@@ -1,0 +1,130 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://raw.githubusercontent.com/rummykhan/shukka/v1/schema/shukka.schema.json",
+  "title": "shukka.json",
+  "description": "The single shukka config in a project root, read by the workflows and the CLI. Role and stack names are derived from project and qualifier and are never written here.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["project", "qualifier", "aws", "infra", "apps"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "project": {
+      "description": "Project name; prefixes every resource and role. Must not be a prefix of another project's name in the same account.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{1,20}$"
+    },
+    "qualifier": {
+      "description": "CDK bootstrap qualifier: the project name format, and at most 10 lowercase alphanumerics (CDK limit).",
+      "type": "string",
+      "allOf": [
+        { "pattern": "^[a-z][a-z0-9-]{1,20}$" },
+        { "pattern": "^[a-z0-9]{1,10}$" }
+      ]
+    },
+    "aws": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["account", "region"],
+      "properties": {
+        "account": { "type": "string", "pattern": "^[0-9]{12}$" },
+        "region": { "type": "string", "pattern": "^[a-z]{2}(-[a-z]+)+-[0-9]+$" }
+      }
+    },
+    "node": {
+      "description": "Node.js major version for checks and builds. Default 22.",
+      "type": "string",
+      "pattern": "^[0-9]+$"
+    },
+    "checks": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/check" }
+    },
+    "infra": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dir", "paths"],
+      "properties": {
+        "dir": { "$ref": "#/definitions/path" },
+        "paths": { "$ref": "#/definitions/paths" }
+      }
+    },
+    "apps": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/app" }
+    },
+    "smoke": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run"],
+      "properties": {
+        "run": { "$ref": "#/definitions/command" }
+      }
+    },
+    "alwaysDeploy": {
+      "description": "Deploy every app and the infrastructure on each merge, whatever changed. Default false.",
+      "type": "boolean"
+    }
+  },
+  "definitions": {
+    "name": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,30}$" },
+    "path": { "type": "string", "minLength": 1 },
+    "paths": { "type": "array", "minItems": 1, "items": { "$ref": "#/definitions/path" } },
+    "command": { "type": "string", "pattern": "\\S" },
+    "commands": { "type": "array", "minItems": 1, "items": { "$ref": "#/definitions/command" } },
+    "check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "dir", "run"],
+      "properties": {
+        "name": { "$ref": "#/definitions/name" },
+        "dir": { "$ref": "#/definitions/path" },
+        "run": { "$ref": "#/definitions/commands" },
+        "services": { "type": "array", "items": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" } }
+      }
+    },
+    "app": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "paths", "build", "server"],
+      "properties": {
+        "name": { "$ref": "#/definitions/name" },
+        "paths": { "$ref": "#/definitions/paths" },
+        "build": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["dir", "run", "bundle"],
+          "properties": {
+            "dir": { "$ref": "#/definitions/path" },
+            "run": { "$ref": "#/definitions/commands" },
+            "bundle": { "$ref": "#/definitions/command" },
+            "env": {
+              "description": "Non-secret build-time values written in the file.",
+              "type": "object",
+              "propertyNames": { "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+              "additionalProperties": { "type": "string" }
+            },
+            "buildEnv": {
+              "description": "Names of non-secret build-time values read from GitHub repository variables of the same name.",
+              "type": "array",
+              "items": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" }
+            }
+          }
+        },
+        "server": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["configure", "units", "health"],
+          "properties": {
+            "configure": { "$ref": "#/definitions/command" },
+            "units": { "type": "array", "minItems": 1, "items": { "type": "string", "pattern": "^[A-Za-z0-9@._:-]+$" } },
+            "health": {
+              "description": "An http(s) URL the release script polls on the server.",
+              "type": "string",
+              "pattern": "^https?://[^\\s/?#]+([/?#]\\S*)?$"
+            }
+          }
+        }
+      }
+    }
+  }
+}
