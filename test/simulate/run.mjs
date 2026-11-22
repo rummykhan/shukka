@@ -1,6 +1,7 @@
 // Runs spike S2's 58 cases (docs/factory/v1/spikes/s2/simulate.py) through the IAM policy simulator against the
 // documents ShukkaBoundary synthesizes, plus cases for each hole in the spike the construct closes. Two spike cases
-// are changed (marked) because the call they model now needs a tag or a principal the spike did not check.
+// are changed (marked) because the call they model now needs a tag or a principal the spike did not check. Then the
+// project bootstrap's deploy and file-publishing role policies (lib/bootstrap.ts, shu-9bj.2).
 // Needs AWS credentials; the only call is `iam simulate-custom-policy`, which is read-only. Not part of the gate.
 //
 //   AWS_PROFILE=stelking node test/simulate/run.mjs
@@ -12,6 +13,8 @@ import { tsImport } from 'tsx/esm/api';
 
 const run = promisify(execFile);
 const { synthFence } = await tsImport('./synth.ts', import.meta.url);
+const { synthBootstrap } = await tsImport('./bootstrap.ts', import.meta.url);
+const { bootstrapStackName, boundaryStackName } = await tsImport('../../lib/bootstrap.ts', import.meta.url);
 
 const A = '123456789012';
 const R = 'us-east-1';
@@ -24,6 +27,7 @@ const d = synthFence({
   sesDomains: ['trendigle.com', 'mail.trendigle.com'],
 });
 const BOUNDARY = `arn:aws:iam::${A}:policy/trendigle-shukka-boundary`;
+const boot = synthBootstrap({ project: 'trendigle', account: A, region: R });
 const EX = [d.executionA, d.executionB, d.executionC];
 const ALLOW_ALL = { Version: '2012-10-17', Statement: [{ Effect: 'Allow', Action: '*', Resource: '*' }] };
 const T = { 'aws:ResourceTag/Project': 'trendigle' };
@@ -155,8 +159,56 @@ const extra = [
   ['exec', 'allowed', 'ec2:RunInstances', `arn:aws:ec2:${R}:${A}:network-interface/*`],
 ];
 
+// shu-9bj.2: the project's bootstrap (lib/bootstrap.ts). The deploy role changes only the project's stacks, and only
+// with the project's own execution role; the file-publishing role writes only the project's asset bucket.
+const stack = (name) => `arn:aws:cloudformation:${R}:${A}:stack/${name}/0a1b2c3d-1111-2222-3333-444455556666`;
+const OWN_EXEC = `arn:aws:iam::${A}:role/cdk-trendigle-cfn-exec-role-${A}-${R}`;
+const ROLE = (arn) => ({ 'cloudformation:RoleArn': arn });
+const OWN = ROLE(OWN_EXEC);
+const bootstrap = [
+  ['deploy', 'allowed', 'cloudformation:CreateChangeSet', stack('Trendigle-prod'), OWN],
+  ['deploy', 'allowed', 'cloudformation:CreateChangeSet', stack('trendigle-ci'), OWN],
+  ['deploy', 'allowed', 'cloudformation:ExecuteChangeSet', stack('Trendigle-prod')],
+  ['deploy', 'allowed', 'cloudformation:DescribeStacks', stack('Trendigle-prod')],
+  ['deploy', 'allowed', 'cloudformation:GetTemplate', stack('Trendigle-prod')],
+  ['deploy', 'allowed', 'cloudformation:DeleteStack', stack('Trendigle-prod'), OWN],
+  ['deploy', 'allowed', 'iam:PassRole', OWN_EXEC, { 'iam:PassedToService': 'cloudformation.amazonaws.com' }],
+  ['deploy', 'allowed', 'ssm:GetParameter', `arn:aws:ssm:${R}:${A}:parameter/cdk-bootstrap/trendigle/version`],
+  ['deploy', 'allowed', 's3:GetObject', `arn:aws:s3:::cdk-trendigle-assets-${A}-${R}/abc.json`],
+  // Own stack, but no RoleArn (CloudFormation would reuse the stored role) or another role.
+  ['deploy', 'explicitDeny', 'cloudformation:CreateChangeSet', stack('Trendigle-prod')],
+  ['deploy', 'explicitDeny', 'cloudformation:CreateChangeSet', stack('Trendigle-prod'), ROLE(`arn:aws:iam::${A}:role/cdk-hnb659fds-cfn-exec-role-${A}-${R}`)],
+  ['deploy', 'explicitDeny', 'cloudformation:CreateChangeSet', stack('Trendigle-prod'), ROLE(`arn:aws:iam::${A}:role/cdk-orbitary-cfn-exec-role-${A}-${R}`)],
+  ['deploy', 'explicitDeny', 'cloudformation:UpdateStack', stack('Trendigle-prod')],
+  ['deploy', 'explicitDeny', 'cloudformation:DeleteStack', stack('Trendigle-prod')],
+  // Other stacks, even with the project's own execution role.
+  ['deploy', 'implicitDeny', 'cloudformation:CreateChangeSet', stack('Orbitary-prod-Data'), OWN],
+  ['deploy', 'implicitDeny', 'cloudformation:CreateChangeSet', stack('orbitary-ci'), OWN],
+  ['deploy', 'implicitDeny', 'cloudformation:CreateChangeSet', stack('Shukka-Account'), OWN],
+  ['deploy', 'implicitDeny', 'cloudformation:CreateChangeSet', stack(boundaryStackName('trendigle')), OWN],
+  ['deploy', 'implicitDeny', 'cloudformation:CreateChangeSet', stack(bootstrapStackName('trendigle')), OWN],
+  ['deploy', 'implicitDeny', 'cloudformation:CreateChangeSet', stack('CDKToolkit'), OWN],
+  ['deploy', 'implicitDeny', 'cloudformation:CreateChangeSet', stack('Trendiglex-prod'), OWN],
+  ['deploy', 'implicitDeny', 'cloudformation:ExecuteChangeSet', stack('Orbitary-prod-Data')],
+  ['deploy', 'implicitDeny', 'cloudformation:DeleteStack', stack('Shukka-Account'), OWN],
+  ['deploy', 'implicitDeny', 'cloudformation:DescribeStacks', stack('Orbitary-prod-Data')],
+  ['deploy', 'explicitDeny', 'cloudformation:CreateChangeSet', stack('Orbitary-prod-Data'), ROLE(`arn:aws:iam::${A}:role/cdk-hnb659fds-cfn-exec-role-${A}-${R}`)],
+  ['deploy', 'implicitDeny', 'iam:PassRole', `arn:aws:iam::${A}:role/cdk-hnb659fds-cfn-exec-role-${A}-${R}`, { 'iam:PassedToService': 'cloudformation.amazonaws.com' }],
+  ['deploy', 'implicitDeny', 'iam:PassRole', OWN_EXEC, { 'iam:PassedToService': 'ec2.amazonaws.com' }],
+  ['deploy', 'implicitDeny', 's3:PutObject', `arn:aws:s3:::cdk-trendigle-assets-${A}-${R}/abc.json`],
+  ['deploy', 'implicitDeny', 'ssm:GetParameter', `arn:aws:ssm:${R}:${A}:parameter/orbitary/prod/SECRET`],
+  ['publish', 'allowed', 's3:PutObject', `arn:aws:s3:::cdk-trendigle-assets-${A}-${R}/abc.zip`, { 'aws:ResourceAccount': A }],
+  ['publish', 'allowed', 's3:ListBucket', `arn:aws:s3:::cdk-trendigle-assets-${A}-${R}`, { 'aws:ResourceAccount': A }],
+  ['publish', 'implicitDeny', 's3:PutObject', `arn:aws:s3:::cdk-hnb659fds-assets-${A}-${R}/abc.zip`, { 'aws:ResourceAccount': A }],
+  ['publish', 'implicitDeny', 's3:PutObject', `arn:aws:s3:::cdk-orbitary-assets-${A}-${R}/abc.zip`, { 'aws:ResourceAccount': A }],
+  ['publish', 'implicitDeny', 's3:DeleteObject', `arn:aws:s3:::cdk-trendigle-assets-${A}-${R}/abc.zip`, { 'aws:ResourceAccount': A }],
+  ['publish', 'implicitDeny', 's3:PutBucketPolicy', `arn:aws:s3:::cdk-trendigle-assets-${A}-${R}`, { 'aws:ResourceAccount': A }],
+];
+
+const POLICIES = { exec: EX, bounded: [ALLOW_ALL], deploy: [boot.deploy], publish: [boot.filePublishing] };
+
 async function simulate([who, , action, resource, ctx]) {
-  const policies = who === 'exec' ? EX : [ALLOW_ALL];
+  const policies = POLICIES[who];
   const args = ['iam', 'simulate-custom-policy', '--policy-input-list', ...policies.map((p) => JSON.stringify(p)),
     '--action-names', action, '--resource-arns', resource, '--output', 'json'];
   if (who === 'bounded') args.push('--permissions-boundary-policy-input-list', JSON.stringify(d.boundary));
@@ -197,4 +249,5 @@ async function report(title, list) {
 
 await report('spike S2 cases', cases);
 await report('spike holes closed', extra);
+await report('project bootstrap (shu-9bj.2)', bootstrap);
 process.exit(failed ? 1 : 0);
