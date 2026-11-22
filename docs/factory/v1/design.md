@@ -147,7 +147,11 @@ Permissions:
 - **Role creation**: `iam:CreateRole`, `iam:PutRolePermissionsBoundary`, `iam:AttachRolePolicy` and `iam:PutRolePolicy` allowed only with `iam:PermissionsBoundary = <boundary ARN>`. A deny on deleting or changing the boundary itself.
 - **The boundary**: the same resource limits, applied to every role the project's stacks create (CDK `PermissionsBoundary.of(app).apply`).
 
-The exact action and resource list is produced by spike S2 against Trendigle's current four stacks and checked with the IAM policy simulator against every physical resource in them.
+The exact documents are in `docs/factory/v1/spikes/s2/policy.py` (spike S2, 58 simulator cases pass): the execution policy is two managed policies (6,144-character limit); the boundary grants no IAM or EC2 management. Project names must not be prefixes of one another.
+
+### `Shukka-Account` stack (once per AWS account)
+
+Deployed with admin credentials by `shukka bootstrap --account`. Owns the GitHub OIDC provider (`token.actions.githubusercontent.com`, client `sts.amazonaws.com`) and outputs its ARN and the list of project names bootstrapped in the account. Projects import the provider; no project stack creates or changes it.
 
 ### `shukka-release.sh` (on the server)
 
@@ -209,6 +213,7 @@ Input: full `cdk diff --no-color` output. Exit 0 = safe. Exit 1 = destructive or
 |---|---|
 | `job_workflow_ref` with nested reusable workflows and immutable IDs behaves differently from the docs | Settled by spike S1 (docs/factory/v1/spikes/s1-oidc.md): it works as designed |
 | A compromised build dependency plants code that runs as root on the server | The configure hook is taken from the git checkout in `ec2.yml`, never from the artifact; the app itself runs as an unprivileged user |
+| The OIDC provider is deleted while moving it out of Trendigle's Ci stack | Two steps under the old admin role: `RETAIN` first, then remove (the guard shows it; allowed by hand); import into `Shukka-Account` straight after; `iam list-open-id-connect-providers` checked between steps |
 | The limited execution role cannot update or roll back an existing Trendigle resource, leaving a stack in `UPDATE_ROLLBACK_FAILED` | Spike S2 simulates every action on every physical resource; first deploy through the new bootstrap is a no-change deploy; switch one low-risk stack (Dns) first; keep the old admin bootstrap until all four have deployed cleanly through the new one |
 | Moving stacks to the new qualifier triggers resource replacement | `cdk diff` must show only metadata/asset changes; the guard stops anything else |
 | First release migration on the box takes the site down | Done in a quiet moment; configure hooks tested in the container first; rollback leaves `/opt/trendigle/app` intact until the second successful release |
@@ -228,7 +233,7 @@ Input: full `cdk diff --no-color` output. Exit 0 = safe. Exit 1 = destructive or
 1. Spikes S1 (OIDC claims) and S2 (execution policy) — results may change D3 and D5 before building.
 2. Build shukka v1 in the public repo with its tests; tag `v1.0.0-rc.N` on a branch for the test consumer.
 3. Acceptance against the test consumer and throwaway stacks.
-4. `shukka bootstrap trendigle` (owner's leave given: P4); Trendigle Ci stack with `ShukkaAccess` deployed by hand (P3), both old and new roles present.
+4. `shukka bootstrap --account` (OIDC provider into `Shukka-Account`, after Trendigle's Ci stack has released it as in the risk above), then `shukka bootstrap trendigle` (owner's leave given: P4); Trendigle Ci stack with `ShukkaAccess` deployed by hand (P3), both old and new roles present.
 5. Trendigle branch: caller workflow, `shukka.json`, synthesizer switch, configure hooks. PR shows the diff; merge in a quiet moment with the owner's approval. Stacks move qualifier one at a time if the diff is large.
 6. After two clean deploys: remove old roles and `diff-guard.sh`; tag `v1.0.0` and `v1`.
 
