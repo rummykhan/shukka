@@ -21,4 +21,9 @@ phase_I() {
   wait_run_done "$ida" >/dev/null || true
   wait_run_done "$idb" >/dev/null || true
   snapshot after_serial
+  # Evidence from the box itself: when A's release command ended (SSM), and when B's release was
+  # unpacked (its REVISION file, written after B takes the app's lock).
+  state_set serial_a_window "$(release_command_window web "$a")"
+  state_set serial_b_window "$(release_command_window web "$b")"
+  state_set serial_b_unpacked "$(box_run "stat -c %Y /opt/$PROJECT/web/releases/$b/REVISION 2>/dev/null || echo none" | tr -d '[:space:]')"
 }

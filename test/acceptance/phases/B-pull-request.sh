@@ -6,6 +6,7 @@
 
 phase_B() {
   local branch="shukkatest-probe-$RUN_ID" tag="shukkatest-probe-tag-$RUN_ID" sha1 sha2 pr id
+  require_consumer_remote || return 1
   snapshot before_pr
   c_git checkout -q -B "$branch" main || return 1
   # An app change that keeps the smoke marker, a harmless infra change (a new output), the probe

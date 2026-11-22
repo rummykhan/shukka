@@ -12,7 +12,8 @@ PROJECT=shukkatest
 QUALIFIER=shukkatest
 # shellcheck disable=SC2034
 SHUKKA_REPO=${SHUKKATEST_SHUKKA_REPO:-rummykhan/shukka}
-CONSUMER_REPO=${SHUKKATEST_CONSUMER_REPO:-rummykhan/shukka-consumer-test}
+# The only repository this suite may push to (it force-pushes main). Not overridable on purpose.
+readonly CONSUMER_REPO=rummykhan/shukka-consumer-test
 CALLER_WORKFLOW=${SHUKKATEST_CALLER_WORKFLOW:-CI}          # the caller's `name:`
 # shellcheck disable=SC2034
 PROBE_WORKFLOW=shukkatest-probe                            # probe workflows' `name:` prefix
@@ -267,6 +268,29 @@ run_log() {
 }
 gh_fetch_log() { gh run view "$1" -R "$CONSUMER_REPO" --log >"$2" 2>/dev/null && [[ -s "$2" ]]; }
 
+# job_messages <run-id> <job-regex>: the printed lines of the matching jobs, without the job, step and
+# timestamp columns. Lines GitHub prints for a step's `env:`/`with:` are indented, so a caller that
+# anchors at the start of a line (^guard: ...) only sees what the step itself printed. A leading
+# "##[error]" (an ::error:: annotation) is removed.
+job_messages() {
+  awk -F'\t' -v re="$2" 'tolower($1) ~ tolower(re) { $1 = ""; $2 = ""; sub(/^\t\t/, ""); print }' OFS='\t' "$(run_log "$1")" |
+    sed -E 's/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z ?//; s/^##\[error\]//'
+}
+
+# The texts the suite matches, case-sensitively and anchored at the start of a printed line. Agreed
+# with shu-9zr (workflows) on its mailbox; the guard's lines are scripts/guard.mjs's report.
+# shellcheck disable=SC2034 # used by cases
+GUARD_HEADER='guard: these changes delete or replace a resource:'
+# shellcheck disable=SC2034
+GUARD_STOP_RE='^guard: stopping\. If this is intended, run the workflow by hand on main with allow_replacement ticked\.$'
+# shellcheck disable=SC2034
+SMOKE_FAILED_RE='^shukka: the site is live but failing its smoke test'
+
+# guard_offending <messages>: the lines between the guard's header and its stop line.
+guard_offending() {
+  awk -v h="$GUARD_HEADER" '$0 == h { on = 1; next } /^guard: / { on = 0 } on' <<<"$1"
+}
+
 # observed <log-file> <observation-id>: the verdict a probe printed ("RESULT <id> <VERDICT> ..."), or ERROR.
 observed() {
   local v
@@ -336,6 +360,24 @@ box_run() {
   printf '%s\n' "$out"
 }
 
+# iso_epoch: an AWS timestamp (2026-11-22T10:00:00.123000+00:00 or ...Z) as seconds since the epoch.
+iso_epoch() { jq -Rr 'sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | fromdateiso8601'; }
+
+# release_command_window <app> <sha>: "<start-epoch> <end-epoch>" of the SSM command that ran
+# shukka-release.sh for that app and commit on the box (from SSM's own records), or nothing.
+release_command_window() {
+  local iid cid times
+  iid=$(box_instance)
+  [[ -n "$iid" ]] || return 1
+  cid=$(aws ssm list-commands --instance-id "$iid" --max-items 50 --output json 2>/dev/null |
+    jq -r --arg sha "$2" --arg app "$1" '[.Commands[] | select((.Parameters | tostring) as $p
+      | ($p | contains($sha)) and ($p | contains("--app")) and ($p | contains($app)))] | first | .CommandId // empty')
+  [[ -n "$cid" ]] || return 1
+  times=$(aws ssm get-command-invocation --command-id "$cid" --instance-id "$iid" \
+    --query '[ExecutionStartDateTime, ExecutionEndDateTime]' --output text 2>/dev/null) || return 1
+  printf '%s %s\n' "$(awk '{print $1}' <<<"$times" | iso_epoch)" "$(awk '{print $2}' <<<"$times" | iso_epoch)"
+}
+
 server_revision() { box_run "cat /opt/$PROJECT/$1/current/REVISION 2>/dev/null || echo NONE" | tr -d '[:space:]'; }
 unit_started() { box_run "systemctl show -p ActiveEnterTimestampMonotonic --value $PROJECT-$1; systemctl is-active $PROJECT-$1" | tr '\n' ' ' | sed 's/ $//'; }
 
@@ -353,7 +395,14 @@ commit_all() {
   c_git commit -q -m "$1"
   c_git rev-parse HEAD
 }
-push_main() { c_git push -q origin HEAD:main; }
+# require_consumer_remote: the working copy's origin must be the test consumer, nothing else.
+require_consumer_remote() {
+  local url
+  url=$(c_git remote get-url origin 2>/dev/null)
+  [[ "$CONSUMER_REPO" == rummykhan/shukka-consumer-test ]] || die "refusing to push: CONSUMER_REPO is '$CONSUMER_REPO'"
+  [[ "$url" =~ [:/]rummykhan/shukka-consumer-test(\.git)?$ ]] || die "refusing to push: origin is '$url', not $CONSUMER_REPO"
+}
+push_main() { require_consumer_remote && c_git push -q origin HEAD:main; }
 
 # json_edit <file-relative-to-consumer> <jq filter> [jq args...]
 json_edit() {

@@ -9,7 +9,6 @@ phase_A() {
   setup_zone
   setup_param
   setup_standin
-  setup_account_stack
   setup_render
   setup_bootstrap_project
   setup_ci_stack

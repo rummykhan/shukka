@@ -70,6 +70,13 @@ case "$me" in
     attempt R3-pipeline-default-bootstrap-role aws sts assume-role \
       --role-arn "arn:aws:iam::$account:role/cdk-hnb659fds-deploy-role-$account-$region" \
       --role-session-name shukkatest-probe
+    # The lookup roles carry account-wide read access; the infra role must reach neither (D10).
+    attempt R3-pipeline-project-lookup-role aws sts assume-role \
+      --role-arn "arn:aws:iam::$account:role/cdk-$qualifier-lookup-role-$account-$region" \
+      --role-session-name shukkatest-probe
+    attempt R3-pipeline-default-lookup-role aws sts assume-role \
+      --role-arn "arn:aws:iam::$account:role/cdk-hnb659fds-lookup-role-$account-$region" \
+      --role-session-name shukkatest-probe
     deploy_role="arn:aws:iam::$account:role/cdk-$qualifier-deploy-role-$account-$region"
     if creds=$(aws sts assume-role --role-arn "$deploy_role" --role-session-name shukkatest-probe \
       --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text 2>/dev/null); then

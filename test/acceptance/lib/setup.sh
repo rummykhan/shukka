@@ -139,16 +139,6 @@ setup_standin() {
   log "stand-in project $stack ready"
 }
 
-setup_account_stack() {
-  if [[ "$(stack_status Shukka-Account)" != ABSENT ]]; then
-    state_set account_stack_preexisting 1
-    log "Shukka-Account already exists; reusing it (the suite will not delete it)"
-    return 0
-  fi
-  state_set account_stack_created 1
-  cli_bootstrap_account "$(state_get oidc_provider_arn)" || die "shukka bootstrap --account failed"
-}
-
 # setup_render: the consumer's contents with this run's values, in a fresh clone of the test repo.
 setup_render() {
   local dir="$RUN_DIR/consumer" email
@@ -244,6 +234,9 @@ setup_push_baseline() {
   clean_consumer_github
   local sha id
   sha=$(commit_all "shukkatest $RUN_ID: consumer baseline")
+  require_consumer_remote
+  # Teardown of an earlier run leaves the caller disabled; enable it so this merge runs.
+  gh workflow enable "$CALLER_WORKFLOW" -R "$CONSUMER_REPO" >/dev/null 2>&1 || true
   c_git push -q --force origin HEAD:main || die "cannot push the baseline to $CONSUMER_REPO"
   state_set baseline_sha "$sha"
   id=$(wait_run_of "$sha") || die "no CI run for the baseline merge"

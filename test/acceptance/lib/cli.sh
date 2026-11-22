@@ -9,10 +9,9 @@ shukka() {
   npx --yes "github:$SHUKKA_REPO#$RC_TAG" "$@"
 }
 
-# Account stack, importing the account's existing GitHub OIDC provider (never creating a second one).
-cli_bootstrap_account() { # provider-arn
-  shukka bootstrap --account --oidc-provider-arn "$1" --profile "$AWS_PROFILE" --region "$AWS_REGION"
-}
+# `shukka bootstrap --account` (the Shukka-Account stack) is deliberately never run by this suite: that
+# stack owns the account's shared GitHub OIDC provider and is created only after Trendigle's Ci stack
+# releases it (shu-li5, epic 2). shukkatest imports the existing provider by ARN.
 
 # Project bootstrap: boundary and execution policies, `cdk bootstrap --qualifier shukkatest`, and
 # buildEnv values copied from /shukkatest/prod/<NAME> to the consumer's repository variables.

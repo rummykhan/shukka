@@ -73,9 +73,6 @@ leftovers() {
     fi
     printf 'LEFTOVER tagged %s\n' "${arn//$acct/123456789012}"
   done
-  if [[ "$(state_get account_stack_created 2>/dev/null)" == 1 && "$(stack_status Shukka-Account)" != ABSENT ]]; then
-    printf 'LEFTOVER stack Shukka-Account (created by this run)\n'
-  fi
 }
 no_leftovers() { [[ -z "$(leftovers)" ]]; }
 
@@ -109,29 +106,67 @@ delete_table() {
   aws dynamodb wait table-not-exists --table-name "$1" 2>/dev/null
 }
 
-# delete_stack <name>: deletes and waits; returns non-zero if it is still there.
+# stack_settled <name>: the stack is absent or in a terminal state (nothing in progress).
+stack_settled() {
+  local st
+  st=$(stack_status "$1")
+  [[ "$st" != *_IN_PROGRESS ]]
+}
+
+# delete_stack <name>: waits for any operation in progress (a deploy that was running when teardown
+# began) to finish, then deletes, retrying while the stack is still there. Non-zero if it remains.
 delete_stack() {
-  local s=$1
+  local s=$1 attempt st
   if ! is_ours "$s" && ! grep -qx -- "$s" <<<"$(qualifier_stacks)" && ! is_boundary_stack "$s"; then
     die "refusing to delete stack '$s'"
   fi
-  [[ "$(stack_status "$s")" == ABSENT ]] && return 0
-  log "teardown: stack $s"
-  aws cloudformation delete-stack --stack-name "$s" || return 1
-  if ! aws cloudformation wait stack-delete-complete --stack-name "$s" 2>/dev/null; then
-    log "teardown: stack $s is $(stack_status "$s")"
+  for attempt in 1 2 3 4; do
+    if ! wait_until 3600 20 stack_settled "$s"; then
+      log "teardown: stack $s is still $(stack_status "$s") after an hour"
+      return 1
+    fi
+    st=$(stack_status "$s")
+    [[ "$st" == ABSENT || "$st" == DELETE_COMPLETE ]] && return 0
+    log "teardown: stack $s ($st), delete attempt $attempt"
+    aws cloudformation delete-stack --stack-name "$s" || { sleep 30; continue; }
+    wait_until 3600 20 stack_settled "$s" || true
+    st=$(stack_status "$s")
+    [[ "$st" == ABSENT || "$st" == DELETE_COMPLETE ]] && return 0
+    log "teardown: stack $s is $st"
     aws cloudformation describe-stack-events --stack-name "$s" --max-items 10 \
       --query "StackEvents[?contains(ResourceStatus, 'FAILED')].[LogicalResourceId, ResourceStatusReason]" --output text >&2 || true
-    return 1
-  fi
+    sleep 30
+  done
+  return 1
 }
 
+# active_runs: ids of runs in the test consumer that are not finished.
+active_runs() {
+  local s
+  for s in queued in_progress waiting pending requested; do
+    gh run list -R "$CONSUMER_REPO" --status "$s" --limit 100 --json databaseId -q '.[].databaseId' 2>/dev/null
+  done | sort -u
+}
+no_active_runs() { [[ -z "$(active_runs)" ]]; }
+
+# td_github: stop the test consumer from deploying anything while (and after) resources are deleted:
+# disable every workflow there, cancel what is queued or running and wait until it has all finished.
+# The caller stays disabled; the next run's setup enables it before its first merge.
 td_github() {
-  if [[ "$(state_get workflow_disabled)" == 1 ]]; then
-    gh workflow enable "$CALLER_WORKFLOW" -R "$CONSUMER_REPO" >/dev/null 2>&1 && state_set workflow_disabled 0
+  local w id rc=0
+  for w in $(gh workflow list -R "$CONSUMER_REPO" --all --json id,state -q '.[] | select(.state == "active") | .id' 2>/dev/null); do
+    gh workflow disable "$w" -R "$CONSUMER_REPO" >/dev/null 2>&1 || rc=1
+  done
+  for id in $(active_runs); do
+    gh run cancel "$id" -R "$CONSUMER_REPO" >/dev/null 2>&1 || true
+  done
+  if ! wait_until 1800 15 no_active_runs; then
+    log "teardown: runs still active in $CONSUMER_REPO: $(active_runs | tr '\n' ' ')"
+    rc=1
   fi
   clean_consumer_github
   gh variable delete SHUKKATEST_GREETING -R "$CONSUMER_REPO" >/dev/null 2>&1 || true
+  return $rc
 }
 
 td_project_stacks() {
@@ -239,21 +274,6 @@ td_zones() {
   return $rc
 }
 
-td_account_stack() {
-  [[ "$(state_get account_stack_created)" == 1 ]] || return 0
-  [[ "$(stack_status Shukka-Account)" == ABSENT ]] && return 0
-  # Only delete it if it imports the provider; a stack that owns the provider would delete the
-  # account's GitHub OIDC provider, which Trendigle uses.
-  if aws cloudformation get-template --stack-name Shukka-Account --query TemplateBody --output json 2>/dev/null |
-    grep -Eq 'AWS::IAM::OIDCProvider|OpenIdConnectProvider'; then
-    log "teardown: Shukka-Account owns an OIDC provider resource; NOT deleting it (owner must decide)"
-    return 1
-  fi
-  log "teardown: stack Shukka-Account (created by this run, imports the provider)"
-  aws cloudformation delete-stack --stack-name Shukka-Account &&
-    aws cloudformation wait stack-delete-complete --stack-name Shukka-Account
-}
-
 # teardown: the whole sequence. Returns non-zero and lists what is left if anything remains.
 teardown() {
   local rc=0
@@ -270,7 +290,6 @@ teardown() {
   td_standin || rc=1
   td_parameters
   td_zones || rc=1
-  td_account_stack || rc=1
   if ! wait_until 900 30 no_leftovers; then
     log "teardown: these throwaway resources are still there:"
     leftovers >&2

@@ -14,6 +14,12 @@ case_run() {
   assert_match "$(stack_status Shukkatest-Ci)" '^(CREATE|UPDATE)_COMPLETE$' "Shukkatest-Ci (ShukkaAccess) deployed"
   tpl=$(aws cloudformation get-template --stack-name Shukkatest-Ci --query TemplateBody --output json)
   assert_no_match "$tpl" 'AWS::IAM::OIDCProvider|OpenIdConnectProvider' "Shukkatest-Ci creates no OIDC provider of its own"
-  arn=$(aws cloudformation describe-stacks --stack-name Shukka-Account --query 'Stacks[0].Outputs[].OutputValue' --output text 2>/dev/null)
-  assert_match "$arn" "${before//./\\.}" "Shukka-Account outputs the provider's ARN"
+  # Shukka-Account is created after Trendigle releases the provider (shu-li5); the suite never creates
+  # it. Only if it already exists is its output checked.
+  if [[ "$(stack_status Shukka-Account)" == ABSENT ]]; then
+    result R2-account-stack-output SKIP "Shukka-Account does not exist yet (created after shu-li5); shukkatest imports the provider by ARN"
+  else
+    arn=$(aws cloudformation describe-stacks --stack-name Shukka-Account --query 'Stacks[0].Outputs[].OutputValue' --output text 2>/dev/null)
+    assert_match "$arn" "${before//./\\.}" "Shukka-Account outputs the provider's ARN"
+  fi
 }
