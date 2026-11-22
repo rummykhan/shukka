@@ -167,12 +167,13 @@ exit 10 = download or unpack failed      (nothing changed)
 exit 11 = configure hook failed          (nothing switched)
 exit 12 = unhealthy, rolled back, previous healthy
 exit 13 = unhealthy, rollback also unhealthy (manual attention)
+exit 2  = invalid arguments (nothing touched)
 stdout last line: "shukka: <project>/<app> <old-sha> -> <new-sha> <result>"
 ```
 
 Where the hook comes from (decided 2026-11-22 after the security review of shu-9bj.1 found the two readings of this contract): `ec2.yml` (through `scripts/release.mjs`) reads the hook from the **git checkout** at the config's `server.configure` path and uploads it to `s3://<bucket>/<project>/<app>/<sha>.configure.sh`; `shukka-release.sh` downloads that object to `/opt/<project>/<app>/hooks/<sha>.sh` (outside every release directory, root-owned, mode 0700) and runs only that file. A file at the same path inside the bundle is never executed.
 
-Configure hook contract: called as `hook.sh <release-dir>` with `PROJECT`, `APP`, `SHA`, `REGION` in the environment, as root. It writes settings files, users and systemd units (pointing at `/opt/<project>/<app>/current`), and must be idempotent. It must not start or restart the app's units; the release script does that after the switch. A release whose hook fails is deleted.
+Configure hook contract: called as `hook.sh <release-dir>` with `PROJECT`, `APP`, `SHA`, `REGION` in the environment, as root. It writes settings files, users and systemd units (pointing at `/opt/<project>/<app>/current`), and must be idempotent. It must not start or restart the app's units; the release script does that after the switch. It must enable its units (`systemctl enable`); the release script only restarts them. `/opt/<project>` and `/opt/<project>/<app>` are root-owned and not writable by group or others (the release script enforces it); the app user's home and writable data live elsewhere. A release whose hook fails is deleted.
 
 Health: HTTP GET every 2 s until 2xx/3xx or the timeout; units must be `active`.
 
