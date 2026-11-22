@@ -252,13 +252,14 @@ async function checkAssemblySafe(io, assembly, check) {
 function checkPoliciesSafe(io, root, assembly, config, allow) {
   const remote = io.run('git', ['remote', 'get-url', 'origin'], { cwd: root, mutates: false, capture: 'stdout' });
   const repo = remote.status === 0 ? githubRepoFromUrl(remote.stdout) : null;
-  const args = ['--account', config.aws.account, ...(repo ? ['--repo', repo] : []), ...(allow ? ['--allow'] : [])];
+  const mailDomains = config.fence.mailDomains;
+  const args = ['--account', config.aws.account, ...(repo ? ['--repo', repo] : []), ...mailDomains.flatMap((d) => ['--mail-domain', d]), ...(allow ? ['--allow'] : [])];
   if (io.dryRun) {
     io.out(`+ node scripts/policy-guard.mjs ${assembly} ${args.join(' ')}   [dry run: not run]\n`);
     return;
   }
   if (!repo) io.warn('origin is not a GitHub repository, so a GitHub trust in the assembly cannot be checked against it and stops the deploy');
-  const result = policyGuard(assembly, { account: config.aws.account, repos: repo ? [repo] : [], allow });
+  const result = policyGuard(assembly, { account: config.aws.account, repos: repo ? [repo] : [], mailDomains, allow });
   io.out(policyReport(result));
   if (result.code !== 0) {
     throw new CliError(result.verdict === 'unreadable'

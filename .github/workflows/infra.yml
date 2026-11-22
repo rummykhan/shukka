@@ -241,7 +241,7 @@ jobs:
           node --input-type=module - "$RUNNER_TEMP/shukka-config.json" <<'JS'
           import { appendFileSync, readFileSync } from 'node:fs';
           const c = JSON.parse(readFileSync(process.argv[2], 'utf8'));
-          const out = { project: c.project, qualifier: c.qualifier, account: c.aws.account, region: c.aws.region };
+          const out = { project: c.project, qualifier: c.qualifier, account: c.aws.account, region: c.aws.region, mail_domains: c.fence.mailDomains.join(',') };
           appendFileSync(process.env.GITHUB_OUTPUT, Object.entries(out).map(([k, v]) => `${k}=${v}\n`).join(''));
           JS
 
@@ -408,7 +408,7 @@ jobs:
           node --input-type=module - "$RUNNER_TEMP/shukka-config.json" <<'JS'
           import { appendFileSync, readFileSync } from 'node:fs';
           const c = JSON.parse(readFileSync(process.argv[2], 'utf8'));
-          const out = { project: c.project, qualifier: c.qualifier, account: c.aws.account, region: c.aws.region };
+          const out = { project: c.project, qualifier: c.qualifier, account: c.aws.account, region: c.aws.region, mail_domains: c.fence.mailDomains.join(',') };
           appendFileSync(process.env.GITHUB_OUTPUT, Object.entries(out).map(([k, v]) => `${k}=${v}\n`).join(''));
           JS
 
@@ -457,6 +457,7 @@ jobs:
       - name: Check trust and resource policies
         env:
           ACCOUNT: ${{ steps.config.outputs.account }}
+          MAIL_DOMAINS: ${{ steps.config.outputs.mail_domains }}
           ALLOW_REPLACEMENT: ${{ inputs.allow_replacement }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
@@ -469,6 +470,9 @@ jobs:
               echo "::warning::shukka: allow_replacement is honoured only when the workflow is run by hand; ignoring it"
             fi
           fi
+          # The fence's mail domains (shukka.json, checked by config.mjs): email subscriptions to them may stay.
+          IFS=, read -ra domains <<<"$MAIL_DOMAINS"
+          for d in ${domains[@]+"${domains[@]}"}; do allow+=(--mail-domain "$d"); done
           if ! node .shukka/scripts/policy-guard.mjs "$RUNNER_TEMP/cdk.out" --account "$ACCOUNT" --repo "$GITHUB_REPOSITORY" ${allow[@]+"${allow[@]}"} --summary "$GITHUB_STEP_SUMMARY"; then
             echo "::error::shukka: the policy guard stopped the infrastructure deploy"
             exit 1
@@ -709,7 +713,7 @@ jobs:
           node --input-type=module - "$RUNNER_TEMP/shukka-config.json" <<'JS'
           import { appendFileSync, readFileSync } from 'node:fs';
           const c = JSON.parse(readFileSync(process.argv[2], 'utf8'));
-          const out = { project: c.project, qualifier: c.qualifier, account: c.aws.account, region: c.aws.region };
+          const out = { project: c.project, qualifier: c.qualifier, account: c.aws.account, region: c.aws.region, mail_domains: c.fence.mailDomains.join(',') };
           appendFileSync(process.env.GITHUB_OUTPUT, Object.entries(out).map(([k, v]) => `${k}=${v}\n`).join(''));
           JS
 
@@ -755,11 +759,15 @@ jobs:
         if: steps.token.outputs.available == 'true'
         env:
           ACCOUNT: ${{ steps.config.outputs.account }}
+          MAIL_DOMAINS: ${{ steps.config.outputs.mail_domains }}
         run: |
           set +e -uo pipefail
           out="$RUNNER_TEMP/shukka-pr-diff"
           mkdir -p "$out"
-          node .shukka/scripts/policy-guard.mjs "$RUNNER_TEMP/cdk.out" --account "$ACCOUNT" --repo "$GITHUB_REPOSITORY" --summary "$GITHUB_STEP_SUMMARY" | tee "$out/policy-guard.txt"
+          domains=()
+          IFS=, read -ra list <<<"$MAIL_DOMAINS"
+          for d in ${list[@]+"${list[@]}"}; do domains+=(--mail-domain "$d"); done
+          node .shukka/scripts/policy-guard.mjs "$RUNNER_TEMP/cdk.out" --account "$ACCOUNT" --repo "$GITHUB_REPOSITORY" ${domains[@]+"${domains[@]}"} --summary "$GITHUB_STEP_SUMMARY" | tee "$out/policy-guard.txt"
           policy_status=${PIPESTATUS[0]}
           echo "$policy_status" >"$out/policy-guard-status"
           if [[ $policy_status -ne 0 ]]; then

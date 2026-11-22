@@ -258,7 +258,7 @@ const resourceCases: Array<[string, Loose, RegExp | null]> = [
   ['a Lambda permission for a service without a source stops', permission('s3.amazonaws.com'), /allows Service s3\.amazonaws\.com without SourceAccount/],
   ['a Lambda permission for a service with another account\'s SourceArn stops', { ...permission('sns.amazonaws.com'), Properties: { ...permission('sns.amazonaws.com').Properties, SourceArn: `arn:aws:sns:us-east-1:${OUTSIDER}:t` } }, /with a SourceAccount or SourceArn that is not account 818221194501/],
   ['an SNS subscription to an https endpoint stops', { Type: 'AWS::SNS::Subscription', Properties: { TopicArn: { Ref: 'Own' }, Protocol: 'https', Endpoint: 'https://example.com/hook' } }, /subscription by https to https:\/\/example\.com\/hook sends messages out of the account/],
-  ['an SNS subscription by email stops', { Type: 'AWS::SNS::Subscription', Properties: { TopicArn: { Ref: 'Own' }, Protocol: 'email', Endpoint: 'a@example.com' } }, /subscription by email/],
+  ['an SNS subscription by email with no mail domains given stops', { Type: 'AWS::SNS::Subscription', Properties: { TopicArn: { Ref: 'Own' }, Protocol: 'email', Endpoint: 'a@example.com' } }, /subscription by email to a@example\.com sends messages outside the project's mail domains \(none given\)/],
   ['an SNS subscription to another account\'s queue stops', { Type: 'AWS::SNS::Subscription', Properties: { TopicArn: { Ref: 'Own' }, Protocol: 'sqs', Endpoint: `arn:aws:sqs:us-east-1:${OUTSIDER}:q` } }, /sqs subscription to arn:aws:sqs:us-east-1:999999999999:q is not one of the project's resources/],
   ['an inline topic subscription to an https endpoint stops', { Type: 'AWS::SNS::Topic', Properties: { Subscription: [{ Protocol: 'https', Endpoint: 'https://example.com' }] } }, /subscription by https/],
   ['an SNS subscription to the project\'s queue passes', { Type: 'AWS::SNS::Subscription', Properties: { TopicArn: { Ref: 'Own' }, Protocol: 'sqs', Endpoint: ownArn } }, null],
@@ -502,7 +502,7 @@ async function runStep(job: string, name: string, asm: string, exprs: Record<str
 
 const backdoor = () => assembly({ 'Trendigle-prod-Ci': one({ Backdoor: role({ AWS: `arn:aws:iam::${OUTSIDER}:root` }) }) });
 const clean = () => assembly({ 'Trendigle-prod-Ci': one({ Infra: role({ Federated: PROVIDER }, shukkaConditions(), 'trendigle-shukka-infra') }) });
-const deployExprs = (allow: string, event: string) => ({ 'steps.config.outputs.account': ACCOUNT, 'inputs.allow_replacement': allow, 'github.event_name': event });
+const deployExprs = (allow: string, event: string) => ({ 'steps.config.outputs.account': ACCOUNT, 'steps.config.outputs.mail_domains': '', 'inputs.allow_replacement': allow, 'github.event_name': event });
 
 test('shu-9bj.6: the deploy job stops on a backdoor with the verdict in the step summary; passes a clean assembly', async () => {
   const stopped = await runStep('deploy', STEP, backdoor(), deployExprs('false', 'push'));
@@ -525,14 +525,14 @@ test('shu-9bj.6: allow_replacement lets the policy guard through only on a run s
 });
 
 test('shu-9bj.6: the PR diff job never fails on a backdoor, leaves the verdict for the comment, and the comment says the merge will stop', async () => {
-  const r = await runStep('diff', STEP, backdoor(), { 'steps.config.outputs.account': ACCOUNT });
+  const r = await runStep('diff', STEP, backdoor(), { 'steps.config.outputs.account': ACCOUNT, 'steps.config.outputs.mail_domains': '' });
   assert.equal(r.code, 0, r.out);
   assert.match(r.out, /::warning::shukka: this merge will stop at the policy guard/);
   assert.match(r.summary, /### Trust and resource policies/);
   const dir = join(r.temp, 'shukka-pr-diff');
   assert.equal(readFileSync(join(dir, 'policy-guard-status'), 'utf8').trim(), '1');
   assert.match(readFileSync(join(dir, 'policy-guard.txt'), 'utf8'), /Backdoor \(AWS::IAM::Role\)/);
-  const clean0 = await runStep('diff', STEP, clean(), { 'steps.config.outputs.account': ACCOUNT });
+  const clean0 = await runStep('diff', STEP, clean(), { 'steps.config.outputs.account': ACCOUNT, 'steps.config.outputs.mail_domains': '' });
   assert.equal(readFileSync(join(clean0.temp, 'shukka-pr-diff', 'policy-guard-status'), 'utf8').trim(), '0');
 
   // The comment job, against a fake GitHub API, with the diff guard's files as the diff job leaves them.
@@ -666,4 +666,43 @@ test('shu-9bj.6: an Fn::If whose branches are policy documents checks both, and 
   const r = check(assembly({ S: one({ R: { Type: 'AWS::IAM::Role', Properties: { AssumeRolePolicyDocument: { 'Fn::If': ['C', doc(`arn:aws:iam::${ACCOUNT}:role/a`), doc(OUTSIDER)] } } } }) }));
   assert.equal(r.code, 1);
   assert.match(r.found.join('\n'), /trusts AWS 999999999999/);
+});
+
+test('shu-9bj.6: an email subscription to one of the project\'s mail domains passes; another domain, sms, http and https stop', () => {
+  const subscription = (Protocol: string, Endpoint: unknown) => ({ Type: 'AWS::SNS::Subscription', Properties: { TopicArn: { Ref: 'Own' }, Protocol, Endpoint } });
+  const dir = assembly({ S: one({
+    Own: { Type: 'AWS::SNS::Topic' },
+    Mine: subscription('email', 'alerts@Trendigle.com'),
+    MineJson: subscription('email-json', 'ops@mail.trendigle.com'),
+    Theirs: subscription('email', 'x@attacker.example'),
+    Lookalike: subscription('email', 'x@trendigle.com.attacker.example'),
+    Text: subscription('sms', '+15555550100'),
+    Web: subscription('https', 'https://trendigle.com/hook'),
+    Plain: subscription('http', 'http://trendigle.com/hook'),
+  }) });
+  const r = policyGuard(dir, { account: ACCOUNT, repos: [REPO], mailDomains: ['trendigle.com', 'mail.trendigle.com'] });
+  const found = r.found.join('\n');
+  assert.doesNotMatch(found, /Mine |MineJson /, found);
+  assert.match(found, /Theirs \(AWS::SNS::Subscription\): subscription by email to x@attacker\.example sends messages outside the project's mail domains \(trendigle\.com, mail\.trendigle\.com\)/);
+  assert.match(found, /Lookalike \(AWS::SNS::Subscription\): subscription by email/);
+  assert.match(found, /Text \(AWS::SNS::Subscription\): subscription by sms to \+15555550100 sends messages out of the account/);
+  assert.match(found, /Web \(AWS::SNS::Subscription\): subscription by https/);
+  assert.match(found, /Plain \(AWS::SNS::Subscription\): subscription by http /);
+  const cli = run([dir, '--account', ACCOUNT, '--repo', REPO, '--mail-domain', 'trendigle.com', '--mail-domain', 'mail.trendigle.com']);
+  assert.equal(cli.code, 1);
+  assert.doesNotMatch(cli.out, /Mine /);
+  assert.equal(run([dir, '--account', ACCOUNT, '--mail-domain', '*.trendigle.com']).code, 2, 'a mail domain is a plain domain name');
+});
+
+test('shu-9bj.6: the workflow steps pass the fence\'s mail domains to the policy guard', async () => {
+  for (const job of ['deploy', 'diff']) assert.equal(stepOf(job, STEP).env.MAIL_DOMAINS, '${{ steps.config.outputs.mail_domains }}');
+  assert.match(stepOf('deploy', 'Read shukka.json').run, /mail_domains: c\.fence\.mailDomains\.join\(','\)/);
+  const asm = assembly({ S: one({ Own: { Type: 'AWS::SNS::Topic' }, Mine: { Type: 'AWS::SNS::Subscription', Properties: { TopicArn: { Ref: 'Own' }, Protocol: 'email', Endpoint: 'alerts@trendigle.com' } } }) });
+  const exprs = { ...deployExprs('false', 'push'), 'steps.config.outputs.mail_domains': 'trendigle.com,mail.trendigle.com' };
+  const ok = await runStep('deploy', STEP, asm, exprs);
+  assert.equal(ok.code, 0, ok.out);
+  const none = await runStep('deploy', STEP, asm, { ...exprs, 'steps.config.outputs.mail_domains': '' });
+  assert.equal(none.code, 1, none.out);
+  const diff = await runStep('diff', STEP, asm, { 'steps.config.outputs.account': ACCOUNT, 'steps.config.outputs.mail_domains': 'trendigle.com' });
+  assert.equal(readFileSync(join(diff.temp, 'shukka-pr-diff', 'policy-guard-status'), 'utf8').trim(), '0', diff.out);
 });

@@ -34,9 +34,11 @@
 // Fn::Join, Fn::Sub, Fn::Select, Fn::Split, Fn::FindInMap; Fn::If (both branches must pass); Fn::ImportValue of an
 // export of a deployed template in the assembly.
 //
-// Usage: node scripts/policy-guard.mjs <assembly dir> --account <12 digits> [--repo <owner/repo>]... [--allow]
+// Usage: node scripts/policy-guard.mjs <assembly dir> --account <12 digits> [--repo <owner/repo>]... [--mail-domain <d>]... [--allow]
 //                                      [--summary <file>]
 // --repo names the project's GitHub repository (owner/repo or owner@id/repo@id); without it no OIDC trust passes.
+// --mail-domain names one of the project's mail domains (the fence's mailDomains in shukka.json): an SNS email or
+// email-json subscription to an address there passes; any other email, and every sms, http and https endpoint, stops.
 // Exit 0: nothing opens the project (or it was allowed). Exit 1: something does, or the assembly cannot be read.
 // Exit 2: bad arguments.
 
@@ -115,9 +117,9 @@ const BUCKET_SAFE = new Set([
 /**
  * @typedef {'safe' | 'stopped' | 'allowed' | 'unreadable'} Verdict
  * @typedef {{ verdict: Verdict, code: 0 | 1, found: string[], templates: number }} PolicyResult
- * @typedef {{ account: string, repos?: string[] }} PolicyOptions
+ * @typedef {{ account: string, repos?: string[], mailDomains?: string[] }} PolicyOptions
  * @typedef {{ file: string, template: any }} Template
- * @typedef {{ account: string, t: Template, exports: Map<string, { value: any, t: Template }>, depth: number }} Ctx
+ * @typedef {{ account: string, t: Template, exports: Map<string, { value: any, t: Template }>, depth: number, mailDomains?: Set<string> }} Ctx
  * @typedef {import('./assembly.mjs').FileAsset} Asset
  */
 
@@ -668,11 +670,21 @@ function notificationProblems(config, account) {
  * Problems with an SNS subscription (AWS::SNS::Subscription, or one inline in AWS::SNS::Topic).
  * @param {any} subscription worked out
  * @param {string} account
+ * @param {Set<string>} mailDomains lower case
  * @returns {string[]}
  */
-function subscriptionProblems(subscription, account) {
+function subscriptionProblems(subscription, account, mailDomains) {
   if (!isObject(subscription)) return [`subscription ${show(subscription)} cannot be read`];
   const protocol = subscription.Protocol;
+  if (protocol === 'email' || protocol === 'email-json') {
+    const endpoints = alternatives(subscription.Endpoint);
+    const outside = endpoints.find((e) => {
+      const m = typeof e === 'string' ? /^[^@\s]+@([^@\s]+)$/.exec(e) : null;
+      return !m || !mailDomains.has(/** @type {string} */ (m[1]).toLowerCase());
+    });
+    if (endpoints.length > 0 && outside === undefined) return [];
+    return [`subscription by ${protocol} to ${show(outside ?? subscription.Endpoint)} sends messages outside the project's mail domains (${[...mailDomains].join(', ') || 'none given'})`];
+  }
   if (typeof protocol !== 'string' || !/^(?:sqs|lambda|firehose|application)$/.test(protocol)) {
     return [`subscription by ${show(protocol)} to ${show(subscription.Endpoint)} sends messages out of the account`];
   }
@@ -776,10 +788,10 @@ function resourceProblems(id, resource, ctx, repos) {
       problems.push(...notificationProblems(props.NotificationConfiguration, account));
       break;
     case 'AWS::SNS::Subscription':
-      problems.push(...subscriptionProblems(props, account));
+      problems.push(...subscriptionProblems(props, account, ctx.mailDomains ?? new Set()));
       break;
     case 'AWS::SNS::Topic':
-      for (const s of valuesAt(props, ['Subscription', '[]'])) problems.push(...subscriptionProblems(s, account));
+      for (const s of valuesAt(props, ['Subscription', '[]'])) problems.push(...subscriptionProblems(s, account, ctx.mailDomains ?? new Set()));
       break;
     case 'AWS::SQS::Queue': {
       const target = valuesAt(props, ['RedrivePolicy', 'deadLetterTargetArn']);
@@ -816,6 +828,7 @@ function resourceProblems(id, resource, ctx, repos) {
 export function checkPolicies(dir, options) {
   const { account } = options;
   const repos = new Set((options.repos ?? []).map(repoName).filter((r) => r !== null));
+  const mailDomains = new Set((options.mailDomains ?? []).map((d) => d.toLowerCase()));
   let root;
   try {
     root = realpathSync(dir);
@@ -883,7 +896,7 @@ export function checkPolicies(dir, options) {
 
   const all = [...templates.values(), ...others.values()];
   for (const t of all) {
-    const ctx = { account, t, exports, depth: 0 };
+    const ctx = { account, t, exports, depth: 0, mailDomains };
     if (t.template.Transform !== undefined) problems.push(`policy-guard: ${t.file}: the template has a Transform (${show(t.template.Transform)}), which rewrites it at deploy time; it cannot be checked`);
     if (JSON.stringify(t.template).includes('"Fn::Transform"')) problems.push(`policy-guard: ${t.file}: the template uses Fn::Transform (a macro or AWS::Include), which changes it at deploy time; it cannot be checked`);
     for (const [id, resource] of Object.entries(t.template.Resources ?? {})) {
@@ -961,7 +974,7 @@ export function summary(result) {
 
 /**
  * @param {string[]} args
- * @returns {{ dir: string, account: string, repos: string[], allow: boolean, summaryFile?: string } | { error: string }}
+ * @returns {{ dir: string, account: string, repos: string[], mailDomains: string[], allow: boolean, summaryFile?: string } | { error: string }}
  */
 export function parseArgs(args) {
   let allow = false;
@@ -971,6 +984,8 @@ export function parseArgs(args) {
   let account;
   /** @type {string[]} */
   const repos = [];
+  /** @type {string[]} */
+  const mailDomains = [];
   /** @type {string | undefined} */
   let summaryFile;
   for (let i = 0; i < args.length; i++) {
@@ -979,6 +994,13 @@ export function parseArgs(args) {
     const needs = (/** @type {string} */ what) => value === undefined || value === '' || value.startsWith('--') ? `${arg} needs ${what}` : null;
     if (arg === '--allow') {
       allow = true;
+    } else if (arg === '--mail-domain') {
+      const missing = needs('a domain');
+      if (missing) return { error: missing };
+      const v = /** @type {string} */ (value);
+      if (!/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$/i.test(v)) return { error: `--mail-domain ${v} is not a domain name` };
+      mailDomains.push(v);
+      i++;
     } else if (arg === '--summary' || arg === '--account' || arg === '--repo') {
       const missing = needs(arg === '--summary' ? 'a file' : arg === '--account' ? 'an account id' : 'owner/repo');
       if (missing) return { error: missing };
@@ -1000,7 +1022,7 @@ export function parseArgs(args) {
   }
   if (dir === undefined) return { error: 'no assembly directory' };
   if (account === undefined) return { error: '--account is required' };
-  return { dir, account, repos, allow, ...(summaryFile === undefined ? {} : { summaryFile }) };
+  return { dir, account, repos, mailDomains, allow, ...(summaryFile === undefined ? {} : { summaryFile }) };
 }
 
 /**
@@ -1010,10 +1032,10 @@ export function parseArgs(args) {
 export function main(args) {
   const parsed = parseArgs(args);
   if ('error' in parsed) {
-    process.stderr.write(`policy-guard: ${parsed.error}\nusage: node policy-guard.mjs <assembly dir> --account <id> [--repo <owner/repo>]... [--allow] [--summary <file>]\n`);
+    process.stderr.write(`policy-guard: ${parsed.error}\nusage: node policy-guard.mjs <assembly dir> --account <id> [--repo <owner/repo>]... [--mail-domain <domain>]... [--allow] [--summary <file>]\n`);
     return 2;
   }
-  const result = policyGuard(parsed.dir, { account: parsed.account, repos: parsed.repos, allow: parsed.allow });
+  const result = policyGuard(parsed.dir, { account: parsed.account, repos: parsed.repos, mailDomains: parsed.mailDomains, allow: parsed.allow });
   process.stdout.write(report(result));
   if (parsed.summaryFile !== undefined) appendFileSync(parsed.summaryFile, summary(result));
   return result.code;
