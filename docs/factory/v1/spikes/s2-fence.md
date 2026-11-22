@@ -31,3 +31,13 @@ Findings that change the design or the plan:
    - and its role must be refused on Trendigle.
 
    Cost: a few cents.
+
+## Holes found later in the spike's documents (2026-11-22, review and security review of shu-i1b)
+
+The 58 simulator cases passed, but they only asked the questions I thought of. The construct's reviewers found these in the same statements; shu-i1b fixes them and shu-9bj.2 covers the bootstrap:
+- `DeployThroughBootstrap` let any bounded role (a server, a Lambda) assume the project's bootstrap roles, including the lookup role (account-wide ReadOnlyAccess) and the deploy role. Critical.
+- The default `cdk bootstrap` deploy role may change any stack, and CloudFormation reuses a stack's stored role without `iam:PassRole`, so a project could update another project's stack and run as that stack's (admin) role. Critical; needs a custom bootstrap template (shu-9bj.2).
+- `EC2AssociateToOwnInstance` did not check the elastic IP's or network interface's tag: another project's public IP could be moved onto this project's server.
+- `CreateVolume` from another project's snapshot and `RunInstances` from another project's private AMI or into its security group were allowed.
+- `RuntimeAgents` granted logs and SSM instance actions on `*`; `LambdaEventSources` was unconditioned; `ec2:Get*` included console output and password data; `CreateTags` could retag an instance as another project's.
+Lesson: simulator cases written by the person who wrote the policy confirm intent, not safety. An adversarial read of each statement, and a resource-type check for every `*`, found what the cases did not.

@@ -137,7 +137,7 @@ Trust, for each role, all conditions together:
 - `job_workflow_ref` StringLike `rummykhan/shukka/.github/workflows/infra.yml@refs/tags/<shukkaVersions>` (infra, diff) or `.../ec2.yml@...` (app).
 
 Permissions:
-- **infra**: `sts:AssumeRole` on the project-qualifier bootstrap roles `cdk-<qualifier>-{deploy,file-publishing,lookup}-role-*`.
+- **infra**: `sts:AssumeRole` on the project-qualifier bootstrap roles `cdk-<qualifier>-{deploy,file-publishing}-role-*` only. Not the lookup role: the stock one has account-wide ReadOnlyAccess, and `cdk.context.json` is committed so deploys need no live lookup (security review of shu-7nw, 2026-11-22). The bootstrap itself is shukka's own template, whose deploy role can change only the project's stacks with the project's own execution role (shu-9bj.2).
 - **app**: `s3:PutObject` on `<bucket>/<project>/*`; `ssm:SendCommand` on `AWS-RunShellScript` and on instances with the tag; `ssm:GetCommandInvocation`, `ec2:DescribeInstances`; `ssm:GetParameter` on `<ssmPath>/*`.
 - **diff**: `cloudformation:GetTemplate`, `DescribeStacks` on `arn:aws:cloudformation:<region>:<account>:stack/<StackPrefix>*/*`; `ssm:GetParameter` on `/cdk-bootstrap/<qualifier>/version`. Nothing else (no lookup role: `cdk.context.json` is committed).
 
