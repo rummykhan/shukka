@@ -126,3 +126,46 @@ bd prime                # Refresh Beads context
 
 **Architecture in one line:** issues live in a local Dolt DB; sync uses `refs/dolt/data` on your git remote; `.beads/issues.jsonl` is a passive export. See https://github.com/gastownhall/beads/blob/main/docs/core-concepts/sync-concepts.md for details and anti-patterns.
 <!-- END BEADS CODEX SETUP -->
+
+<!-- BEGIN SOFTWARE FACTORY — managed block. Edit through the factory (/factory-setup, /factory-run); keep these markers. -->
+## How work gets done here
+
+This project is delivered through the software factory. The project profile is [`FACTORY.md`](FACTORY.md): commands, the gate, git and deploy policy, QA, lessons learned. Read it before changing code.
+
+- **Tasks live in beads** (`bd ready`, `bd show <id>`). Every task has acceptance criteria written before the code; work to them.
+- **Pipeline:** requirements → design → plan → build → review → QA → validate, with the user approving requirements, design, plan and any deploy. Start a piece of work with `/factory`.
+- **Nobody closes their own work.** A task is done when an independent review passes and the gate (`npm run gate`) is green.
+- **Need something only a human can provide** (a key, access, a decision)? Don't guess or stub silently: record it as a `factory:needs-user` bead and carry on with what does not depend on it.
+- **Changed the system's shape?** Update the System design below in the same change.
+
+## System design
+
+_As built at `e21bf3a` · updated 2026-11-22_
+
+### What it is
+A reusable deployment pipeline for AWS CDK projects on GitHub Actions. Nothing is built yet; the approved design is `docs/factory/v1/design.md`.
+
+### Components
+Nothing built yet.
+
+### Data model
+Nothing built yet.
+
+### Key flows
+Nothing built yet.
+
+### Interfaces
+Nothing built yet.
+
+### External dependencies
+| Service | Purpose | Config | Local stand-in |
+|---|---|---|---|
+| GitHub Actions + OIDC | Runs the pipeline; issues tokens AWS trusts | none (OIDC) | `rummykhan/shukka-consumer-test` |
+| AWS (CloudFormation, IAM, S3, SSM, EC2) | What consumers deploy to | consumer's account | throwaway `shukkatest*` resources |
+
+### Decisions
+- See the Decisions table in `docs/factory/v1/design.md` (D1–D11).
+
+### In progress
+- shukka v1 — builds everything above; Trendigle switches to it.
+<!-- END SOFTWARE FACTORY -->

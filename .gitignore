@@ -9,3 +9,4 @@ cdk.out/
 .beads-credential-key
 .beads/proxieddb/
 *.gate.lock*
+.beads.gate.lock
