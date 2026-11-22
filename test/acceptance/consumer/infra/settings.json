@@ -1,5 +1,6 @@
 {
   "tableName": "shukkatest-items",
   "note": "",
-  "escape": false
+  "escape": false,
+  "plantExecutableAsset": false
 }

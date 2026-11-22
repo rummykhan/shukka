@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # Probe: try to obtain each shukkatest deploy role from the job this runs in, the way an attacker's
-# code in that job would (request a GitHub OIDC token, call sts:AssumeRoleWithWebIdentity).
+# code in that job would (request a GitHub OIDC token, call sts:AssumeRoleWithWebIdentity). The roles
+# are targets.json's .roles: shukka's infra, app and diff roles, and the CDK roles a token must never
+# reach directly (the project's deploy and lookup roles, the default bootstrap's deploy and lookup).
 #
 #   assume.sh <prefix|auto>
 #
 # Prints one line per role, which the acceptance suite reads from the run log:
-#   RESULT <prefix>-<infra|app|diff> DENIED|ALLOWED|ERROR <detail>
+#   RESULT <prefix>-<role key> DENIED|ALLOWED|ERROR <detail>
 #   CLAIMS <prefix> sub=... job_workflow_ref=... (claims only; the token itself is never printed)
 # A job without `id-token: write` has no token endpoint at all; that is reported as DENIED.
 # Never fails the job: the verdicts are the output.
@@ -23,7 +25,8 @@ if [[ "$prefix" == auto ]]; then
   esac
 fi
 region=$(jq -r .region "$targets")
-roles=(infra app diff)
+roles=()
+while IFS= read -r r; do roles+=("$r"); done < <(jq -r '.roles | keys_unsorted[]' "$targets")
 
 if [[ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" || -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]]; then
   for r in "${roles[@]}"; do

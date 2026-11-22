@@ -1,9 +1,12 @@
 # shellcheck shell=bash
 # phase: D
-# title: the pipeline's credentials and execution role try to change the stand-in project and read Trendigle
+# title: a merge's own CDK code looks for credentials during synth; the execution role is asked to change the stand-in project; the box role reads Trendigle
 # needs: A
 # critical: no
 
+# The CDK code runs escape.sh while shukka synthesizes it on main (no token, no credentials since
+# shu-9zr), and adds Shukkatest-Escape, which the pipeline's deploy hands to shukkatest's execution
+# role. What the infra and deploy roles themselves may do is read from IAM by the cases (simulator).
 phase_D() {
   local sha id
   snapshot before_escape

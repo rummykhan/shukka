@@ -1,21 +1,31 @@
 #!/usr/bin/env bash
-# Probe: what can the credentials in this process reach? Runs inside the CDK app (bin/app.mjs) when
-# infra/probe.on exists, so it holds exactly what shukka's infra.yml hands the project's CDK code:
-#   - on a merge to main: the infra role ("pipeline" credentials, R3)
-#   - on a pull request:  the diff role (R4: a pull request's code must not get credentials that can
-#                         change anything)
+# Probe: what does the project's own CDK code hold while shukka synthesizes it? Runs inside the CDK
+# app (bin/app.mjs) when infra/probe.on exists. Since shu-9zr the project's npm ci and cdk synth run
+# only in infra.yml's synth job, which has no id-token permission; the credentialed jobs never run
+# project code. So, on a merge to main and on a pull request alike, this code must find:
+#   RESULT <p>-oidc NO-TOKEN          no OIDC token request URL or request token in the environment
+#   RESULT <p>-aws NO-CREDS           no AWS credentials (environment, files, or a working identity)
+#   RESULT <p>-github-token NO-TOKEN  no GitHub token in the environment or in the checkout's git config
+# where <p> is R3-merge-synth (push to main), R4-pr-synth (pull request), R3-dispatch-synth (run by
+# hand) or R2-<event>-synth. The opposite verdicts are TOKEN and CREDS; when it finds a token it also
+# tries the roles with it (assume.sh), and with AWS credentials it tries the stand-in project and
+# Trendigle (read only) as the older probe did, so a failure comes with what was reachable.
 #
-# Prints "RESULT <id> DENIED|ALLOWED|ERROR <detail>" lines for the acceptance suite. Writes are only
-# ever attempted on shukkatest's own resources or the stand-in project (standin-shukkatest-*), both
-# throwaway; Trendigle is only read (DescribeTable, a one-key listing). Never fails the synth.
+# Never prints a secret, only the names of the variables and files it found. Never fails the synth.
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 t="$here/targets.json"
 j() { jq -r "$1" "$t"; }
-account=$(j .account)
 region=$(j .region)
-qualifier=$(j .qualifier)
 export AWS_REGION=$region AWS_DEFAULT_REGION=$region AWS_PAGER=""
+
+case "${GITHUB_EVENT_NAME:-}:${GITHUB_REF:-}" in
+  pull_request:*) p=R4-pr-synth ;;
+  push:refs/heads/main) p=R3-merge-synth ;;
+  workflow_dispatch:refs/heads/main) p=R3-dispatch-synth ;;
+  *) p="R2-${GITHUB_EVENT_NAME:-local}-synth" ;;
+esac
+echo "PROBE escape running in ${GITHUB_JOB:-?} of ${GITHUB_WORKFLOW_REF:-?} (${GITHUB_EVENT_NAME:-?} ${GITHUB_REF:-?})"
 
 # attempt <id> <command...>: runs one AWS call and prints its verdict.
 attempt() {
@@ -38,78 +48,63 @@ writable() {
     { echo "RESULT escape-guard ERROR refusing to write to $1"; return 1; }
 }
 
-# The same set of attempts against the stand-in project and Trendigle, with whatever credentials are
-# in the environment now. $1 is the id prefix.
+# What credentials found here could do to the stand-in project and Trendigle (read only).
 other_projects() {
-  local p=$1 st sb sq stk tt tb
+  local q=$1 st sb sq stk tt tb
   st=$(j .standin.table) sb=$(j .standin.bucket) stk=$(j .standin.stack) sq=$(j .standin.queue)
   tt=$(j .readOnly.trendigleTable) tb=$(j .readOnly.trendigleBucket)
-  writable "$st" && attempt "$p-standin-table-write" aws dynamodb put-item --table-name "$st" \
+  writable "$st" && attempt "$q-standin-table-write" aws dynamodb put-item --table-name "$st" \
     --item '{"pk":{"S":"shukkatest-probe"}}'
-  writable "$sb" && attempt "$p-standin-bucket-write" aws s3api put-object --bucket "$sb" \
+  writable "$sb" && attempt "$q-standin-bucket-write" aws s3api put-object --bucket "$sb" \
     --key shukkatest-probe.txt --body "$t"
-  writable "$sq" && attempt "$p-standin-queue-create" aws sqs create-queue --queue-name "$sq"
-  writable "$stk" && attempt "$p-standin-stack-update" aws cloudformation update-stack --stack-name "$stk" \
+  writable "$sq" && attempt "$q-standin-queue-create" aws sqs create-queue --queue-name "$sq"
+  writable "$stk" && attempt "$q-standin-stack-update" aws cloudformation update-stack --stack-name "$stk" \
     --use-previous-template --tags Key=shukkatest-probe,Value=changed
-  writable "$stk" && attempt "$p-standin-stack-delete" aws cloudformation delete-stack --stack-name "$stk"
-  # Trendigle: read-only attempts only.
-  attempt "$p-trendigle-table-read" aws dynamodb describe-table --table-name "$tt" --query Table.TableStatus
-  attempt "$p-trendigle-bucket-read" aws s3api list-objects-v2 --bucket "$tb" --max-keys 1 --query KeyCount
+  attempt "$q-trendigle-table-read" aws dynamodb describe-table --table-name "$tt" --query Table.TableStatus
+  attempt "$q-trendigle-bucket-read" aws s3api list-objects-v2 --bucket "$tb" --max-keys 1 --query KeyCount
 }
 
-me=$(aws sts get-caller-identity --query Arn --output text 2>/dev/null) || {
-  echo "RESULT escape-whoami ERROR no AWS credentials in the CDK app's environment"
-  exit 0
-}
-echo "PROBE escape running as $me"
+# 1. The GitHub OIDC token endpoint (what AssumeRoleWithWebIdentity needs).
+oidc=()
+[[ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]] && oidc+=(ACTIONS_ID_TOKEN_REQUEST_URL)
+[[ -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]] && oidc+=(ACTIONS_ID_TOKEN_REQUEST_TOKEN)
+if ((${#oidc[@]} == 0)); then
+  echo "RESULT $p-oidc NO-TOKEN no OIDC token request URL or token in the environment"
+else
+  echo "RESULT $p-oidc TOKEN found ${oidc[*]}"
+  bash "$here/assume.sh" "$p-oidc-assume" || true
+fi
 
-case "$me" in
-  */shukkatest-shukka-infra/*)
-    # Pipeline credentials (merge to main).
-    other_projects R3-pipeline-infra
-    attempt R3-pipeline-default-bootstrap-role aws sts assume-role \
-      --role-arn "arn:aws:iam::$account:role/cdk-hnb659fds-deploy-role-$account-$region" \
-      --role-session-name shukkatest-probe
-    # The lookup roles carry account-wide read access; the infra role must reach neither (D10).
-    attempt R3-pipeline-project-lookup-role aws sts assume-role \
-      --role-arn "arn:aws:iam::$account:role/cdk-$qualifier-lookup-role-$account-$region" \
-      --role-session-name shukkatest-probe
-    attempt R3-pipeline-default-lookup-role aws sts assume-role \
-      --role-arn "arn:aws:iam::$account:role/cdk-hnb659fds-lookup-role-$account-$region" \
-      --role-session-name shukkatest-probe
-    deploy_role="arn:aws:iam::$account:role/cdk-$qualifier-deploy-role-$account-$region"
-    if creds=$(aws sts assume-role --role-arn "$deploy_role" --role-session-name shukkatest-probe \
-      --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text 2>/dev/null); then
-      # Control: the project's own deploy role must be reachable, or the pipeline could not deploy.
-      echo "RESULT R3-pipeline-ctl-project-deploy-role ALLOWED"
-      read -r ak sk tk <<<"$creds"
-      (
-        export AWS_ACCESS_KEY_ID=$ak AWS_SECRET_ACCESS_KEY=$sk AWS_SESSION_TOKEN=$tk
-        other_projects R3-pipeline-deployrole
-      )
-    else
-      echo "RESULT R3-pipeline-ctl-project-deploy-role DENIED could not assume $deploy_role"
-    fi
-    ;;
-  */shukkatest-shukka-diff/*)
-    # Pull-request credentials: must change nothing, not even shukkatest's own resources.
-    attempt R4-prdiff-ctl-get-template aws cloudformation get-template --stack-name "$(j .own.stack)"
-    attempt R4-prdiff-project-deploy-role aws sts assume-role \
-      --role-arn "arn:aws:iam::$account:role/cdk-$qualifier-deploy-role-$account-$region" \
-      --role-session-name shukkatest-probe
-    attempt R4-prdiff-deploy-bucket-write aws s3api put-object --bucket "$(j .own.bucket)" \
-      --key shukkatest/probe.txt --body "$t"
-    attempt R4-prdiff-table-write aws dynamodb put-item --table-name "$(j .own.table)" \
-      --item '{"pk":{"S":"shukkatest-probe"}}'
-    attempt R4-prdiff-stack-update aws cloudformation update-stack --stack-name "$(j .own.stack)" \
-      --use-previous-template --parameters ParameterKey=BootstrapVersion,UsePreviousValue=true \
-      --tags Key=Project,Value=shukkatest Key=shukkatest-probe,Value=changed
-    attempt R4-prdiff-send-command aws ssm send-command --document-name AWS-RunShellScript \
-      --targets Key=tag:Project,Values=shukkatest --parameters 'commands=["true"]'
-    other_projects R4-prdiff
-    ;;
-  *)
-    echo "RESULT escape-whoami ERROR unexpected identity $me"
-    ;;
-esac
+# 2. AWS credentials: variables, files, and whether any identity answers at all.
+found=()
+for v in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_WEB_IDENTITY_TOKEN_FILE AWS_ROLE_ARN \
+  AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_CREDENTIALS_RELATIVE_URI AWS_PROFILE; do
+  [[ -n "${!v:-}" ]] && found+=("$v")
+done
+for f in "${AWS_SHARED_CREDENTIALS_FILE:-$HOME/.aws/credentials}" "${AWS_CONFIG_FILE:-$HOME/.aws/config}"; do
+  [[ -s "$f" ]] && found+=("$f")
+done
+if me=$(timeout 60 aws sts get-caller-identity --query Arn --output text 2>/dev/null); then
+  found+=("identity $me")
+fi
+if ((${#found[@]} == 0)); then
+  echo "RESULT $p-aws NO-CREDS no AWS credential variables or files, and no identity answers"
+else
+  echo "RESULT $p-aws CREDS found ${found[*]}"
+  [[ -n "${me:-}" ]] && other_projects "$p-held"
+fi
+
+# 3. A GitHub token: in the environment, or persisted by actions/checkout into the git config.
+gh_found=()
+for v in GITHUB_TOKEN GH_TOKEN; do
+  [[ -n "${!v:-}" ]] && gh_found+=("$v")
+done
+if git -C "$here/.." config --get-regexp '^http\..*extraheader$' >/dev/null 2>&1; then
+  gh_found+=("git http extraheader")
+fi
+if ((${#gh_found[@]} == 0)); then
+  echo "RESULT $p-github-token NO-TOKEN no GitHub token in the environment or the checkout's git config"
+else
+  echo "RESULT $p-github-token TOKEN found ${gh_found[*]}"
+fi
 exit 0

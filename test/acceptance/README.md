@@ -1,4 +1,4 @@
-# Acceptance suite (shu-95y)
+# Acceptance suite (shu-95y; probes reworked by shu-9bj.3 for the credential-free synth)
 
 Runs shukka the way a consumer does and checks the result against `docs/factory/v1/requirements.md`
 and the epic's success criteria. Written from the requirements and the design's contracts, not from
@@ -6,7 +6,7 @@ the implementation. Not part of the gate: it needs the owner's GitHub login and 
 
 ```bash
 bash test/acceptance/run.sh v1.0.0-rc.1     # everything, then teardown (about 1.5 to 2 hours)
-bash test/acceptance/run.sh --list          # every case id, one line each
+bash test/acceptance/run.sh --list          # every case id, one line each (with the task that last rewrote it)
 bash test/acceptance/run.sh --teardown      # remove leftovers of a run that was killed
 ```
 
@@ -20,9 +20,10 @@ the `RESULT` lines and every run's log and job list are kept in the run director
 |---|---|---|
 | preflight | tools, the account (read from `aws sts get-caller-identity`, never written in a file), the rc tag exists, the test repo is private, **no leftovers of an earlier run** (it stops rather than delete them) | |
 | A setup | throwaway hosted zone; buildEnv parameter; stand-in project; consumer rendered and cloned (it imports the account's existing GitHub OIDC provider by ARN); `shukka bootstrap shukkatest`; `Shukkatest-Ci` deployed by hand; baseline pushed to main (the first merge) | R1, R2, R3, R5, R6 basics, the planted bundle hook |
-| B pull request | one PR: an app change, a harmless infra change, the probe workflows and the in-CDK probe; then a destructive push to it. The branch and a tag carry the probes too | R1, R2, R4 |
-| C own workflow | the consumer's own workflow on main asks for each role, then is removed | R2 |
-| D fence | a merge adds `Shukkatest-Escape` (changes the stand-in) and runs the in-CDK probe with the pipeline's credentials; the box's role reads at Trendigle; then removed | R3 |
+| B pull request | one PR: an app change, a harmless infra change, the probe workflows and the in-CDK probe (it runs in the PR's synth job and must find nothing); then a destructive push to it. The branch and a tag carry the probes too | R1, R2, R4 |
+| C own workflow | the consumer's own workflow on main asks for each role with its own OIDC token, then is removed | R2 |
+| D fence | a merge adds `Shukkatest-Escape` (changes the stand-in) and runs the in-CDK probe in the merge's synth job (must find nothing); the box's role reads at Trendigle; then removed. Cases read what the infra, deploy and diff roles may do from IAM (simulator) | R3 |
+| D2 assembly | a merge whose CDK code plants a file asset built by a command (`settings.plantExecutableAsset`); the deploy job must refuse the assembly; then removed | R3, R2 |
 | E docs only | README edit merged | R7 |
 | F destructive | table renamed (replacement) merged; then a manual run with `allow_replacement` | R4 |
 | G rollback | web made unhealthy and merged; then fixed | R5, R7 |
@@ -80,11 +81,21 @@ Pushed (force, a fresh history each run) to `rummykhan/shukka-consumer-test`:
 - `box/configure.sh`: the configure hook (user and systemd unit pointing at `current`; never starts it).
 - `smoke/smoke.sh`: finds the box by asking the zone's Route 53 name server directly (the zone is not
   delegated), checks both `/health` and the web page's marker.
-- `probe/assume.sh`: asks for the infra, app and diff roles with the job's own OIDC token and prints
-  `RESULT <case> DENIED|ALLOWED|ERROR` and the token's claims (never the token). Called by the build
-  and checks commands (a compromised dependency) and by the probe workflows.
-- `probe/escape.sh`: runs inside the CDK app when `infra/probe.on` exists, so it holds exactly what
-  infra.yml gives the project's code: the diff role on a pull request, the infra role on main.
+- `probe/assume.sh`: asks for every role in `probe/targets.json` `.roles` (shukka's infra, app and diff
+  roles; the project's CDK deploy and lookup roles; the default bootstrap's deploy and lookup roles)
+  with the job's own OIDC token and prints `RESULT <case>-<role> DENIED|ALLOWED|ERROR` and the token's
+  claims (never the token). Called by the build and checks commands (a compromised dependency) and by
+  the probe workflows.
+- `probe/escape.sh`: runs inside the CDK app when `infra/probe.on` exists. Since shu-9zr the project's
+  code runs only in infra.yml's `synth` job (no `id-token`); the credentialed jobs run shukka's own cdk
+  on the downloaded assembly. So the probe reports what that code holds: `RESULT <p>-oidc
+  NO-TOKEN|TOKEN`, `RESULT <p>-aws NO-CREDS|CREDS`, `RESULT <p>-github-token NO-TOKEN|TOKEN`, with
+  `<p>` = `R3-merge-synth` on main and `R4-pr-synth` on a pull request. With a token or credentials it
+  also tries what they reach, so a failure comes with evidence.
+- `infra/bin/app.mjs` with `settings.plantExecutableAsset`: after synthesis adds a file asset whose
+  source is a command (`source.executable`) to every asset manifest, as a compromised CDK dependency
+  would. The command prints a marker computed by the shell (`...-RAN-42`), so the marker is in a log
+  only if the command ran.
 - `probe/workflows/`: copied into `.github/workflows/` only while the trust cases run.
 
 ## Coverage
@@ -95,14 +106,14 @@ Every acceptance line of R1-R8 and R10, and every success criterion of epic shu-
 |---|---|
 | R1.1 caller is the only CI file; PRs run checks; merges run checks, infra deploy, app deploy, smoke | `R1-caller-is-the-whole-ci`, `R1-merge-deploys-full-chain`, `R1-pr-runs-checks-not-deploy`, `R1-build-env-from-variables` |
 | R1.2 a project pinned to a version is unaffected by newer ones | `R1-pinned-to-rc-tag` (the run resolved every shukka workflow to the pinned tag's commit). Publishing a newer tag mid-run is **manual** (the suite does not move tags on the public repo) |
-| R2.1 non-main branch, pull request or tag cannot assume either role | `R2-branch-cannot-assume-roles`, `R2-pr-cannot-assume-roles`, `R2-tag-cannot-assume-roles` (consumer's own workflow), `R2-infra-yml-refused-off-main` (shukka's infra.yml itself, so only the subject differs) |
-| R2.2 a step that builds or tests app code cannot assume the infra role (trn-a2r) | `R2-build-job-cannot-assume`, `R2-checks-job-cannot-assume`, `R2-own-workflow-on-main-refused` (on main only the workflow differs) |
+| R2.1 non-main branch, pull request or tag cannot assume either role | `R2-branch-cannot-assume-roles`, `R2-pr-cannot-assume-roles`, `R2-tag-cannot-assume-roles` (consumer's own workflow with a real OIDC token: shukka's three roles and the CDK deploy and lookup roles), `R2-infra-yml-refused-off-main` (shukka's infra.yml itself, so only the subject differs; read from its `changes` job), `R4-pr-synth-gets-no-credentials` |
+| R2.2 a step that builds or tests app code cannot assume the infra role (trn-a2r) | `R2-build-job-cannot-assume`, `R2-checks-job-cannot-assume` (those jobs have no token endpoint: DENIED), `R2-own-workflow-on-main-refused` (a job that does hold a real token on main, refused by `job_workflow_ref`), `R3-merge-synth-gets-no-credentials` (the project's CDK code holds nothing), `R3-planted-executable-asset-stops-merge` |
 | R2.3 an existing OIDC provider is reused, not duplicated | `R2-oidc-provider-not-duplicated` (the Shukka-Account output is checked only if that stack already exists), `R2-oidc-provider-intact-after-run`. `shukka bootstrap --account`: **after shu-li5** (epic 2), not run here |
-| R3.1 pipeline credentials refused on another project's stack, table, bucket | `R3-pipeline-creds-refused-on-other-project`, `R3-execution-role-refuses-other-project`, `R3-pipeline-creds-refused-on-trendigle`, `R3-box-role-refused-on-trendigle`, `R4-pr-code-gets-no-write-credentials` |
+| R3.1 pipeline credentials refused on another project's stack, table, bucket | `R3-merge-synth-gets-no-credentials` (observed: project code on a merge holds no token or credentials), `R3-execution-role-refuses-other-project` (observed end to end: the merge is red, the stand-in unchanged), `R3-box-role-refused-on-trendigle` (observed from the box), `R3-planted-executable-asset-stops-merge` (observed: an asset that runs a command is refused before any role is assumed), `R3-pipeline-creds-refused-on-other-project` and `R3-pipeline-creds-refused-on-trendigle` (**IAM simulator, admin side**: see below), `R4-pr-code-gets-no-write-credentials` (simulator) |
 | R3.2 the project's own stacks deploy through the fence | `R3-own-stacks-through-fence`, `R1-merge-deploys-full-chain`, `SC1-throwaway-project-resources`, `R3-default-bootstrap-untouched`, `R3-default-bootstrap-intact-after-run`. Trendigle's own four stacks: epic shu-li0 |
 | R4.1 a removing/replacing diff stops the merge, names the resources, says how to proceed | `R4-destructive-change-stops-merge`, `R4-pr-diff-comment-updated-in-place`. The `### Infrastructure changes` / `### Guard` summary headings are **manual** (no API returns job summaries; the case prints the run to open) |
 | R4.2 rerun by hand with allow deploys it | `R4-allow-replacement-deploys` |
-| R4.3 PR shows the diff, PR code gets no credentials that can change anything | `R4-pr-diff-comment`, `R4-pr-diff-comment-updated-in-place`, `R4-pr-code-gets-no-write-credentials` |
+| R4.3 PR shows the diff, PR code gets no credentials that can change anything | `R4-pr-diff-comment` (diff job and the separate comment job), `R4-pr-diff-comment-updated-in-place`, `R4-pr-synth-gets-no-credentials` (observed: the PR's own code holds no token, credentials or GitHub token), `R4-pr-code-gets-no-write-credentials` (the diff role, held only by shukka's code: IAM simulator) |
 | R4 stateful resources retained by default | `R4-allow-replacement-deploys` (the replaced table is retained) |
 | R5.1 failing health check: previous version serving, run red, log shows both | `R5-unhealthy-release-rolls-back`, `R8-cli-rolls-back-unhealthy` |
 | R5 the configure hook comes from git, never from the bundle (design, after the shu-9bj.1 review) | `R5-bundle-hook-never-runs` |
@@ -117,9 +128,9 @@ Every acceptance line of R1-R8 and R10, and every success criterion of epic shu-
 | R9 Trendigle uses it | out of scope here: epic shu-li0 |
 | R10 / R10.1 shukka's own tests in its CI catch a loosened trust policy or a broken guard | `R10-shukka-ci-green-on-rc`, `R10-loosened-trust-fails-tests`, `R10-broken-guard-fails-tests` |
 | SC1 test consumer (caller + shukka.json only) deploys shukkatest on merge from an rc tag | `R1-caller-is-the-whole-ci`, `R1-merge-deploys-full-chain`, `SC1-throwaway-project-resources` |
-| SC2 PR shows the diff as a comment and cannot assume the deploy roles | `R4-pr-diff-comment`, `R2-pr-cannot-assume-roles`, `R4-pr-code-gets-no-write-credentials` |
-| SC3 a job that builds app code cannot assume the infra role (observed) | `R2-build-job-cannot-assume`, `R2-own-workflow-on-main-refused` |
-| SC4 shukkatest's pipeline refused on a Trendigle resource | `R3-pipeline-creds-refused-on-trendigle`, `R3-box-role-refused-on-trendigle` |
+| SC2 PR shows the diff as a comment and cannot assume the deploy roles | `R4-pr-diff-comment`, `R2-pr-cannot-assume-roles`, `R4-pr-synth-gets-no-credentials`, `R4-pr-code-gets-no-write-credentials` |
+| SC3 a job that builds app code cannot assume the infra role (observed) | `R2-build-job-cannot-assume`, `R2-own-workflow-on-main-refused`, `R3-merge-synth-gets-no-credentials` |
+| SC4 shukkatest's pipeline refused on a Trendigle resource | `R3-box-role-refused-on-trendigle` (observed), `R3-pipeline-creds-refused-on-trendigle` (simulator) |
 | SC5 destructive change stops the merge; manual run with allow deploys it | `R4-destructive-change-stops-merge`, `R4-allow-replacement-deploys` |
 | SC6 unhealthy release rolls back, run red | `R5-unhealthy-release-rolls-back` |
 | SC7 docs-only merge deploys nothing | `R7-docs-only-merge-deploys-nothing` |
@@ -130,10 +141,29 @@ Every acceptance line of R1-R8 and R10, and every success criterion of epic shu-
 
 The probes print `RESULT <id> <verdict>` in the GitHub run logs; the suite fetches the logs and
 repeats each line in its own log as `RESULT <id> DENIED (run N: ...)`. A missing line is `MISSING`
-and fails the case, so a probe that never ran cannot pass. Each set has a control that must be
-`ALLOWED` (the pipeline's own deploy, `R3-pipeline-ctl-project-deploy-role`,
-`R4-prdiff-ctl-get-template`), so a wrong role ARN cannot pass as a refusal either. A job without
-`id-token: write` has no token endpoint at all; the probe reports that as `DENIED`.
+and fails the case, so a probe that never ran cannot pass. The synth probes are read only from the
+synth job's own lines (`pull request / synth`, `stacks / synth`), and must say `NO-TOKEN` (OIDC and
+GitHub token) and `NO-CREDS` (AWS). A job without `id-token: write` has no token endpoint at all;
+`assume.sh` reports that as `DENIED`.
+
+**What moved to the admin side (shu-9bj.3).** Since shu-9zr no project code runs while the infra
+role, the project's CDK deploy role or the diff role is held, so no probe the suite plants in the
+consumer can hold them (the old controls `R3-pipeline-ctl-project-deploy-role` and
+`R4-prdiff-ctl-get-template`, observed from inside the CDK app, could no longer be met). A consumer
+workflow cannot hold them either: calling shukka's infra.yml runs shukka's code, not the probe's, and
+a consumer job that asks with its own OIDC token is refused by `job_workflow_ref` (observed in the
+R2 cases above, for shukka's roles and the CDK deploy and lookup roles). So what an infra-role,
+deploy-role or diff-role session may do is read from IAM with the admin profile:
+`aws iam simulate-principal-policy` evaluates the role's identity policies and its permissions
+boundary for one action on one resource, with `aws:RequestedRegion`, the resource's real
+`Project` tag and, for CloudFormation, `cloudformation:RoleArn` as context. The suite prints
+`RESULT <id> <verdict> (simulator: ...)`. Each set keeps a control with the same action and context
+shape that must be `ALLOWED` (`R3-pipeline-ctl-project-deploy-role`,
+`R3-pipeline-deployrole-ctl-own-stack-changeset`, `R4-prdiff-ctl-get-template`), so a wrong ARN or
+a missing context key cannot pass as a refusal. The simulator does not evaluate resource policies,
+SCPs or the target role's trust policy; for a refusal a caller-side denial is enough, and the
+controls' real counterparts are the pipeline's own deploys (`R1-merge-deploys-full-chain`). The
+fence itself (the execution role) is still observed end to end (`R3-execution-role-refuses-other-project`).
 
 ### Texts matched in job logs
 
@@ -143,6 +173,7 @@ with shu-9zr on its mailbox; the guard's lines are `scripts/guard.mjs`'s report.
 
 | Where | Line |
 |---|---|
+| infra deploy job, planted executable asset | `assembly: <manifest>: file asset shukkatestplantedasset is built by running a command (source.executable); refused` (`scripts/assembly.mjs check`) |
 | infra deploy job, destructive diff | `guard: these changes delete or replace a resource:`, then the offending diff lines (must name `AWS::DynamoDB::Table` and `Items`), then `guard: stopping. If this is intended, run the workflow by hand on main with allow_replacement ticked.` |
 | smoke job, smoke command failed | a line beginning `shukka: the site is live but failing its smoke test` |
 | `shukka deploy`, destructive diff | the same guard header and offending lines |
@@ -154,8 +185,9 @@ Kept in one place each so they are easy to correct; all asked on the owners' mai
 - CLI flags (`lib/cli.sh`): `bootstrap <project> --config
   --hosted-zone-id --repo`, `deploy --profile`. The toolkit stack's name is not assumed: the suite finds
   it by its `Qualifier` parameter and the boundary stack by the policies it holds.
-- Job display names (`JOB_RE_*` in `lib/common.sh`): plan, check, build, infra/deploy, diff,
-  app/ec2/release (with the app name), smoke.
+- Job display names (`JOB_RE_*` in `lib/common.sh`), as shu-9zr named them: `plan`, `check <name>`,
+  `build <app>`, `stacks / synth|changes|deploy`, `pull request / synth|diff|comment`,
+  `servers / changes|release <app>`, `smoke` (each prefixed `shukka / ` by the caller's job id).
 - infra.yml's mode input name (`SHUKKATEST_INFRA_MODE_INPUT`, default `mode`) for calling it directly.
 - `build.bundle` is read as a script path relative to `build.dir`.
 - The throwaway zone's domain (`SHUKKATEST_ZONE_DOMAIN`, default `shukkatest-<run>.com`, not delegated).
