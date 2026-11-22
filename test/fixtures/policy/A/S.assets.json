@@ -1,0 +1,1 @@
+{"version": "48.0.0", "files": {"evil": {"source": {"path": "evil.yaml", "packaging": "file"}, "destinations": {"d": {"bucketName": "cdk-hnb659fds-assets-818221194501-us-east-1", "objectKey": "evil.yaml"}}}}}

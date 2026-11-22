@@ -202,6 +202,29 @@ const extra = [
   ['bounded', 'allowed', 'ssm:DescribeInstanceInformation', '*', APP],
   // A deploy bucket not named for the project is outside the fence (shukka.json refuses it).
   ['bounded', 'implicitDeny', 's3:PutObject', `arn:aws:s3:::shared-deploy-${A}/trendigle/app/abc.tgz`, APP],
+  // shu-9bj.6: no bounded role (server, Lambda, custom resource) writes a resource policy or sends data out after the
+  // policy guard read the templates; ordinary use of the same resources stays allowed.
+  ['bounded', 'explicitDeny', 's3:PutBucketPolicy', `arn:aws:s3:::trendigle-prod-media-${A}`],
+  ['bounded', 'explicitDeny', 's3:DeleteBucketPolicy', `arn:aws:s3:::trendigle-prod-media-${A}`],
+  ['bounded', 'explicitDeny', 's3:PutBucketAcl', `arn:aws:s3:::trendigle-prod-media-${A}`],
+  ['bounded', 'explicitDeny', 's3:PutObjectAcl', `arn:aws:s3:::trendigle-prod-media-${A}/x.png`],
+  ['bounded', 'explicitDeny', 's3:PutBucketPublicAccessBlock', `arn:aws:s3:::trendigle-prod-media-${A}`],
+  ['bounded', 'explicitDeny', 's3:PutBucketOwnershipControls', `arn:aws:s3:::trendigle-prod-media-${A}`],
+  ['bounded', 'explicitDeny', 'sqs:AddPermission', `arn:aws:sqs:${R}:${A}:trendigle-prod-events`],
+  ['bounded', 'explicitDeny', 'sqs:SetQueueAttributes', `arn:aws:sqs:${R}:${A}:trendigle-prod-events`],
+  ['bounded', 'explicitDeny', 'sns:AddPermission', `arn:aws:sns:${R}:${A}:trendigle-prod-alerts`],
+  ['bounded', 'explicitDeny', 'sns:SetTopicAttributes', `arn:aws:sns:${R}:${A}:trendigle-prod-alerts`],
+  ['bounded', 'explicitDeny', 'sns:Subscribe', `arn:aws:sns:${R}:${A}:trendigle-prod-alerts`],
+  ['bounded', 'explicitDeny', 'lambda:AddPermission', `arn:aws:lambda:${R}:${A}:function:Trendigle-prod-Notify-Worker`],
+  ['bounded', 'explicitDeny', 'lambda:AddLayerVersionPermission', `arn:aws:lambda:${R}:${A}:layer:trendigle-x:1`],
+  ['bounded', 'explicitDeny', 'lambda:CreateFunctionUrlConfig', `arn:aws:lambda:${R}:${A}:function:Trendigle-prod-Notify-Worker`],
+  ['bounded', 'explicitDeny', 'lambda:UpdateFunctionUrlConfig', `arn:aws:lambda:${R}:${A}:function:Trendigle-prod-Notify-Worker`],
+  ['bounded', 'explicitDeny', 'dynamodb:PutResourcePolicy', `arn:aws:dynamodb:${R}:${A}:table/trendigle_prod_posts`],
+  ['bounded', 'explicitDeny', 'logs:PutSubscriptionFilter', `arn:aws:logs:${R}:${A}:log-group:/trendigle/prod/app`],
+  ['bounded', 'explicitDeny', 'logs:PutDestinationPolicy', `arn:aws:logs:${R}:${A}:destination:trendigle-x`],
+  ['bounded', 'allowed', 's3:PutObject', `arn:aws:s3:::trendigle-prod-media-${A}/u/x.png`],
+  ['bounded', 'allowed', 'sqs:SendMessage', `arn:aws:sqs:${R}:${A}:trendigle-prod-events`],
+  ['bounded', 'allowed', 'sns:Publish', `arn:aws:sns:${R}:${A}:trendigle-prod-alerts`],
 ];
 
 // shu-9bj.2: the project's bootstrap (lib/bootstrap.ts). The deploy role changes only the project's stacks, and only

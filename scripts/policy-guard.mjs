@@ -1,10 +1,10 @@
 #!/usr/bin/env node
-// Reads every CloudFormation template in a synthesized CDK cloud assembly (cdk.out), nested assemblies and nested
-// stacks included, and stops when a policy would let a principal outside the project in. The execution role may
-// create and re-trust roles named <project>*, and write bucket, queue, topic and function policies, so a changed
-// assembly (a compromised dependency editing cdk.out after a clean pull-request diff) could otherwise hand an outside
-// account lasting credentials inside the fence. Like guard.mjs it stops a merge; a run started by hand with
-// allow_replacement (`--allow`) goes ahead.
+// Reads every CloudFormation template a synthesized CDK cloud assembly (cdk.out) deploys, nested assemblies and
+// nested stacks included, and stops when a policy would let a principal outside the project in, or send the
+// project's data out. The execution role may create and re-trust roles named <project>*, and write bucket, queue,
+// topic, table and function policies, so a changed assembly (a compromised dependency editing cdk.out after a clean
+// pull-request diff) could otherwise hand an outside account lasting access inside the fence. Like guard.mjs it stops
+// a merge; a run started by hand with allow_replacement (`--allow`) goes ahead.
 //
 // Stops on:
 //   - an AWS::IAM::Role trust policy (Allow) naming any principal other than
@@ -15,15 +15,24 @@
 //         StringNotLike job_workflow_ref,
 //       a role of the same account (arn:aws:iam::<account>:role/..., or a role in the assembly);
 //     so: "*", another account, the account root, users, other identity providers, NotPrincipal;
-//   - an S3 bucket, SQS queue or SNS topic policy, or a Lambda permission (Allow), naming "*" or another account
-//     (Service principals, the account itself and its roles are fine);
-//   - anything the check cannot read: a value it cannot work out (a parameter, a stack name, a custom resource's
-//     attribute), a nested stack whose template is not in the assembly, a transform or macro, a template that is not
-//     JSON. A legitimate CDK app has none of these in its principals.
+//   - a resource policy (S3 bucket, SQS queue, SNS topic, DynamoDB table and stream, KMS key) or a Lambda permission
+//     (Allow) naming "*" or another account, or a Service principal without aws:SourceAccount / aws:SourceArn (Lambda:
+//     SourceAccount / SourceArn) pinned to the account or the project's resources;
+//   - an S3 bucket with an ACL other than Private / BucketOwner*, a public access block with a flag off, or
+//     notifications, replication or access logs going to something that is not the project's;
+//   - an SNS subscription, a log subscription filter, a Lambda destination or a queue's dead-letter target that is
+//     not one of the project's resources in the account (http, https, email and SMS endpoints included);
+//   - any other resource type with a property named *Policy*, *Permission*, AccessControl or Principal: the check
+//     does not know it, so it fails closed;
+//   - a policy document or statement with a key outside the IAM grammar (keys are case-sensitive);
+//   - anything the check cannot read: a value it cannot work out (a parameter, a custom resource's attribute), an
+//     export defined twice, a nested stack whose template is not in the assembly, a transform or macro, a template
+//     that is not JSON or that is not the one the stack deploys (scripts/assembly.mjs deployedTemplates).
 //
-// Intrinsics worked out: Ref of AWS::AccountId, AWS::Partition, AWS::URLSuffix, AWS::Region and AWS::NoValue;
-// Fn::GetAtt <role>.Arn of a role in the same template; Fn::Join, Fn::Sub, Fn::Select, Fn::Split, Fn::FindInMap;
-// Fn::If (both branches must pass); Fn::ImportValue of another template's export in the assembly.
+// Intrinsics worked out: Ref of AWS::AccountId, AWS::Partition, AWS::URLSuffix, AWS::Region and AWS::NoValue, and of
+// the template's own resources; Fn::GetAtt of the template's own resources (a role's Arn is a role of the account);
+// Fn::Join, Fn::Sub, Fn::Select, Fn::Split, Fn::FindInMap; Fn::If (both branches must pass); Fn::ImportValue of an
+// export of a deployed template in the assembly.
 //
 // Usage: node scripts/policy-guard.mjs <assembly dir> --account <12 digits> [--repo <owner/repo>]... [--allow]
 //                                      [--summary <file>]
@@ -32,8 +41,10 @@
 // Exit 2: bad arguments.
 
 import { appendFileSync, lstatSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
-import { isAbsolute, join, relative, sep } from 'node:path';
+import { createRequire } from 'node:module';
+import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { deployedTemplates } from './assembly.mjs';
 
 const PROVIDER_HOST = 'token.actions.githubusercontent.com';
 const AUD = `${PROVIDER_HOST}:aud`;
@@ -43,13 +54,63 @@ const WORKFLOW_REF = `${PROVIDER_HOST}:job_workflow_ref`;
 const SHUKKA_WORKFLOW_REF = /^rummykhan\/shukka\/\.github\/workflows\/[A-Za-z0-9_.-]+\.ya?ml@refs\/(?:tags|heads)\/[A-Za-z0-9._/*-]+$/;
 const SERVICE = /^[a-z0-9][a-z0-9.-]*\.amazonaws\.com(?:\.cn)?$/;
 const ACCOUNT = /^[0-9]{12}$/;
-const ARN = /^arn:aws[a-z-]*:(iam|sts)::([^:]*):(.+)$/;
+const IAM_ARN = /^arn:aws[a-z-]*:(iam|sts)::([^:]*):(.+)$/;
+const ANY_ARN = /^arn:aws[a-z-]*:([^:]*):([^:]*):([^:]*):(.*)$/;
+// A value naming one of the template's own resources (Ref or Fn::GetAtt), as resolve() writes it.
+const OWN = /<(?:Ref|Fn::GetAtt) [^>]+>/;
 // GitHub owner and repository names, as ShukkaAccess takes them; the immutable form carries ids after @.
 const REPO = /^([A-Za-z0-9][A-Za-z0-9-]{0,38})(?:@[0-9]+)?\/([A-Za-z0-9._-]{1,100})(?:@[0-9]+)?$/;
-const RESOURCE_POLICIES = new Set([
-  'AWS::S3::BucketPolicy', 'AWS::SQS::QueuePolicy', 'AWS::SQS::QueueInlinePolicy', 'AWS::SNS::TopicPolicy', 'AWS::SNS::TopicInlinePolicy',
+const DOCUMENT_KEYS = new Set(['Version', 'Id', 'Statement']);
+const STATEMENT_KEYS = new Set(['Sid', 'Effect', 'Principal', 'NotPrincipal', 'Action', 'NotAction', 'Resource', 'NotResource', 'Condition']);
+// Condition operators that pin a value (not negated, not IfExists, not ForAnyValue).
+const PINNING = new Set(['StringEquals', 'StringEqualsIgnoreCase', 'StringLike', 'ArnEquals', 'ArnLike']);
+// Where each resource type keeps its policy documents (paths into Properties; [] means each item of a list).
+/** @type {Record<string, (string | number)[][]>} */
+const RESOURCE_POLICIES = {
+  'AWS::S3::BucketPolicy': [['PolicyDocument']],
+  'AWS::SQS::QueuePolicy': [['PolicyDocument']],
+  'AWS::SQS::QueueInlinePolicy': [['PolicyDocument']],
+  'AWS::SNS::TopicPolicy': [['PolicyDocument']],
+  'AWS::SNS::TopicInlinePolicy': [['PolicyDocument']],
+  'AWS::KMS::Key': [['KeyPolicy']],
+  'AWS::SecretsManager::ResourcePolicy': [['ResourcePolicy']],
+  'AWS::DynamoDB::Table': [['ResourcePolicy', 'PolicyDocument'], ['StreamSpecification', 'ResourcePolicy', 'PolicyDocument']],
+  'AWS::DynamoDB::GlobalTable': [['Replicas', '[]', 'ResourcePolicy', 'PolicyDocument'], ['Replicas', '[]', 'ReplicaStreamSpecification', 'ResourcePolicy', 'PolicyDocument']],
+};
+// Types whose policy-looking properties are handled below or carry no grant to anyone outside the account
+// (identity policies, a queue's redrive settings, a topic's data-protection and logging settings).
+const HANDLED = new Set([
+  ...Object.keys(RESOURCE_POLICIES),
+  'AWS::IAM::Role', 'AWS::IAM::Policy', 'AWS::IAM::ManagedPolicy', 'AWS::IAM::InstanceProfile',
+  'AWS::Lambda::Permission', 'AWS::Lambda::LayerVersionPermission', 'AWS::Lambda::EventInvokeConfig', 'AWS::Lambda::EventSourceMapping',
+  'AWS::S3::Bucket', 'Custom::S3BucketNotifications', 'AWS::SQS::Queue', 'AWS::SNS::Topic', 'AWS::SNS::Subscription',
+  'AWS::Logs::SubscriptionFilter', 'AWS::CloudFormation::Stack',
 ]);
-const LAMBDA_PERMISSIONS = new Set(['AWS::Lambda::Permission', 'AWS::Lambda::LayerVersionPermission']);
+// Services CDK itself grants without a source condition (EventBridge to a topic or key, a load balancer or Secrets
+// Manager rotation to a function, CloudTrail and log delivery to a bucket). They pass without one; a source
+// condition that names anything but the project still stops. Every other service needs the condition.
+const UNCONDITIONED_SERVICES = new Set([
+  'events.amazonaws.com', 'elasticloadbalancing.amazonaws.com', 'secretsmanager.amazonaws.com', 'cloudtrail.amazonaws.com', 'delivery.logs.amazonaws.com',
+]);
+// Key policies grant a service only the key's use, inside requests that already name one of the project's resources:
+// no source condition is needed there (CDK grants s3 and events on keys without one).
+const NO_SOURCE_NEEDED = new Set(['AWS::KMS::Key']);
+/** AWS's own Elastic Load Balancing log-delivery accounts (one per region), from aws-cdk-lib's region facts. */
+const ELB_LOG_ACCOUNTS = (() => {
+  try {
+    const { RegionInfo } = createRequire(import.meta.url)('aws-cdk-lib/region-info');
+    return new Set(RegionInfo.regions.map((/** @type {any} */ r) => r.elbv2Account).filter(Boolean));
+  } catch {
+    return new Set();
+  }
+})();
+const POLICY_LIKE = (/** @type {string} */ key) => /Policy|Permission/.test(key) || key === 'AccessControl' || key === 'Principal';
+// S3::Bucket properties that cannot send data or access outside the bucket; the rest are checked or stop.
+const BUCKET_SAFE = new Set([
+  'BucketName', 'BucketEncryption', 'VersioningConfiguration', 'LifecycleConfiguration', 'Tags', 'CorsConfiguration', 'WebsiteConfiguration',
+  'OwnershipControls', 'ObjectLockEnabled', 'ObjectLockConfiguration', 'IntelligentTieringConfigurations', 'AccelerateConfiguration', 'MetricsConfigurations',
+  'AccessControl', 'PublicAccessBlockConfiguration', 'NotificationConfiguration', 'LoggingConfiguration', 'ReplicationConfiguration',
+]);
 
 /**
  * @typedef {'safe' | 'stopped' | 'allowed' | 'unreadable'} Verdict
@@ -57,7 +118,7 @@ const LAMBDA_PERMISSIONS = new Set(['AWS::Lambda::Permission', 'AWS::Lambda::Lay
  * @typedef {{ account: string, repos?: string[] }} PolicyOptions
  * @typedef {{ file: string, template: any }} Template
  * @typedef {{ account: string, t: Template, exports: Map<string, { value: any, t: Template }>, depth: number }} Ctx
- * @typedef {{ bucket: string, key: string, source: string }} Asset
+ * @typedef {import('./assembly.mjs').FileAsset} Asset
  */
 
 /** A value the check could not work out; `why` says what it was. */
@@ -74,6 +135,13 @@ class Oai {
     this.id = id;
   }
 }
+/** Fn::If with different branches: both are checked wherever the value is used. */
+class Branches {
+  /** @param {any[]} values */
+  constructor(values) {
+    this.values = values;
+  }
+}
 const NO_VALUE = Symbol('AWS::NoValue');
 
 /**
@@ -81,7 +149,7 @@ const NO_VALUE = Symbol('AWS::NoValue');
  * @returns {v is Record<string, any>}
  */
 function isObject(v) {
-  return typeof v === 'object' && v !== null && !Array.isArray(v);
+  return typeof v === 'object' && v !== null && !Array.isArray(v) && !(v instanceof Unknown) && !(v instanceof Oai) && !(v instanceof Branches);
 }
 
 /**
@@ -104,11 +172,12 @@ function intrinsic(v) {
 function show(v) {
   if (v instanceof Unknown) return `<${v.why}>`;
   if (v instanceof Oai) return `<CloudFront origin access identity ${v.id}>`;
+  if (v instanceof Branches) return v.values.map(show).join(' or ');
   return typeof v === 'string' ? v : JSON.stringify(v);
 }
 
 /**
- * Ref of a pseudo parameter, a parameter or a resource.
+ * Ref of a pseudo parameter or one of the template's resources; anything else (a parameter) cannot be worked out.
  * @param {string} name
  * @param {Ctx} ctx
  * @returns {any}
@@ -118,15 +187,16 @@ function ref(name, ctx) {
     case 'AWS::AccountId': return ctx.account;
     case 'AWS::Partition': return 'aws';
     case 'AWS::URLSuffix': return 'amazonaws.com';
-    // Regions only appear in service principals here (logs.<region>.amazonaws.com); any one will do.
+    // Regions only appear in service principals and resource ARNs here; any one will do.
     case 'AWS::Region': return 'aws-region';
     case 'AWS::NoValue': return NO_VALUE;
-    default: return new Unknown(`Ref ${name}`);
+    default: return isObject(ctx.t.template?.Resources?.[name]) ? `<Ref ${name}>` : new Unknown(`Ref ${name}`);
   }
 }
 
 /**
- * Fn::GetAtt: a role's Arn, a CloudFront origin access identity's canonical user; nothing else.
+ * Fn::GetAtt: a role's Arn is a role of the account; a CloudFront origin access identity's canonical user; any other
+ * attribute of the template's own resources is the project's.
  * @param {string} id
  * @param {string} attr
  * @param {Ctx} ctx
@@ -134,13 +204,14 @@ function ref(name, ctx) {
  */
 function getAtt(id, attr, ctx) {
   const resource = ctx.t.template?.Resources?.[id];
-  if (resource?.Type === 'AWS::IAM::Role' && attr === 'Arn') return `arn:aws:iam::${ctx.account}:role/${id}`;
-  if (resource?.Type === 'AWS::CloudFront::CloudFrontOriginAccessIdentity' && attr === 'S3CanonicalUserId') return new Oai(id);
-  return new Unknown(`Fn::GetAtt ${id}.${attr}`);
+  if (!isObject(resource)) return new Unknown(`Fn::GetAtt ${id}.${attr}`);
+  if (resource.Type === 'AWS::IAM::Role' && attr === 'Arn') return `arn:aws:iam::${ctx.account}:role/${id}`;
+  if (resource.Type === 'AWS::CloudFront::CloudFrontOriginAccessIdentity' && attr === 'S3CanonicalUserId') return new Oai(id);
+  return `<Fn::GetAtt ${id}.${attr}>`;
 }
 
 /**
- * Work out a template value: a string, a list, an object with its values worked out, or Unknown.
+ * Work out a template value: a string, a list, an object with its values worked out, Branches, Oai or Unknown.
  * @param {any} v
  * @param {Ctx} ctx
  * @returns {any}
@@ -205,21 +276,18 @@ function resolve(v, ctx) {
       if (!Array.isArray(arg) || arg.length !== 3) return new Unknown('Fn::If');
       const a = resolve(arg[1], inner);
       const b = resolve(arg[2], inner);
-      return JSON.stringify(a) === JSON.stringify(b) && !(a instanceof Unknown) ? a : { [BRANCHES]: [a, b] };
+      return typeof a === 'string' && a === b ? a : new Branches([a, b]);
     }
     case 'Fn::ImportValue': {
       const exportName = resolve(arg, inner);
       if (typeof exportName !== 'string') return new Unknown('Fn::ImportValue');
       const exported = ctx.exports.get(exportName);
-      return exported ? resolve(exported.value, { ...inner, t: exported.t }) : new Unknown(`Fn::ImportValue ${exportName} (not exported in this assembly)`);
+      return exported ? resolve(exported.value, { ...inner, t: exported.t }) : new Unknown(`Fn::ImportValue ${exportName} (not exported by a deployed template)`);
     }
     default:
       return new Unknown(name);
   }
 }
-
-// Fn::If with different branches: both are checked wherever the value is used.
-const BRANCHES = '\u0000branches';
 
 /**
  * Fn::Sub, string or [string, variables].
@@ -253,7 +321,7 @@ function sub(arg, ctx) {
 function alternatives(v) {
   if (v === undefined || v === NO_VALUE) return [];
   if (Array.isArray(v)) return v.flatMap(alternatives);
-  if (isObject(v) && BRANCHES in v) return v[BRANCHES].flatMap(alternatives);
+  if (v instanceof Branches) return v.values.flatMap(alternatives);
   return [v];
 }
 
@@ -263,8 +331,37 @@ function alternatives(v) {
  * @returns {{ account: string, rest: string } | null}
  */
 function parseArn(value) {
-  const m = ARN.exec(value);
+  const m = IAM_ARN.exec(value);
   return m ? { account: /** @type {string} */ (m[2]), rest: /** @type {string} */ (m[3]) } : null;
+}
+
+/**
+ * Whether a worked-out value is one of the project's resources: one of the templates' own (Ref, Fn::GetAtt, alone or
+ * inside an ARN without an account such as S3's), or an ARN in the account.
+ * @param {any} v
+ * @param {string} account
+ * @returns {boolean}
+ */
+function ownResource(v, account) {
+  if (typeof v !== 'string') return false;
+  if (/^<(?:Ref|Fn::GetAtt) [^>]+>$/.test(v)) return true;
+  const m = ANY_ARN.exec(v);
+  if (!m) return false;
+  return m[3] === account || (m[3] === '' && OWN.test(v));
+}
+
+/**
+ * A problem when any of the values a destination may be is not one of the project's resources.
+ * @param {any} value worked out
+ * @param {string} what
+ * @param {string} account
+ * @returns {string | null}
+ */
+function destinationProblem(value, what, account) {
+  const values = alternatives(value);
+  const bad = values.find((v) => !ownResource(v, account));
+  if (values.length === 0) return `${what} cannot be read`;
+  return bad === undefined ? null : `${what} ${show(bad)} is not one of the project's resources in account ${account}`;
 }
 
 /**
@@ -285,15 +382,6 @@ export function repoName(repo) {
 export function githubRepoFromUrl(url) {
   const m = /^(?:https:\/\/(?:[^@/]+@)?github\.com\/|ssh:\/\/git@github\.com\/|git@github\.com:)([^/]+\/[^/]+?)(?:\.git)?\/?$/.exec(url.trim());
   return m && repoName(/** @type {string} */ (m[1])) ? /** @type {string} */ (m[1]) : null;
-}
-
-/**
- * The values of a condition as a list of worked-out values.
- * @param {any} v
- * @returns {any[]}
- */
-function conditionValues(v) {
-  return alternatives(v);
 }
 
 /**
@@ -323,9 +411,9 @@ function oidcConditionProblems(condition, repos) {
   }
   const eq = isObject(condition.StringEquals) ? condition.StringEquals : {};
   const like = isObject(condition.StringLike) ? condition.StringLike : {};
-  const aud = conditionValues(eq[AUD]);
+  const aud = alternatives(eq[AUD]);
   if (aud.length !== 1 || aud[0] !== 'sts.amazonaws.com') problems.push(`StringEquals ${AUD} must be sts.amazonaws.com, got ${aud.map(show).join(', ') || 'nothing'}`);
-  const subs = conditionValues(eq[SUB]);
+  const subs = alternatives(eq[SUB]);
   if (subs.length === 0) problems.push(`no StringEquals ${SUB} (any repository could assume it)`);
   for (const s of subs) {
     const m = typeof s === 'string' ? /^repo:([^:]+):(.+)$/.exec(s) : null;
@@ -334,7 +422,7 @@ function oidcConditionProblems(condition, repos) {
     else if (repos.size === 0) problems.push(`StringEquals ${SUB} ${s}: the project's repository was not given (--repo), so it cannot be checked`);
     else if (!repos.has(name)) problems.push(`StringEquals ${SUB} ${s} names another repository than the project's (${[...repos].join(', ')})`);
   }
-  const refs = conditionValues(like[WORKFLOW_REF]);
+  const refs = alternatives(like[WORKFLOW_REF]);
   if (refs.length === 0) problems.push(`no StringLike ${WORKFLOW_REF} (any workflow of the repository could assume it)`);
   for (const r of refs) {
     if (typeof r !== 'string' || !SHUKKA_WORKFLOW_REF.test(r)) problems.push(`StringLike ${WORKFLOW_REF} ${show(r)} is not one of rummykhan/shukka's workflows`);
@@ -343,23 +431,34 @@ function oidcConditionProblems(condition, repos) {
 }
 
 /**
- * The statements of a worked-out policy document; a problem when it cannot be read.
+ * The statements of a worked-out policy document, and what is wrong with its shape: a document or statement that
+ * cannot be read, or a key outside the IAM grammar (case-sensitive, so `principal` is not `Principal`).
  * @param {any} doc
- * @returns {{ statements: Record<string, any>[], problem?: string }}
+ * @returns {{ statements: Record<string, any>[], problems: string[] }}
  */
 function statementsOf(doc) {
-  if (doc instanceof Unknown) return { statements: [], problem: `the policy document is ${show(doc)}` };
-  const docs = alternatives(doc);
   /** @type {Record<string, any>[]} */
   const statements = [];
-  for (const d of docs) {
-    if (!isObject(d)) return { statements: [], problem: `the policy document is ${show(d)}` };
+  /** @type {string[]} */
+  const problems = [];
+  for (const d of alternatives(doc)) {
+    if (!isObject(d)) {
+      problems.push(`the policy document is ${show(d)}`);
+      continue;
+    }
+    for (const key of Object.keys(d)) if (!DOCUMENT_KEYS.has(key)) problems.push(`the policy document has ${JSON.stringify(key)}, which is not an IAM policy key`);
     for (const st of alternatives(d.Statement)) {
-      if (!isObject(st)) return { statements: [], problem: `a statement is ${show(st)}` };
+      if (!isObject(st)) {
+        problems.push(`a statement is ${show(st)}`);
+        continue;
+      }
+      for (const key of Object.keys(st)) if (!STATEMENT_KEYS.has(key)) problems.push(`a statement has ${JSON.stringify(key)}, which is not an IAM statement key`);
+      if (st.Effect !== 'Allow' && st.Effect !== 'Deny') problems.push(`a statement's Effect is ${show(st.Effect)}, not Allow or Deny`);
+      if (st.Effect !== 'Deny' && st.Principal === undefined && st.NotPrincipal === undefined) problems.push('a statement names no principal');
       statements.push(st);
     }
   }
-  return { statements };
+  return { statements, problems };
 }
 
 /**
@@ -379,14 +478,55 @@ function principalsOf(principal) {
 }
 
 /**
- * What is wrong with one principal of a resource policy (S3, SQS, SNS), or null.
+ * How a statement's conditions tie a service to its source: 'pinned' when aws:SourceAccount is the account or
+ * aws:SourceArn names the project's resources under an operator that requires a match; 'other' when a source key
+ * appears otherwise; 'none' when there is no source key at all.
+ * @param {any} condition worked out
+ * @param {string} account
+ * @returns {'pinned' | 'other' | 'none'}
+ */
+function sourceOf(condition, account) {
+  if (!isObject(condition)) return 'none';
+  let seen = false;
+  for (const [op, block] of Object.entries(condition)) {
+    if (!isObject(block)) {
+      seen = true;
+      continue;
+    }
+    for (const [key, value] of Object.entries(block)) {
+      const k = key.toLowerCase();
+      if (k !== 'aws:sourceaccount' && k !== 'aws:sourcearn' && k !== 'aws:sourceowner') continue;
+      seen = true;
+      const values = alternatives(value);
+      if (!PINNING.has(op) || values.length === 0) continue;
+      if (k !== 'aws:sourcearn' && values.every((v) => v === account)) return 'pinned';
+      if (k === 'aws:sourcearn' && values.every((v) => ownResource(v, account))) return 'pinned';
+    }
+  }
+  return seen ? 'other' : 'none';
+}
+
+/**
+ * What is wrong with one principal of a resource policy, or null.
  * @param {string} type
  * @param {any} value
+ * @param {any} condition worked out
  * @param {string} account
+ * @param {string} resourceType
  * @returns {string | null}
  */
-function resourcePrincipalProblem(type, value, account) {
-  if (type === 'Service' && typeof value === 'string' && SERVICE.test(value)) return null;
+function resourcePrincipalProblem(type, value, condition, account, resourceType) {
+  if (type === 'Service' && typeof value === 'string' && SERVICE.test(value)) {
+    const source = sourceOf(condition, account);
+    if (source === 'pinned' || (source === 'none' && (NO_SOURCE_NEEDED.has(resourceType) || UNCONDITIONED_SERVICES.has(value)))) return null;
+    return source === 'other'
+      ? `allows Service ${value} with a source condition that is not pinned to account ${account} or the project's resources`
+      : `allows Service ${value} without aws:SourceAccount or aws:SourceArn pinned to account ${account} or the project's resources`;
+  }
+  if (type === 'AWS' && typeof value === 'string' && resourceType === 'AWS::S3::BucketPolicy') {
+    const arn = parseArn(value);
+    if (ELB_LOG_ACCOUNTS.has(value) || (arn && arn.rest === 'root' && ELB_LOG_ACCOUNTS.has(arn.account))) return null;
+  }
   if (type === 'CanonicalUser' && value instanceof Oai) return null;
   if (type === 'AWS' && typeof value === 'string') {
     if (value === account) return null;
@@ -425,33 +565,119 @@ function trustPrincipalProblem(type, value, condition, account, repos) {
 }
 
 /**
- * What is wrong with a Lambda permission's principal, or null.
- * @param {any} value worked out
+ * What is wrong with a Lambda permission, or null.
+ * @param {Record<string, any>} props worked out
+ * @param {string} type
  * @param {string} account
- * @returns {string | null}
+ * @returns {string[]}
  */
-function lambdaPrincipalProblem(value, account) {
-  if (typeof value !== 'string') return `allows ${show(value)}`;
-  if (value === '*') return 'allows "*" (anyone)';
-  if (SERVICE.test(value) || value === account) return null;
-  const arn = parseArn(value);
-  if (arn && arn.account === account) return null;
-  return `allows ${value}, outside account ${account}`;
+function lambdaPermissionProblems(props, type, account) {
+  const values = alternatives(props.Principal);
+  if (values.length === 0) return ['names no principal'];
+  /** @type {string[]} */
+  const problems = [];
+  for (const value of values) {
+    if (typeof value !== 'string') problems.push(`allows ${show(value)}`);
+    else if (value === '*') problems.push('allows "*" (anyone)');
+    else if (SERVICE.test(value) && type === 'AWS::Lambda::Permission') {
+      const sourceAccount = alternatives(props.SourceAccount);
+      const sourceArn = alternatives(props.SourceArn);
+      const accountOk = sourceAccount.length === 0 || sourceAccount.every((v) => v === account);
+      const arnOk = sourceArn.length === 0 || sourceArn.every((v) => ownResource(v, account));
+      const given = sourceAccount.length > 0 || sourceArn.length > 0;
+      if (!accountOk || !arnOk) problems.push(`allows Service ${value} with a SourceAccount or SourceArn that is not account ${account} or the project's`);
+      else if (!given && !UNCONDITIONED_SERVICES.has(value)) problems.push(`allows Service ${value} without SourceAccount ${account} or a SourceArn of the project's`);
+    } else if (value !== account && parseArn(value)?.account !== account) {
+      problems.push(`allows ${value}, outside account ${account}`);
+    }
+  }
+  return problems;
 }
 
 /**
- * The TemplateURL a nested stack published as this asset has: the asset bucket of a CDK bootstrap in the account.
- * @param {Asset} asset
- * @param {string} account
- * @returns {RegExp}
+ * The value at a path into Properties ('[]' spreads a list), as a list of the values found.
+ * @param {any} props
+ * @param {(string | number)[]} path
+ * @returns {any[]}
  */
-function nestedTemplateUrl(asset, account) {
-  const fill = (/** @type {string} */ s) => s.replaceAll('${AWS::AccountId}', account).replaceAll('${AWS::Region}', 'aws-region').replaceAll('${AWS::Partition}', 'aws');
-  const bucket = fill(asset.bucket);
-  const key = fill(asset.key);
-  const escape = (/** @type {string} */ s) => s.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
-  if (!new RegExp(`^cdk-[a-z0-9]+-assets-${account}-[a-z0-9-]+$`).test(bucket)) return /(?!)/;
-  return new RegExp(`^https://s3[.-][a-z0-9.-]*\\.amazonaws\\.com(?:\\.cn)?/${escape(bucket)}/${escape(key)}$`);
+function valuesAt(props, path) {
+  /** @type {any[]} */
+  let current = [props];
+  for (const step of path) {
+    current = step === '[]' ? current.flatMap((c) => alternatives(c)) : current.map((c) => (isObject(c) ? c[step] : undefined)).filter((c) => c !== undefined);
+  }
+  return current;
+}
+
+/**
+ * Problems with an S3 bucket's own settings: its ACL, its public access block, where its notifications, replicas and
+ * access logs go, and any property not known to be safe.
+ * @param {Record<string, any>} props worked out
+ * @param {string} account
+ * @returns {string[]}
+ */
+function bucketProblems(props, account) {
+  /** @type {string[]} */
+  const problems = [];
+  for (const key of Object.keys(props)) if (!BUCKET_SAFE.has(key)) problems.push(`property ${key} is not checked by shukka; it may send the bucket's data elsewhere`);
+  if (props.AccessControl !== undefined && !(typeof props.AccessControl === 'string' && /^(?:Private|BucketOwnerRead|BucketOwnerFullControl|LogDeliveryWrite)$/.test(props.AccessControl))) {
+    // LogDeliveryWrite is AWS's log-delivery group (CDK sets it on a server-access-logs bucket); the rest are public.
+    problems.push(`AccessControl ${show(props.AccessControl)} grants access beyond the account (only Private, BucketOwner* and LogDeliveryWrite pass)`);
+  }
+  const block = props.PublicAccessBlockConfiguration;
+  if (block !== undefined) {
+    for (const flag of ['BlockPublicAcls', 'BlockPublicPolicy', 'IgnorePublicAcls', 'RestrictPublicBuckets']) {
+      const v = isObject(block) ? block[flag] : undefined;
+      if (v !== true && v !== 'true') problems.push(`PublicAccessBlockConfiguration ${flag} is ${show(v ?? 'off')}`);
+    }
+  }
+  problems.push(...notificationProblems(props.NotificationConfiguration, account));
+  for (const rule of valuesAt(props, ['ReplicationConfiguration', 'Rules', '[]'])) {
+    const p = destinationProblem(isObject(rule) ? rule.Destination?.Bucket : undefined, 'replication to', account);
+    if (p) problems.push(p);
+  }
+  if (props.LoggingConfiguration !== undefined) {
+    const target = isObject(props.LoggingConfiguration) ? props.LoggingConfiguration.DestinationBucketName : undefined;
+    if (!(typeof target === 'string' && /^<(?:Ref|Fn::GetAtt) [^>]+>$/.test(target))) problems.push(`access logs go to ${show(target)}, not a bucket of the project's`);
+  }
+  return problems;
+}
+
+/**
+ * Problems with where a bucket's notifications go (S3::Bucket and CDK's Custom::S3BucketNotifications).
+ * @param {any} config worked out
+ * @param {string} account
+ * @returns {string[]}
+ */
+function notificationProblems(config, account) {
+  /** @type {string[]} */
+  const problems = [];
+  // CloudFormation's names (S3::Bucket) and the S3 API's (CDK's Custom::S3BucketNotifications).
+  const lists = [['LambdaConfigurations', 'Function'], ['QueueConfigurations', 'Queue'], ['TopicConfigurations', 'Topic'], ['LambdaFunctionConfigurations', 'LambdaFunctionArn']];
+  for (const [list, key] of lists) {
+    for (const item of valuesAt(config ?? {}, [/** @type {string} */ (list), '[]'])) {
+      const target = isObject(item) ? item[/** @type {string} */ (key)] ?? item.QueueArn ?? item.TopicArn : undefined;
+      const p = destinationProblem(target, 'notification to', account);
+      if (p) problems.push(p);
+    }
+  }
+  return problems;
+}
+
+/**
+ * Problems with an SNS subscription (AWS::SNS::Subscription, or one inline in AWS::SNS::Topic).
+ * @param {any} subscription worked out
+ * @param {string} account
+ * @returns {string[]}
+ */
+function subscriptionProblems(subscription, account) {
+  if (!isObject(subscription)) return [`subscription ${show(subscription)} cannot be read`];
+  const protocol = subscription.Protocol;
+  if (typeof protocol !== 'string' || !/^(?:sqs|lambda|firehose|application)$/.test(protocol)) {
+    return [`subscription by ${show(protocol)} to ${show(subscription.Endpoint)} sends messages out of the account`];
+  }
+  const p = destinationProblem(subscription.Endpoint, `${protocol} subscription to`, account);
+  return p ? [p] : [];
 }
 
 /**
@@ -475,90 +701,114 @@ function jsonFiles(root) {
 }
 
 /**
- * A path named in a manifest, resolved against the manifest's directory, still inside the root; or null.
- * @param {string} root
- * @param {string} base
- * @param {unknown} path
- * @returns {string | null}
+ * The TemplateURL a nested stack published as this asset has: the asset bucket of a CDK bootstrap in the account.
+ * @param {Asset} asset
+ * @param {string} account
+ * @returns {RegExp}
  */
-function inside(root, base, path) {
-  if (typeof path !== 'string' || path === '' || isAbsolute(path)) return null;
-  const rel = relative(root, join(root, base, path));
-  return rel === '' || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel) ? null : rel;
+function nestedTemplateUrl(asset, account) {
+  const fill = (/** @type {string} */ s) => s.replaceAll('${AWS::AccountId}', account).replaceAll('${AWS::Region}', 'aws-region').replaceAll('${AWS::Partition}', 'aws');
+  const bucket = fill(asset.bucket);
+  const key = fill(asset.key);
+  const escape = (/** @type {string} */ s) => s.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
+  if (!new RegExp(`^cdk-[a-z0-9]+-assets-${account}-[a-z0-9-]+$`).test(bucket)) return /(?!)/;
+  return new RegExp(`^https://s3[.-][a-z0-9.-]*\\.amazonaws\\.com(?:\\.cn)?/${escape(bucket)}/${escape(key)}$`);
 }
 
 /**
- * Reads the assembly: every document with Resources (templates under any name), the stack templates the manifests
- * name (which must be JSON), and the object keys file assets are published under (to find nested stack templates).
- * @param {string} root
- * @returns {{ templates: Template[], problems: string[], assets: Asset[] }}
+ * Problems with one resource of a template.
+ * @param {string} id
+ * @param {any} resource
+ * @param {Ctx} ctx
+ * @param {Set<string>} repos
+ * @returns {string[]}
  */
-function readAssembly(root) {
-  /** @type {Template[]} */
-  const templates = [];
+function resourceProblems(id, resource, ctx, repos) {
+  const { account } = ctx;
+  const type = isObject(resource) ? resource.Type : undefined;
+  if (typeof type !== 'string') return [];
+  const raw = isObject(resource.Properties) ? resource.Properties : {};
+  const props = resolve(raw, ctx);
   /** @type {string[]} */
   const problems = [];
-  /** @type {Map<string, any>} */
-  const docs = new Map();
-  for (const path of jsonFiles(root)) {
-    try {
-      const text = readFileSync(join(root, path), 'utf8');
-      if (!/^\s*\{/.test(text)) continue;
-      docs.set(path, JSON.parse(text));
-    } catch {
-      // not JSON: only a problem when a manifest names it as a template (below)
+  /** @param {{ statements: Record<string, any>[], problems: string[] }} parsed */
+  const shape = (parsed) => problems.push(...parsed.problems.map((p) => `policy cannot be read: ${p}`));
+
+  if (!HANDLED.has(type)) {
+    const keys = Object.keys(raw).filter(POLICY_LIKE);
+    if (keys.length > 0) problems.push(`${keys.join(', ')}: shukka does not check this type's policies, so it stops`);
+  }
+  if (type === 'AWS::IAM::Role') {
+    const parsed = statementsOf(props.AssumeRolePolicyDocument);
+    shape(parsed);
+    for (const st of parsed.statements) {
+      if (st.Effect === 'Deny') continue;
+      if (st.NotPrincipal !== undefined) problems.push(`trusts everyone but ${show(st.NotPrincipal)} (NotPrincipal)`);
+      for (const [ptype, value] of principalsOf(st.Principal)) {
+        const p = trustPrincipalProblem(ptype, value, st.Condition, account, repos);
+        if (p) problems.push(p);
+      }
     }
   }
-  for (const [file, doc] of docs) if (isObject(doc) && isObject(doc.Resources)) templates.push({ file, template: doc });
-
-  /** @type {Asset[]} where each file asset is published, from every asset manifest */
-  const assets = [];
-  for (const [file, doc] of docs) {
-    if (!isObject(doc) || !isObject(doc.files)) continue;
-    const base = file.includes(sep) ? file.slice(0, file.lastIndexOf(sep)) : '';
-    for (const asset of Object.values(doc.files)) {
-      const source = inside(root, base, asset?.source?.path);
-      for (const d of Object.values(isObject(asset?.destinations) ? asset.destinations : {})) {
-        if (source !== null && typeof d?.objectKey === 'string' && typeof d?.bucketName === 'string') {
-          assets.push({ bucket: d.bucketName, key: d.objectKey, source });
+  for (const path of RESOURCE_POLICIES[type] ?? []) {
+    for (const doc of valuesAt(props, path)) {
+      const parsed = statementsOf(doc);
+      shape(parsed);
+      for (const st of parsed.statements) {
+        if (st.Effect === 'Deny') continue;
+        if (st.NotPrincipal !== undefined) problems.push(`allows everyone but ${show(st.NotPrincipal)} (NotPrincipal)`);
+        for (const [ptype, value] of principalsOf(st.Principal)) {
+          const p = resourcePrincipalProblem(ptype, value, st.Condition, account, type);
+          if (p) problems.push(p);
         }
       }
     }
   }
-
-  // Stack templates through every manifest, nested assemblies included: each must be a JSON template read above.
-  const queue = [''];
-  const seen = new Set();
-  while (queue.length > 0) {
-    const base = /** @type {string} */ (queue.shift());
-    if (seen.has(base)) continue;
-    seen.add(base);
-    const where = base === '' ? 'manifest.json' : join(base, 'manifest.json');
-    const manifest = docs.get(where);
-    if (!isObject(manifest)) {
-      problems.push(`policy-guard: cannot read ${where}`);
-      continue;
-    }
-    for (const [id, artifact] of Object.entries(isObject(manifest.artifacts) ? manifest.artifacts : {})) {
-      const props = isObject(artifact?.properties) ? artifact.properties : {};
-      if (artifact?.type === 'cdk:cloud-assembly') {
-        const nested = inside(root, base, props.directoryName);
-        if (nested === null) problems.push(`policy-guard: ${where}: nested assembly ${id} cannot be read`);
-        else queue.push(nested);
+  switch (type) {
+    case 'AWS::Lambda::Permission':
+    case 'AWS::Lambda::LayerVersionPermission':
+      problems.push(...lambdaPermissionProblems(props, type, account));
+      break;
+    case 'AWS::S3::Bucket':
+      problems.push(...bucketProblems(props, account));
+      break;
+    case 'Custom::S3BucketNotifications':
+      problems.push(...notificationProblems(props.NotificationConfiguration, account));
+      break;
+    case 'AWS::SNS::Subscription':
+      problems.push(...subscriptionProblems(props, account));
+      break;
+    case 'AWS::SNS::Topic':
+      for (const s of valuesAt(props, ['Subscription', '[]'])) problems.push(...subscriptionProblems(s, account));
+      break;
+    case 'AWS::SQS::Queue': {
+      const target = valuesAt(props, ['RedrivePolicy', 'deadLetterTargetArn']);
+      if (target.length > 0) {
+        const p = destinationProblem(target, 'dead letters go to', account);
+        if (p) problems.push(p);
       }
-      if (artifact?.type === 'aws:cloudformation:stack' && props.templateFile !== undefined) {
-        const file = inside(root, base, props.templateFile);
-        if (file === null || !isObject(docs.get(file)) || !isObject(docs.get(file).Resources ?? {})) {
-          problems.push(`policy-guard: ${where}: stack ${id} template ${show(props.templateFile)} is not a JSON template in the assembly; it cannot be checked`);
-        }
-      }
+      break;
     }
+    case 'AWS::Logs::SubscriptionFilter': {
+      const p = destinationProblem(props.DestinationArn, 'log events go to', account);
+      if (p) problems.push(p);
+      break;
+    }
+    case 'AWS::Lambda::EventInvokeConfig':
+    case 'AWS::Lambda::EventSourceMapping':
+      for (const which of ['OnSuccess', 'OnFailure']) {
+        const target = valuesAt(props, ['DestinationConfig', which, 'Destination']);
+        if (target.length === 0) continue;
+        const p = destinationProblem(target, `${which} destination`, account);
+        if (p) problems.push(p);
+      }
+      break;
   }
-  return { templates, problems, assets };
+  return problems.map((p) => `${id} (${type}): ${p}`);
 }
 
 /**
- * Problems with the trust and resource policies of every template in the assembly.
+ * Problems with the trust and resource policies of every template the assembly deploys.
  * @param {string} dir
  * @param {PolicyOptions} options
  * @returns {{ problems: string[], templates: number } | { unreadable: string }}
@@ -569,70 +819,78 @@ export function checkPolicies(dir, options) {
   let root;
   try {
     root = realpathSync(dir);
-    readFileSync(join(root, 'manifest.json'));
+    JSON.parse(readFileSync(join(root, 'manifest.json'), 'utf8'));
   } catch (error) {
     return { unreadable: `policy-guard: cannot read ${dir}/manifest.json: ${/** @type {Error} */ (error).message}` };
   }
-  const { templates, problems, assets } = readAssembly(root);
-  const templateFiles = new Set(templates.map((t) => t.file));
+  const deployed = deployedTemplates(root);
+  const problems = deployed.problems.map((p) => p.replace(/^assembly: /, 'policy-guard: '));
+  const fileAssets = deployed.assets;
 
-  /** @type {Map<string, { value: any, t: Template }>} */
-  const exports = new Map();
-  for (const t of templates) {
-    for (const output of Object.values(isObject(t.template.Outputs) ? t.template.Outputs : {})) {
-      const name = output?.Export?.Name;
-      if (typeof name === 'string') exports.set(name, { value: output.Value, t });
+  // Deployed templates: the stacks' own, then nested stacks' reached through them.
+  /** @type {Map<string, Template>} */
+  const templates = new Map(deployed.stacks.map((s) => [s.file, { file: s.file, template: s.template }]));
+  // Every other JSON document with Resources is checked too (it costs nothing), but exports come only from deployed ones.
+  /** @type {Map<string, Template>} */
+  const others = new Map();
+  for (const path of jsonFiles(root)) {
+    if (templates.has(path)) continue;
+    try {
+      const text = readFileSync(join(root, path), 'utf8');
+      if (!/^\s*\{/.test(text)) continue;
+      const doc = JSON.parse(text);
+      if (isObject(doc) && isObject(doc.Resources)) others.set(path, { file: path, template: doc });
+    } catch {
+      // not JSON: assembly.mjs's deployedTemplates stops any that is deployed or looks like a template
     }
   }
-
-  for (const t of templates) {
-    const ctx = { account, t, exports, depth: 0 };
-    const at = (/** @type {string} */ id, /** @type {string} */ type) => `policy-guard: ${t.file}: ${id} (${type})`;
-    if (t.template.Transform !== undefined) problems.push(`policy-guard: ${t.file}: the template has a Transform (${show(t.template.Transform)}), which rewrites it at deploy time; it cannot be checked`);
-    if (JSON.stringify(t.template).includes('"Fn::Transform"')) problems.push(`policy-guard: ${t.file}: the template uses Fn::Transform (a macro or AWS::Include), which changes it at deploy time; it cannot be checked`);
-    for (const [id, resource] of Object.entries(t.template.Resources)) {
-      const type = isObject(resource) ? resource.Type : undefined;
-      if (typeof type !== 'string') continue;
-      const props = isObject(resource.Properties) ? resource.Properties : {};
-      if (type === 'AWS::IAM::Role') {
-        const { statements, problem } = statementsOf(resolve(props.AssumeRolePolicyDocument, ctx));
-        if (problem) problems.push(`${at(id, type)}: trust policy cannot be read: ${problem}`);
-        for (const st of statements) {
-          if (st.Effect === 'Deny') continue;
-          if (st.NotPrincipal !== undefined) problems.push(`${at(id, type)}: trusts everyone but ${show(st.NotPrincipal)} (NotPrincipal)`);
-          for (const [ptype, value] of principalsOf(st.Principal)) {
-            const p = trustPrincipalProblem(ptype, value, st.Condition, account, repos);
-            if (p) problems.push(`${at(id, type)}: ${p}`);
-          }
-        }
-      } else if (RESOURCE_POLICIES.has(type)) {
-        const { statements, problem } = statementsOf(resolve(props.PolicyDocument, ctx));
-        if (problem) problems.push(`${at(id, type)}: policy cannot be read: ${problem}`);
-        for (const st of statements) {
-          if (st.Effect === 'Deny') continue;
-          if (st.NotPrincipal !== undefined) problems.push(`${at(id, type)}: allows everyone but ${show(st.NotPrincipal)} (NotPrincipal)`);
-          for (const [ptype, value] of principalsOf(st.Principal)) {
-            const p = resourcePrincipalProblem(ptype, value, account);
-            if (p) problems.push(`${at(id, type)}: ${p}`);
-          }
-        }
-      } else if (LAMBDA_PERMISSIONS.has(type)) {
-        const values = alternatives(resolve(props.Principal, ctx));
-        if (values.length === 0) problems.push(`${at(id, type)}: names no principal`);
-        for (const value of values) {
-          const p = lambdaPrincipalProblem(value, account);
-          if (p) problems.push(`${at(id, type)}: ${p}`);
-        }
-      } else if (type === 'AWS::CloudFormation::Stack') {
-        // A nested stack's template must be one read here: the URL is the project's CDK asset bucket and the object
-        // key a file asset of the assembly is published under.
-        const url = resolve(props.TemplateURL, ctx);
-        const source = typeof url === 'string' ? assets.find((a) => nestedTemplateUrl(a, account).test(url))?.source : undefined;
-        if (source === undefined || !templateFiles.has(source)) problems.push(`${at(id, type)}: the nested stack's template (${show(url)}) is not a JSON template in the assembly; it cannot be checked`);
+  /** @type {Map<string, { value: any, t: Template }>} */
+  const exports = new Map();
+  /** @type {Map<string, number>} */
+  const exportCount = new Map();
+  const queue = [...templates.values()];
+  const empty = new Map();
+  while (queue.length > 0) {
+    const t = /** @type {Template} */ (queue.shift());
+    for (const output of Object.values(isObject(t.template.Outputs) ? t.template.Outputs : {})) {
+      const name = isObject(output?.Export) ? resolve(output.Export.Name, { account, t, exports: empty, depth: 0 }) : undefined;
+      if (typeof name === 'string') {
+        exportCount.set(name, (exportCount.get(name) ?? 0) + 1);
+        exports.set(name, { value: output.Value, t });
+      } else if (output?.Export !== undefined) {
+        problems.push(`policy-guard: ${t.file}: an export's name cannot be worked out (${show(name)})`);
+      }
+    }
+    for (const [id, resource] of Object.entries(isObject(t.template.Resources) ? t.template.Resources : {})) {
+      if (!isObject(resource) || resource.Type !== 'AWS::CloudFormation::Stack') continue;
+      // A nested stack's template must be one read here: the URL is the project's CDK asset bucket and the object
+      // key a file asset of the assembly is published under.
+      const url = resolve(resource.Properties?.TemplateURL, { account, t, exports: empty, depth: 0 });
+      const source = typeof url === 'string' ? fileAssets.find((a) => nestedTemplateUrl(a, account).test(url))?.source : undefined;
+      const nested = source === undefined ? undefined : templates.get(source) ?? others.get(source);
+      if (!nested) {
+        problems.push(`policy-guard: ${t.file}: ${id} (AWS::CloudFormation::Stack): the nested stack's template (${show(url)}) is not a JSON template in the assembly; it cannot be checked`);
+      } else if (!templates.has(nested.file)) {
+        templates.set(nested.file, nested);
+        others.delete(nested.file);
+        queue.push(nested);
       }
     }
   }
-  return { problems: [...new Set(problems)], templates: templates.length };
+  for (const [name, count] of exportCount) {
+    if (count > 1) problems.push(`policy-guard: the export ${name} is defined ${count} times; which value an import gets cannot be told`);
+  }
+
+  const all = [...templates.values(), ...others.values()];
+  for (const t of all) {
+    const ctx = { account, t, exports, depth: 0 };
+    if (t.template.Transform !== undefined) problems.push(`policy-guard: ${t.file}: the template has a Transform (${show(t.template.Transform)}), which rewrites it at deploy time; it cannot be checked`);
+    if (JSON.stringify(t.template).includes('"Fn::Transform"')) problems.push(`policy-guard: ${t.file}: the template uses Fn::Transform (a macro or AWS::Include), which changes it at deploy time; it cannot be checked`);
+    for (const [id, resource] of Object.entries(t.template.Resources ?? {})) {
+      for (const p of resourceProblems(id, resource, ctx, repos)) problems.push(`policy-guard: ${t.file}: ${p}`);
+    }
+  }
+  return { problems: [...new Set(problems)], templates: all.length };
 }
 
 /**

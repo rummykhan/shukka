@@ -413,6 +413,22 @@ export function fenceDocuments(inputs: FenceInputs): FenceDocuments {
       ],
       Condition: { ArnEquals: { 'aws:PrincipalArn': `arn:aws:iam::${account}:role/${diffRoleName(P)}` } },
     },
+    // Spike hole (shu-9bj.6): the data statements give bounded roles s3:*, sqs:*, sns:*, lambda:* and dynamodb:* on the
+    // project's resources, so a custom resource (Custom::AWS) or a server could write a bucket, queue, topic, function
+    // or table policy that lets another account in, or send the project's logs or messages out, after the policy guard
+    // read the templates. Policies come only from templates, which CloudFormation applies with the execution role.
+    // Of CDK's own handlers only autoDeleteObjects writes a bucket policy (a deny-new-objects statement before it
+    // empties a bucket being deleted); it logs and carries on when refused. Resource "*": a deny only takes away.
+    {
+      Sid: 'NoPolicyWrites', Effect: 'Deny', Resource: '*',
+      Action: [
+        // Wildcards keep the boundary under 6,144 characters: sqs:Set* is SetQueueAttributes, logs:PutDestination* also
+        // denies creating a destination for another account, lambda:*FunctionUrlConfig also its Get and Delete.
+        's3:*BucketPolicy', 's3:Put*Acl', 's3:*PublicAccessBlock', 's3:PutBucketOwnership*', 'sqs:AddPermission', 'sqs:Set*',
+        'sns:AddPermission', 'sns:SetTopicAttributes', 'sns:Subscribe', 'lambda:Add*Permission', 'lambda:*FunctionUrlConfig',
+        'dynamodb:PutResource*', 'logs:PutSubscriptionFilter', 'logs:PutDestination*',
+      ],
+    },
   ];
 
   return {

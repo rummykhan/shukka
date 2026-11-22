@@ -13,6 +13,11 @@
 //   - an asset source path, template file, asset manifest file, nested assembly directory or a
 //     template's `aws:asset:path` metadata that is absolute or climbs out with `..`;
 //   - a symbolic link in the assembly whose target lies outside it.
+// The templates CloudFormation is given (deployedTemplates, which policy-guard.mjs reads too) must be the ones
+// checked: cdk deploys the file asset that a stack's stackTemplateAssetObjectUrl names, not templateFile, so
+//   - that URL must name file assets (bucket and key) whose source is the stack's own templateFile;
+//   - two file assets published to one bucket and key must have the same source;
+//   - a stack template, and any file asset ending .json, .yaml, .yml or .template, must be a JSON object.
 // Stack artifacts (in every manifest) also name things the deploy step hands to cdk on its command line, so
 // none of them may be read as an option or break a line of GITHUB_OUTPUT:
 //   - an id or displayName (the stack selector) not matching SELECTOR;
@@ -27,7 +32,7 @@
 //                                            exit 1, printing nothing, when any is not a valid stack name
 //   exit 2: usage error
 
-import { lstatSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
 import { isAbsolute, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -283,7 +288,114 @@ export function checkAssembly(dir) {
       }
     }
   }
+  problems.push(...deployedTemplates(root).problems);
   return [...new Set(problems)];
+}
+
+/**
+ * @typedef {{ bucket: string, key: string, source: string, where: string }} FileAsset
+ * @typedef {{ where: string, id: string, file: string, template: any }} StackTemplate
+ */
+
+/**
+ * A JSON object read from a file in the assembly, or undefined when it is missing or not a JSON object.
+ * @param {string} root
+ * @param {string} rel
+ * @returns {any}
+ */
+function jsonObject(root, rel) {
+  try {
+    const doc = readJson(join(root, rel));
+    return doc && typeof doc === 'object' && !Array.isArray(doc) ? doc : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The stack templates CloudFormation will be given and the file assets cdk publishes, through every manifest
+ * (nested assemblies included), with the problems that mean the templates read are not the ones deployed.
+ * @param {string} dir the assembly
+ * @returns {{ stacks: StackTemplate[], assets: FileAsset[], problems: string[] }}
+ */
+export function deployedTemplates(dir) {
+  /** @type {StackTemplate[]} */
+  const stacks = [];
+  /** @type {FileAsset[]} */
+  const assets = [];
+  /** @type {string[]} */
+  const problems = [];
+  /** @type {{ where: string, id: string, file: string | null, url: unknown }[]} */
+  const named = [];
+  const root = realpathSync(dir);
+  const queue = [''];
+  const seen = new Set();
+  while (queue.length > 0) {
+    const base = /** @type {string} */ (queue.shift());
+    if (seen.has(base)) continue;
+    seen.add(base);
+    const where = base === '' ? 'manifest.json' : join(base, 'manifest.json');
+    const manifest = jsonObject(root, where);
+    if (!manifest) continue;
+    for (const [id, artifact] of Object.entries(manifest.artifacts ?? {})) {
+      const a = /** @type {any} */ (artifact) ?? {};
+      const props = a.properties ?? {};
+      if (a.type === 'cdk:cloud-assembly') {
+        const nested = inside(root, base, props.directoryName);
+        if (nested !== null) queue.push(nested);
+      } else if (a.type === 'cdk:asset-manifest') {
+        const file = inside(root, base, props.file);
+        const doc = file === null ? undefined : jsonObject(root, file);
+        const manifestDir = file === null ? base : relative(root, join(root, file, '..'));
+        for (const [assetId, asset] of Object.entries(doc?.files ?? {})) {
+          const x = /** @type {any} */ (asset);
+          if ((x?.source?.packaging ?? 'file') !== 'file') continue;
+          const source = inside(root, manifestDir, x?.source?.path);
+          if (source === null) continue;
+          if (/\.(json|ya?ml|template)$/i.test(source) && !jsonObject(root, source)) {
+            problems.push(`assembly: ${file}: file asset ${assetId} (${source}) looks like a template but is not a JSON object; it cannot be checked`);
+          }
+          for (const d of Object.values(x?.destinations ?? {})) {
+            const dest = /** @type {any} */ (d);
+            if (typeof dest?.bucketName === 'string' && typeof dest?.objectKey === 'string') {
+              assets.push({ bucket: dest.bucketName, key: dest.objectKey, source, where: /** @type {string} */ (file) });
+            }
+          }
+        }
+      } else if (a.type === 'aws:cloudformation:stack') {
+        named.push({ where, id, file: props.templateFile === undefined ? null : inside(root, base, props.templateFile), url: props.stackTemplateAssetObjectUrl });
+        if (props.templateFile !== undefined) {
+          const file = inside(root, base, props.templateFile);
+          const template = file === null ? undefined : jsonObject(root, file);
+          // A template that is not there cannot be deployed either (cdk fails); one that is there must be JSON.
+          if (file !== null && !template && !existsSync(join(root, file))) continue;
+          if (file === null || !template) problems.push(`assembly: ${where}: stack ${id} template ${JSON.stringify(props.templateFile)} is not a JSON template in the assembly; it cannot be checked`);
+          else stacks.push({ where, id, file, template });
+        }
+      }
+    }
+  }
+  // One bucket and key, one source: otherwise which file is published (and deployed) is not the one read.
+  /** @type {Map<string, Set<string>>} */
+  const byDestination = new Map();
+  for (const x of assets) {
+    const k = `${x.bucket}/${x.key}`;
+    byDestination.set(k, (byDestination.get(k) ?? new Set()).add(x.source));
+  }
+  for (const [k, sources] of byDestination) {
+    if (sources.size > 1) problems.push(`assembly: two file assets are published to ${k} from different files (${[...sources].sort().join(', ')}); refused`);
+  }
+  for (const s of named) {
+    if (s.url === undefined) continue;
+    const m = typeof s.url === 'string' ? /^s3:\/\/([^/]+)\/(.+)$/.exec(s.url) : null;
+    const sources = m ? byDestination.get(`${m[1]}/${m[2]}`) : undefined;
+    if (!m) problems.push(`assembly: ${s.where}: stack ${s.id} stackTemplateAssetObjectUrl ${JSON.stringify(s.url)} is not an s3:// URL`);
+    else if (!sources) problems.push(`assembly: ${s.where}: stack ${s.id} deploys ${s.url}, which no file asset publishes`);
+    else if (s.file === null || sources.size !== 1 || !sources.has(s.file)) {
+      problems.push(`assembly: ${s.where}: stack ${s.id} deploys ${s.url}, published from ${[...sources].sort().join(', ')}, not its templateFile ${s.file ?? '(none)'}; refused`);
+    }
+  }
+  return { stacks, assets, problems };
 }
 
 /**

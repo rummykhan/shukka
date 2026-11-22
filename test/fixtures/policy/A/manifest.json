@@ -1,0 +1,1 @@
+{"version": "48.0.0", "artifacts": {"S": {"type": "aws:cloudformation:stack", "environment": "aws://818221194501/us-east-1", "properties": {"templateFile": "S.template.json", "stackTemplateAssetObjectUrl": "s3://cdk-hnb659fds-assets-818221194501-us-east-1/evil.yaml"}}, "S.assets": {"type": "cdk:asset-manifest", "properties": {"file": "S.assets.json"}}}}
