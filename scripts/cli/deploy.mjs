@@ -22,7 +22,7 @@ import { loadConfig } from '../config.mjs';
 import { guard, report } from '../guard.mjs';
 import { release } from '../release.mjs';
 import { upload } from '../upload.mjs';
-import { CliError, NPM_SAFE, cdkBin, mustRun, projectEnv, tempDir } from './exec.mjs';
+import { CliError, NPM_SAFE, cdkBin, cdkPlace, mustRun, projectEnv, refuseSymlink, tempDir } from './exec.mjs';
 
 const SHUKKA_DIR = fileURLToPath(new URL('../../', import.meta.url));
 export const REVISION_TAG = 'shukka:revision';
@@ -189,7 +189,8 @@ function synth(io, tree, config) {
 }
 
 /**
- * shukka's cdk with the fenced session, in the assembly's own temp directory (no project file is read there).
+ * shukka's cdk with the fenced session, from an empty temp directory with an empty HOME (no cdk.json plugins from
+ * the directory or from ~/.cdk.json); the assembly is passed with --app.
  * @param {Io} io
  * @param {Config} config
  * @param {Session | null} session
@@ -198,7 +199,8 @@ function synth(io, tree, config) {
  * @param {import('./exec.mjs').RunOptions} [options]
  */
 function cdk(io, config, session, assembly, args, options = {}) {
-  return io.run(process.execPath, [cdkBin(), ...args], { cwd: dirname(assembly), fullEnv: cdkEnv(config, session), ...options });
+  const place = cdkPlace();
+  return io.run(process.execPath, [cdkBin(), ...args], { cwd: place.cwd, fullEnv: { ...cdkEnv(config, session), HOME: place.home }, ...options });
 }
 
 /**
@@ -378,6 +380,7 @@ async function prepare({ io, makeAws, target, configPath, cwd }) {
   const rel = configInRepo(root, cwd, configPath);
   const tree = freshTree(io, root, sha);
   try {
+    refuseSymlink(tree, rel);
     const { config, problems } = loadConfig(join(tree, rel));
     if (!config) throw new CliError(problems.join('\n'));
     if (target.region !== undefined && target.region !== config.aws.region) {

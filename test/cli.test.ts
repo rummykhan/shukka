@@ -5,7 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -585,7 +585,8 @@ test('shu-5ix: project code runs without AWS credentials; cdk gets only the depl
     assert.ok(!x.args.includes('--profile'), 'cdk is not given the caller profile');
     assert.equal(env.npm_config_script_shell, '/bin/sh');
     assert.equal(env.npm_config_registry, 'https://registry.npmjs.org/');
-    assert.ok(x.options.cwd.includes('shukka-cdk-'), `cdk runs in shukka's temp directory: ${x.options.cwd}`);
+    assert.ok(x.options.cwd.includes('shukka-cdk-cwd-'), `cdk runs in an empty shukka temp directory: ${x.options.cwd}`);
+    assert.ok(env.HOME.includes('shukka-cdk-home-'), `cdk gets an empty HOME: ${env.HOME}`);
   }
   assert.equal(c.s3.calls.length, 2, 'upload and release used the caller clients');
 }));
@@ -739,9 +740,19 @@ test('shu-5ix: temporary directories are removed when a command ends', withTmp(a
 
 // ---------- security: what the cdk child, the fence and the project list may read ----------
 
-test("shu-5ix: a planted .npmrc and cdk.json in the directory bootstrap runs from are not read by shukka's cdk", withTmp(async (tmp) => {
+test("shu-5ix: a planted .npmrc and cdk.json in the directory bootstrap runs from, and a ~/.cdk.json, are not read by shukka's cdk", withTmp(async (tmp) => {
   const { dir } = consumer(tmp);
   const marker = join(tmp, 'pwned');
+  const homeMarker = join(tmp, 'pwned-home');
+  const fakeHome = join(tmp, 'home');
+  write(join(fakeHome, 'evil.cjs'), `require('fs').writeFileSync(${JSON.stringify(homeMarker)}, 'plugin ran'); module.exports = { version: '1', init() {} };\n`);
+  write(join(fakeHome, '.cdk.json'), JSON.stringify({ plugin: [join(fakeHome, 'evil.cjs')] }));
+  const savedHome = process.env.HOME;
+  const savedFiles = [process.env.AWS_CONFIG_FILE, process.env.AWS_SHARED_CREDENTIALS_FILE];
+  process.env.HOME = fakeHome;
+  delete process.env.AWS_CONFIG_FILE;
+  delete process.env.AWS_SHARED_CREDENTIALS_FILE;
+  try {
   write(join(dir, 'evil.cjs'), `require('fs').writeFileSync(${JSON.stringify(marker)}, 'plugin ran'); module.exports = { version: '1', init() {} };\n`);
   write(join(dir, 'cdk.json'), JSON.stringify({ plugin: [join(dir, 'evil.cjs')] }));
   write(join(dir, 'evil.sh'), `#!/bin/sh\necho shell > ${marker}\n`);
@@ -770,10 +781,65 @@ test("shu-5ix: a planted .npmrc and cdk.json in the directory bootstrap runs fro
   assert.ok(replays.length >= 1 && replays.every((p) => p.out.includes('Shukka-Boundary-shukkatest')), JSON.stringify(replays));
   assert.ok(!existsSync(marker), 'the planted plugin did not run');
 
-  // Control: the same cdk run from the project directory does load the planted plugin.
+  assert.ok(!existsSync(homeMarker), 'the ~/.cdk.json plugin did not run');
+  for (const x of cdkCalls) {
+    assert.deepEqual(readdirSync(x.options.cwd), [], 'cdk runs in an empty directory');
+    assert.notEqual(x.options.env.HOME, fakeHome);
+    assert.deepEqual(readdirSync(x.options.env.HOME), [], 'cdk gets an empty HOME');
+    assert.equal(x.options.env.AWS_CONFIG_FILE, join(fakeHome, '.aws', 'config'), "the admin's profile still resolves");
+    assert.equal(x.options.env.AWS_SHARED_CREDENTIALS_FILE, join(fakeHome, '.aws', 'credentials'));
+  }
+
+  // Controls: the same cdk run from the project directory, or with the real HOME, does load the planted plugin.
   const app = cdkCalls[0]!.args[cdkCalls[0]!.args.indexOf('--app') + 1]!;
   spawnSync(process.execPath, [cdkBin(), 'ls', '--app', app, '--no-notices'], { cwd: dir, env: { ...process.env, CDK_DISABLE_CLI_TELEMETRY: 'true' }, encoding: 'utf8' });
   assert.ok(existsSync(marker), 'control: from the project directory the plugin would have run');
+  spawnSync(process.execPath, [cdkBin(), 'ls', '--app', app, '--no-notices'], { cwd: cdkCalls[0]!.options.cwd, env: { ...process.env, HOME: fakeHome, CDK_DISABLE_CLI_TELEMETRY: 'true' }, encoding: 'utf8' });
+  assert.ok(existsSync(homeMarker), 'control: with the real HOME the ~/.cdk.json plugin would have run');
+  } finally {
+    process.env.HOME = savedHome;
+    if (savedFiles[0] !== undefined) process.env.AWS_CONFIG_FILE = savedFiles[0];
+    if (savedFiles[1] !== undefined) process.env.AWS_SHARED_CREDENTIALS_FILE = savedFiles[1];
+  }
+}));
+
+test('shu-5ix: cdk diff and deploy run with the deploy-role session only, so asset publishing goes deploy role to file-publishing role', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  const { calls, spawn } = deploySpawn(CLEAN_DIFF, bundleDir(tmp));
+  const c = releaseClients();
+  const session = { accessKeyId: 'ASIADEPLOYROLE', secretAccessKey: 's', sessionToken: 't' };
+  const assumed: string[] = [];
+  const { aws } = awsWith(c, { assumeRole: async (arn: string) => { assumed.push(arn); return session; } });
+  const r = await cli(['deploy', '--skip-checks', '--profile', 'stelking'], { cwd: dir, spawn, aws, checkAssembly: NO_ASSETS });
+  assert.equal(r.code, 0, r.err);
+  assert.deepEqual(assumed, [`arn:aws:iam::${ACCOUNT}:role/cdk-shukkatest-deploy-role-${ACCOUNT}-us-east-1`]);
+  const cdkCalls = calls.filter((x) => x.cmd === process.execPath && x.args[0] === cdkBin());
+  assert.deepEqual(cdkCalls.map((x) => x.args[1]), ['diff', 'deploy']);
+  for (const x of cdkCalls) {
+    const env = x.options.fullEnv;
+    assert.equal(env.AWS_ACCESS_KEY_ID, session.accessKeyId);
+    assert.equal(env.AWS_SESSION_TOKEN, session.sessionToken);
+    assert.equal(readFileSync(env.AWS_CONFIG_FILE, 'utf8'), '', 'no profile to fall back on: cdk publishes assets from this session');
+    assert.equal(readFileSync(env.AWS_SHARED_CREDENTIALS_FILE, 'utf8'), '');
+    assert.ok(!x.args.includes('--profile'));
+  }
+}));
+
+test('shu-5ix: a shukka.json that is a symbolic link is refused', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  write(join(tmp, 'elsewhere.json'), readFileSync(join(dir, 'shukka.json'), 'utf8'));
+  rmSync(join(dir, 'shukka.json'));
+  symlinkSync(join(tmp, 'elsewhere.json'), join(dir, 'shukka.json'));
+  git(dir, 'add', '-A');
+  git(dir, 'commit', '-q', '-m', 'link');
+  git(dir, 'push', '-q', 'origin', 'main');
+  for (const argv of [['deploy', '--dry-run'], ['diff'], projectArgs()]) {
+    const { calls, spawn } = recordingSpawn();
+    const r = await cli(argv, { cwd: dir, spawn });
+    assert.equal(r.code, 1, `${argv[0]}: ${r.out}${r.err}`);
+    assert.match(r.err, /refusing: \S*shukka\.json is or is under a symbolic link/, argv[0]);
+    assert.deepEqual(MUTATING(calls), [], `${argv[0]}: nothing ran`);
+  }
 }));
 
 test('shu-5ix: the fence prints each hosted zone with its name and each mail domain with where it came from, also in a dry run', withTmp(async (tmp) => {

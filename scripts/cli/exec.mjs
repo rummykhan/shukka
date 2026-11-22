@@ -5,10 +5,10 @@
 // commands (git, `aws sts get-caller-identity`) still run in a dry run, because what is printed depends on them.
 
 import { spawnSync } from 'node:child_process';
-import { closeSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, lstatSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
-import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { homedir, tmpdir } from 'node:os';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 
 /**
  * @typedef {{
@@ -199,4 +199,47 @@ export function cdkBin() {
   const pkg = JSON.parse(readFileSync(pkgFile, 'utf8'));
   const bin = typeof pkg.bin === 'string' ? pkg.bin : pkg.bin.cdk;
   return join(dirname(pkgFile), bin);
+}
+
+/**
+ * Where cdk runs: a fresh empty directory as its cwd and another as its HOME, so no cdk.json (with `plugin`
+ * entries, which cdk loads and runs) is read from the directory it runs in or from ~/.cdk.json.
+ * @returns {{ cwd: string, home: string }}
+ */
+export function cdkPlace() {
+  return { cwd: tempDir('cdk-cwd'), home: tempDir('cdk-home') };
+}
+
+/**
+ * The AWS config and credentials files of this process, by real path, so a child whose HOME is moved still finds
+ * the caller's profile.
+ * @param {Record<string, string | undefined>} [env]
+ * @returns {{ AWS_CONFIG_FILE: string, AWS_SHARED_CREDENTIALS_FILE: string }}
+ */
+export function awsFiles(env = process.env) {
+  return {
+    AWS_CONFIG_FILE: env.AWS_CONFIG_FILE ?? join(homedir(), '.aws', 'config'),
+    AWS_SHARED_CREDENTIALS_FILE: env.AWS_SHARED_CREDENTIALS_FILE ?? join(homedir(), '.aws', 'credentials'),
+  };
+}
+
+/**
+ * Refuse a config file that is, or sits under, a symbolic link below `base` (it could point anywhere).
+ * @param {string} base
+ * @param {string} file
+ */
+export function refuseSymlink(base, file) {
+  const rel = relative(base, resolve(base, file));
+  const parts = rel.startsWith('..') || isAbsolute(rel) ? [resolve(base, file)] : rel.split(/[\\/]/);
+  let at = rel.startsWith('..') || isAbsolute(rel) ? '' : base;
+  for (const part of parts) {
+    at = at === '' ? part : join(at, part);
+    let st;
+    try {
+      st = lstatSync(at);
+    } catch {
+      return;
+    }
+    if (st.isSymbolicLink()) throw new CliError(`refusing: ${file} is or is under a symbolic link (${at})`);
+  }
 }

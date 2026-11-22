@@ -13,9 +13,9 @@
 
 import { readFileSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 import { checkProjectName, loadConfig } from '../config.mjs';
-import { CliError, NPM_SAFE, cdkBin, mustRun, tempDir } from './exec.mjs';
+import { CliError, NPM_SAFE, awsFiles, cdkBin, cdkPlace, mustRun, refuseSymlink, tempDir } from './exec.mjs';
 export const ACCOUNT_STACK = 'Shukka-Account';
 /** Tag on the stacks `shukka bootstrap` deploys, naming the project; how shukka knows a bootstrap is its own. */
 export const PROJECT_TAG = 'shukka:project';
@@ -39,17 +39,22 @@ function profileArgs(target) {
 
 /**
  * The `cdk deploy` of one stack from a synthesized cloud assembly, with shukka's own pinned cdk (`node <bin>`, never
- * npx), in the shukka temp directory that holds the assembly: nothing in the directory the admin runs this from
- * (a project's .npmrc or cdk.json, whose plugins would run with admin credentials) is read.
+ * npx), from an empty temp directory with an empty HOME: no .npmrc or cdk.json (whose plugins would run with admin
+ * credentials) is read from the directory the admin runs this from, or from the admin's home.
  * @param {Io} io
  * @param {string} assembly
  * @param {string} stack
  * @param {Target & { region: string }} target
  */
 function cdkDeploy(io, assembly, stack, target) {
+  const place = cdkPlace();
   mustRun(io, `cdk deploy ${stack}`, process.execPath, [
     cdkBin(), 'deploy', stack, '--app', assembly, '--require-approval', 'never', '--no-color', ...profileArgs(target),
-  ], { cwd: dirname(assembly), env: { ...NPM_SAFE, AWS_REGION: target.region, AWS_DEFAULT_REGION: target.region } });
+  ], {
+    cwd: place.cwd,
+    // HOME moved to an empty directory (no ~/.cdk.json plugins); the admin's AWS files pinned by real path first.
+    env: { ...awsFiles(), ...NPM_SAFE, HOME: place.home, AWS_REGION: target.region, AWS_DEFAULT_REGION: target.region },
+  });
 }
 
 /**
@@ -283,6 +288,7 @@ function originRepo(io, cwd) {
  */
 export async function bootstrapProject(options) {
   const { io, aws, project } = options;
+  refuseSymlink(options.cwd, options.configPath);
   const { config, problems } = loadConfig(options.configPath);
   if (!config) throw new CliError(problems.join('\n'));
   if (config.project !== project) {

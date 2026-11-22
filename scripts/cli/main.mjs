@@ -255,6 +255,8 @@ export async function main(argv, deps = {}) {
       const { loadConfig } = await import('../config.mjs');
       const { resolve } = await import('node:path');
       const fullConfig = resolve(cwd, configPath);
+      const { refuseSymlink } = await import('./exec.mjs');
+      refuseSymlink(cwd, fullConfig);
       const { config, problems } = loadConfig(fullConfig);
       if (!config) throw new CliError(problems.join('\n'));
       const r = region ?? config.aws.region;
