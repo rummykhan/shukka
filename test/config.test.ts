@@ -48,7 +48,7 @@ test("shu-9wa: the design's Trendigle example validates against the schema", () 
 test('shu-9wa: the schema names exactly the contract keys', () => {
   const schema = JSON.parse(readFileSync(join(root, 'schema', 'shukka.schema.json'), 'utf8'));
   assert.deepEqual(Object.keys(schema.properties).sort(), [
-    '$schema', 'alwaysDeploy', 'apps', 'aws', 'checks', 'infra', 'node', 'project', 'qualifier', 'smoke',
+    '$schema', 'alwaysDeploy', 'apps', 'aws', 'checks', 'fence', 'infra', 'node', 'project', 'qualifier', 'smoke',
   ]);
   assert.equal(schema.additionalProperties, false);
   const app = schema.definitions.app;

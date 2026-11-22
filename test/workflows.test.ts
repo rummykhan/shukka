@@ -276,7 +276,7 @@ test('shu-9zr: project code runs only in jobs that cannot obtain credentials; cr
   for (const id of ['changes', 'deploy', 'diff']) assert.ok([infra.jobs[id].needs].flat().includes('synth'), id);
   // shukka's cdk CLI is pinned exactly in its own lockfile.
   const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
-  assert.match(pkg.devDependencies['aws-cdk'], /^\d+\.\d+\.\d+$/);
+  assert.match(pkg.dependencies['aws-cdk'], /^\d+\.\d+\.\d+$/);
 });
 
 test('shu-9zr: deploy refuses an unsafe assembly before any credential is configured, and skips when the stacks are ahead', () => {

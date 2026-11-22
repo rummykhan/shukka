@@ -68,6 +68,26 @@
     "alwaysDeploy": {
       "description": "Deploy every app and the infrastructure on each merge, whatever changed. Default false.",
       "type": "boolean"
+    },
+    "fence": {
+      "description": "Resources outside the project's name prefix that its stacks may change, read by `shukka bootstrap <project>` to build the project's execution policy and boundary (ShukkaBoundary).",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "hostedZoneIds": {
+          "description": "Route 53 hosted zones the project may change, by id (Z...).",
+          "type": "array",
+          "items": { "type": "string", "pattern": "^Z[A-Z0-9]{1,32}$" }
+        },
+        "mailDomains": {
+          "description": "SES domains the project owns and may send mail from. Plain domain names, no wildcards.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+$"
+          }
+        }
+      }
     }
   },
   "definitions": {
