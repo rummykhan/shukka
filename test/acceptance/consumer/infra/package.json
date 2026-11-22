@@ -1,0 +1,15 @@
+{
+  "name": "shukkatest-infra",
+  "private": true,
+  "type": "module",
+  "description": "CDK app for shukka's throwaway acceptance project shukkatest",
+  "dependencies": {
+    "aws-cdk-lib": "^2.170.0",
+    "constructs": "^10.0.0",
+    "shukka": "github:rummykhan/shukka#__SHUKKA_REF__",
+    "tsx": "^4.19.0"
+  },
+  "devDependencies": {
+    "aws-cdk": "^2.1000.0"
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "$schema": "https://raw.githubusercontent.com/rummykhan/shukka/__SHUKKA_REF__/schema/shukka.schema.json",
+  "project": "shukkatest",
+  "qualifier": "shukkatest",
+  "aws": { "account": "__ACCOUNT__", "region": "__REGION__" },
+  "node": "22",
+  "checks": [
+    { "name": "lint", "dir": ".", "run": ["bash apps/check.sh"] }
+  ],
+  "infra": { "dir": "infra", "paths": ["infra/**"] },
+  "apps": [
+    {
+      "name": "web",
+      "paths": ["apps/web/**"],
+      "build": { "dir": "apps/web", "run": ["bash build.sh"], "bundle": "bundle.sh", "buildEnv": ["SHUKKATEST_GREETING"] },
+      "server": { "configure": "box/configure.sh", "units": ["shukkatest-web"], "health": "http://127.0.0.1:8080/health" }
+    },
+    {
+      "name": "api",
+      "paths": ["apps/api/**"],
+      "build": { "dir": "apps/api", "run": ["bash build.sh"], "bundle": "bundle.sh" },
+      "server": { "configure": "box/configure.sh", "units": ["shukkatest-api"], "health": "http://127.0.0.1:8081/health" }
+    }
+  ],
+  "smoke": { "run": "bash smoke/smoke.sh" },
+  "alwaysDeploy": false
+}

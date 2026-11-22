@@ -1,0 +1,25 @@
+{
+  "account": "__ACCOUNT__",
+  "region": "__REGION__",
+  "qualifier": "shukkatest",
+  "roles": {
+    "infra": "arn:aws:iam::__ACCOUNT__:role/shukkatest-shukka-infra",
+    "app": "arn:aws:iam::__ACCOUNT__:role/shukkatest-shukka-app",
+    "diff": "arn:aws:iam::__ACCOUNT__:role/shukkatest-shukka-diff"
+  },
+  "own": {
+    "stack": "Shukkatest-Box",
+    "bucket": "shukkatest-deploy-__ACCOUNT__",
+    "table": "shukkatest-items"
+  },
+  "standin": {
+    "stack": "__STANDIN_STACK__",
+    "table": "__STANDIN_TABLE__",
+    "bucket": "__STANDIN_BUCKET__",
+    "queue": "__STANDIN_TABLE__-queue"
+  },
+  "readOnly": {
+    "trendigleTable": "__TRENDIGLE_TABLE__",
+    "trendigleBucket": "__TRENDIGLE_BUCKET__"
+  }
+}
