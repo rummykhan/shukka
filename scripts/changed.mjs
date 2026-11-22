@@ -9,6 +9,9 @@
 //   prints {"infra": bool, "apps": {"<name>": bool}, "base": {"infra": sha|null, "apps": {"<name>": sha|null}}}
 //   exit 0: printed; exit 1: config invalid or git failed; exit 2: usage error
 //   --stacks names the project's stacks instead of listing every stack whose name starts with the project
+//
+// The config's globs are matched only against the git-relative names printed by
+// `git diff --name-only`; they are never expanded on the filesystem.
 
 import { execFileSync } from 'node:child_process';
 import { realpathSync } from 'node:fs';
@@ -44,17 +47,42 @@ const RUNNING = new Set(['Pending', 'InProgress', 'Delayed']);
 
 /**
  * A path glob as used in shukka.json: `**` crosses directories, `*` and `?` stay inside one
- * path segment, a trailing `/**` also matches the directory's contents at any depth.
+ * path segment, a trailing `/**` also matches the directory's contents at any depth,
+ * `{a,b}` is alternation (nestable), `[abc]`, `[a-z]` and `[!abc]` (or `[^abc]`) are
+ * character classes that never match `/`. A stray `]`, `}` or `,` is a literal character.
+ * Throws on a pattern it cannot parse (an unclosed `[` or `{`, a reversed range).
  * @param {string} glob
  * @returns {RegExp}
  */
 export function globToRegExp(glob) {
+  const { source, pos } = parseGlob(glob, 0, false);
+  if (pos !== glob.length) throw new Error(`glob ${JSON.stringify(glob)}: unexpected ${JSON.stringify(glob[pos])}`);
+  try {
+    return new RegExp(`^${source}$`, 'u');
+  } catch (error) {
+    throw new Error(`glob ${JSON.stringify(glob)}: ${/** @type {Error} */ (error).message}`, { cause: error });
+  }
+}
+
+/** @param {string} c */
+const escapeLiteral = (c) => c.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
+
+/**
+ * Parse a run of the glob from `pos`. Inside braces it stops before a `,` or `}`.
+ * @param {string} glob
+ * @param {number} pos
+ * @param {boolean} inBrace
+ * @returns {{ source: string, pos: number }}
+ */
+function parseGlob(glob, pos, inBrace) {
   let source = '';
-  for (let i = 0; i < glob.length; i++) {
+  let i = pos;
+  while (i < glob.length) {
     const c = /** @type {string} */ (glob[i]);
+    if (inBrace && (c === ',' || c === '}')) break;
     if (c === '*' && glob[i + 1] === '*') {
-      i++;
-      if (glob[i + 1] === '/') {
+      i += 2;
+      if (glob[i] === '/') {
         i++;
         source += '(?:.*/)?';
       } else {
@@ -62,22 +90,63 @@ export function globToRegExp(glob) {
       }
     } else if (c === '*') {
       source += '[^/]*';
+      i++;
     } else if (c === '?') {
       source += '[^/]';
+      i++;
+    } else if (c === '[') {
+      let j = i + 1;
+      const negated = glob[j] === '!' || glob[j] === '^';
+      if (negated) j++;
+      const first = j;
+      // A `]` right after the opening (or after `!`) is a member, as in POSIX.
+      if (glob[j] === ']') j++;
+      while (j < glob.length && glob[j] !== ']') j++;
+      if (j >= glob.length) throw new Error(`glob ${JSON.stringify(glob)}: unclosed [`);
+      const members = [...glob.slice(first, j)]
+        .map((m, k, all) => (m === '-' ? (k > 0 && k < all.length - 1 ? '-' : '\\-') : escapeLiteral(m)))
+        .join('');
+      source += negated ? `[^/${members}]` : `(?!/)[${members}]`;
+      i = j + 1;
+    } else if (c === '{') {
+      /** @type {string[]} */
+      const alternatives = [];
+      let j = i + 1;
+      for (;;) {
+        const part = parseGlob(glob, j, true);
+        alternatives.push(part.source);
+        j = part.pos;
+        if (j >= glob.length) throw new Error(`glob ${JSON.stringify(glob)}: unclosed {`);
+        j++;
+        if (glob[j - 1] === '}') break;
+      }
+      source += `(?:${alternatives.join('|')})`;
+      i = j;
     } else {
-      source += c.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+      source += escapeLiteral(c);
+      i++;
     }
   }
-  return new RegExp(`^${source}$`, 'u');
+  return { source, pos: i };
 }
 
 /**
+ * Whether a path matches any glob. A glob that cannot be parsed counts as matching, with a
+ * warning: an unreadable pattern must make its part deploy, never skip it.
  * @param {string} path a repository-relative path with forward slashes
  * @param {string[]} globs
+ * @param {(line: string) => void} [warn]
  * @returns {boolean}
  */
-export function matchesAny(path, globs) {
-  return globs.some((glob) => globToRegExp(glob).test(path));
+export function matchesAny(path, globs, warn = () => {}) {
+  return globs.some((glob) => {
+    try {
+      return globToRegExp(glob).test(path);
+    } catch (error) {
+      warn(`${/** @type {Error} */ (error).message}; treating it as matching`);
+      return true;
+    }
+  });
 }
 
 /**
@@ -160,7 +229,7 @@ export function decidePart(repo, head, revisions, globs, label, warn) {
     }
   }
   const shas = /** @type {string[]} */ (distinct);
-  const changed = shas.some((sha) => changedPaths(repo, sha, head).some((path) => matchesAny(path, globs)));
+  const changed = shas.some((sha) => changedPaths(repo, sha, head).some((path) => matchesAny(path, globs, (line) => warn(`${label}: ${line}`))));
   const base = shas.find((sha) => shas.every((other) => other === sha || isAncestor(repo, sha, other))) ?? shas[0];
   return { changed, base: base ?? null };
 }
@@ -283,10 +352,11 @@ export async function readAppRevisions(ec2, ssm, project, apps, wait = {}, warn 
   }
   if (!commandId) return unknownEverywhere('SendCommand returned no command id');
 
+  // One deadline for all instances, so a slow fleet waits timeoutMs in total, not per instance.
+  let waited = 0;
   for (const instance of instances) {
     /** @type {string | null} */
     let output = null;
-    let waited = 0;
     for (;;) {
       let status = 'Pending';
       try {
@@ -346,7 +416,7 @@ export async function computeChanges(options) {
     warn(options.force ? 'forced: every part deploys' : 'alwaysDeploy: every part deploys');
     return everything(config, true);
   }
-  const head = git(repo, ['rev-parse', '--verify', `${options.head ?? 'HEAD'}^{commit}`]).trim();
+  const head = git(repo, ['rev-parse', '--verify', '--end-of-options', `${options.head ?? 'HEAD'}^{commit}`]).trim();
 
   /** @type {Revisions} */
   let stackRevisions;

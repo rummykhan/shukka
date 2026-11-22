@@ -240,6 +240,16 @@ test('shu-8f5: waits for the SSM invocation to finish', async () => {
   assert.equal(sent.filter((s) => s.command === 'GetCommandInvocationCommand').length, 4);
 });
 
+test('shu-8f5: the SSM wait is one deadline across all instances', async () => {
+  const { sent } = await run({
+    stacks: [stack('Trendigle-prod-Data', c5)],
+    servers: [{ id: 'i-1' }, { id: 'i-2' }, { id: 'i-3' }],
+    pendingPolls: 1000,
+  });
+  // timeoutMs 10, interval 1: about 11 polls for the first instance, then one each for the rest.
+  assert.ok(sent.filter((s) => s.command === 'GetCommandInvocationCommand').length <= 15);
+});
+
 // ---------------------------------------------------------------------------
 // Criterion 2: globs; docs-only gives all false.
 // ---------------------------------------------------------------------------
@@ -258,6 +268,65 @@ test('shu-8f5: config globs match paths: ** crosses directories, * and ? stay in
   assert.ok(!matchesAny('a/', ['a?']));
   assert.ok(matchesAny('x.json', ['**/*.json']));
   assert.equal(globToRegExp('a(b)+c').test('a(b)+c'), true);
+});
+
+test('shu-8f5: {a,b} alternation matches each alternative and nothing else, nested too', () => {
+  const glob = 'implementation/{app,shared}/**';
+  assert.ok(matchesAny('implementation/app/x.ts', [glob]));
+  assert.ok(matchesAny('implementation/shared/lib/y.ts', [glob]));
+  assert.ok(!matchesAny('implementation/admin/x.ts', [glob]));
+  assert.ok(!matchesAny('implementation/apps/x.ts', [glob]));
+  assert.ok(matchesAny('src/x.test.ts', ['src/*.{ts,{mjs,cjs}}']));
+  assert.ok(matchesAny('src/x.cjs', ['src/*.{ts,{mjs,cjs}}']));
+  assert.ok(!matchesAny('src/x.js', ['src/*.{ts,{mjs,cjs}}']));
+  assert.ok(matchesAny('a/x', ['{a,b/c}/*']) && matchesAny('b/c/x', ['{a,b/c}/*']) && !matchesAny('b/x', ['{a,b/c}/*']));
+});
+
+test('shu-8f5: [...] classes, ranges and [!...] negation match one character, never /', () => {
+  assert.ok(matchesAny('src/a/x', ['src/[ab]/**']));
+  assert.ok(matchesAny('src/b/x', ['src/[ab]/**']));
+  assert.ok(!matchesAny('src/c/x', ['src/[ab]/**']));
+  assert.ok(matchesAny('implementation/infra/bin/app.ts', ['implementation/[i]nfra/**']));
+  assert.ok(matchesAny('src/q/x', ['src/[a-z]/**']));
+  assert.ok(!matchesAny('src/Q/x', ['src/[a-z]/**']));
+  assert.ok(!matchesAny('src/b/x', ['src/[!b]/**']));
+  assert.ok(matchesAny('src/c/x', ['src/[!b]/**']));
+  assert.ok(!matchesAny('src/b/x', ['src/[^b]/**']));
+  assert.ok(!matchesAny('a/b', ['a[!x]b']));
+  assert.ok(!matchesAny('a/b', ['a[/]b']));
+  assert.ok(matchesAny('a-b', ['a[-x]b']) && matchesAny('a-b', ['a[x-]b']) && !matchesAny('a.b', ['a[x-]b']));
+  assert.ok(matchesAny('a]b', ['a[]]b']));
+  assert.ok(matchesAny('my-app/x', ['my-app/**']));
+});
+
+test('shu-8f5: a glob that cannot be parsed counts as matching, with a warning', () => {
+  for (const glob of ['src/[ab/**', 'src/{a,b/**', 'src/[z-a]/**']) {
+    const warnings: string[] = [];
+    assert.ok(matchesAny('docs/README.md', [glob], (line) => warnings.push(line)), glob);
+    assert.equal(warnings.length, 1, glob);
+    assert.ok(warnings[0]?.includes(JSON.stringify(glob)), warnings[0]);
+    assert.throws(() => globToRegExp(glob));
+  }
+});
+
+test('shu-8f5: brace and class globs in the config drive the decision; an unparseable one deploys', async () => {
+  const world = (): World => ({
+    stacks: [stack('Trendigle-prod-Data', c4)],
+    servers: [{ id: 'i-1', revisions: { app: c4, admin: c4 } }],
+  });
+  // c4..c5 changes only implementation/admin/src/page.ts.
+  const braces = configWith((raw) => {
+    raw.infra.paths = ['implementation/[i]nfra/**'];
+    raw.apps[0].paths = ['implementation/{app,shared}/**'];
+    raw.apps[1].paths = ['implementation/{adm[h-j]n,shared}/**'];
+  });
+  const { changes } = await run(world(), { config: braces, head: c5 });
+  assert.deepEqual(changes, { infra: false, apps: { app: false, admin: true }, base: { infra: c4, apps: { app: c4, admin: c4 } } });
+
+  const broken = configWith((raw) => { raw.infra.paths = ['implementation/[infra/**']; });
+  const out = await run(world(), { config: broken, head: c5 });
+  assert.equal(out.changes.infra, true);
+  assert.ok(out.warnings.some((w) => w.startsWith('infra: ') && w.includes('unclosed [')), out.warnings.join('\n'));
 });
 
 test('shu-8f5: a docs-only change since every deployed revision gives all false', async () => {
