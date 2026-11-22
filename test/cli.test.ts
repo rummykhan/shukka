@@ -504,10 +504,17 @@ function deploySpawn(diff: string, bundle: string, diffStatus = 0) {
 function releaseClients() {
   const s3 = stubClient();
   const ec2 = stubClient(() => ({ Reservations: [{ Instances: [{ InstanceId: 'i-0abc' }] }] }));
-  const ssm = stubClient((c) => (c.constructor.name === 'SendCommandCommand'
-    ? { Command: { CommandId: 'cmd-1' } }
-    : { Status: 'Success', ResponseCode: 0, StandardOutputContent: 'shukka: shukkatest/web old -> new live\n' }));
+  const ssm = ssmStub({ Status: 'Success', ResponseCode: 0, StandardOutputContent: 'shukka: shukkatest/web old -> new live\n' });
   return { s3, ec2, ssm };
+}
+
+/** An SSM stub: agents Online (release.mjs waits for them before SendCommand), one command, this invocation result. */
+function ssmStub(invocation: Record<string, unknown>) {
+  return stubClient((c) => {
+    if (c.constructor.name === 'DescribeInstanceInformationCommand') return { InstanceInformationList: [{ InstanceId: 'i-0abc', PingStatus: 'Online' }] };
+    if (c.constructor.name === 'SendCommandCommand') return { Command: { CommandId: 'cmd-1' } };
+    return invocation;
+  });
 }
 
 function awsWith(c: ReturnType<typeof releaseClients>, over: Fake = {}) {
@@ -536,6 +543,8 @@ test('shu-5ix: deploy runs the guard on the cdk diff, deploys with the revision 
   assert.equal(c.s3.calls[1]!.input.Body.toString(), '#!/usr/bin/env bash\necho configured\n', 'the hook comes from git');
   const send = c.ssm.calls.find((x) => x.constructor.name === 'SendCommandCommand')!;
   assert.deepEqual(send.input.InstanceIds, ['i-0abc']);
+  const names = c.ssm.calls.map((x) => x.constructor.name);
+  assert.ok(names.indexOf('DescribeInstanceInformationCommand') !== -1 && names.indexOf('DescribeInstanceInformationCommand') < names.indexOf('SendCommandCommand'), 'release waits for the SSM agent first');
   assert.ok(calls.some((x) => x.cmd === 'bash' && x.args[1] === 'bash smoke.sh'), 'smoke ran');
 }));
 
@@ -669,9 +678,7 @@ test('shu-5ix: a failed release exits with the release script code', withTmp(asy
   const { dir } = consumer(tmp);
   const s = deploySpawn(CLEAN_DIFF, bundleDir(tmp));
   const c = releaseClients();
-  const ssm = stubClient((x) => (x.constructor.name === 'SendCommandCommand'
-    ? { Command: { CommandId: 'cmd-1' } }
-    : { Status: 'Failed', ResponseCode: 12, StandardOutputContent: 'shukka: shukkatest/web a -> b rolled-back\n' }));
+  const ssm = ssmStub({ Status: 'Failed', ResponseCode: 12, StandardOutputContent: 'shukka: shukkatest/web a -> b rolled-back\n' });
   const r = await cli(['deploy', '--skip-checks'], { cwd: dir, spawn: s.spawn, aws: fakeAws({ clients: () => ({ s3: c.s3.client, ssm: ssm.client, ec2: c.ec2.client }) }).aws, checkAssembly: NO_ASSETS });
   assert.equal(r.code, 12);
   assert.match(r.out, /rolled back; the previous release is live/);
