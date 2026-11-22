@@ -183,6 +183,10 @@ jobs:
           node --input-type=module - "$RUNNER_TEMP/shukka-config.json" <<'JS'
           import { appendFileSync, readFileSync } from 'node:fs';
           const config = JSON.parse(readFileSync(process.argv[2], 'utf8'));
+          if (config.apps.length > 20) {
+            console.log('::error::shukka: at most 20 apps (build hands one bundle digest per app to the release)');
+            process.exit(1);
+          }
           const out = {
             config: JSON.stringify(config),
             node: config.node,
@@ -266,6 +270,30 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
+    # One slot per matrix entry (strategy.job-index), each "<app>:<sha256 of bundle.tgz>": ec2.yml refuses a
+    # bundle-<app> artifact another job of the run replaced. Matrix outputs merge by name, so the slots are
+    # declared; plan refuses more than 20 apps.
+    outputs:
+      digest_0: ${{ steps.bundle.outputs.digest_0 }}
+      digest_1: ${{ steps.bundle.outputs.digest_1 }}
+      digest_2: ${{ steps.bundle.outputs.digest_2 }}
+      digest_3: ${{ steps.bundle.outputs.digest_3 }}
+      digest_4: ${{ steps.bundle.outputs.digest_4 }}
+      digest_5: ${{ steps.bundle.outputs.digest_5 }}
+      digest_6: ${{ steps.bundle.outputs.digest_6 }}
+      digest_7: ${{ steps.bundle.outputs.digest_7 }}
+      digest_8: ${{ steps.bundle.outputs.digest_8 }}
+      digest_9: ${{ steps.bundle.outputs.digest_9 }}
+      digest_10: ${{ steps.bundle.outputs.digest_10 }}
+      digest_11: ${{ steps.bundle.outputs.digest_11 }}
+      digest_12: ${{ steps.bundle.outputs.digest_12 }}
+      digest_13: ${{ steps.bundle.outputs.digest_13 }}
+      digest_14: ${{ steps.bundle.outputs.digest_14 }}
+      digest_15: ${{ steps.bundle.outputs.digest_15 }}
+      digest_16: ${{ steps.bundle.outputs.digest_16 }}
+      digest_17: ${{ steps.bundle.outputs.digest_17 }}
+      digest_18: ${{ steps.bundle.outputs.digest_18 }}
+      digest_19: ${{ steps.bundle.outputs.digest_19 }}
     strategy:
       fail-fast: false
       matrix:
@@ -291,9 +319,12 @@ jobs:
 
       # buildEnv names are read from repository variables (design D9); vars holds no secrets.
       - name: Build and bundle
+        id: bundle
         working-directory: project
         env:
           APP: ${{ toJSON(matrix.app) }}
+          APP_NAME: ${{ matrix.app.name }}
+          JOB_INDEX: ${{ strategy.job-index }}
           REPOSITORY_VARS: ${{ toJSON(vars) }}
         run: |
           set -euo pipefail
@@ -349,6 +380,14 @@ jobs:
           # A tarball keeps symbolic links as links; upload.mjs checks them on the deploy side.
           tar -C "$dir" -czf "$RUNNER_TEMP/shukka-bundle/bundle.tgz" .
           echo "shukka: bundled $dir ($(du -h "$RUNNER_TEMP/shukka-bundle/bundle.tgz" | cut -f1))"
+          digest() {
+            node --input-type=module - "$1" <<'JS'
+          import { createHash } from 'node:crypto';
+          import { readFileSync } from 'node:fs';
+          process.stdout.write(createHash('sha256').update(readFileSync(process.argv[2])).digest('hex'));
+          JS
+          }
+          echo "digest_$JOB_INDEX=$APP_NAME:$(digest "$RUNNER_TEMP/shukka-bundle/bundle.tgz")" >>"$GITHUB_OUTPUT"
 
       - name: Upload the bundle
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -395,7 +434,7 @@ jobs:
 
   app:
     name: servers
-    needs: [plan, infra]
+    needs: [plan, build, infra]
     if: >-
       !cancelled() && needs.infra.result == 'success' && needs.plan.outputs.has_apps == 'true'
     permissions:
@@ -405,6 +444,7 @@ jobs:
     with:
       config: ${{ inputs.config }}
       force: ${{ inputs.force }}
+      bundle_digests: ${{ toJSON(needs.build.outputs) }}
 
   smoke:
     name: smoke

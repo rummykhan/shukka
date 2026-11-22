@@ -4,11 +4,14 @@
 //
 // The assembly is untrusted data. cdk-assets runs on the deploy runner with the deploy role's
 // credentials, so anything in the assembly that makes it run a command or read outside the
-// assembly is refused:
+// assembly is refused. Asset manifests are found through every manifest.json (top level and
+// nested assemblies: each `cdk:asset-manifest` artifact's `properties.file`, whatever its name), and
+// every JSON file in the assembly with `files` or `dockerImages` is checked the same way:
 //   - a file asset with `source.executable` (cdk-assets runs that command on the host);
 //   - any Docker image asset (it runs `docker build` on the host; v1 has no image-publishing role);
-//   - an asset source path, template file, asset manifest file or nested assembly directory that is
-//     absolute or climbs out with `..`;
+//   - a stack carrying legacy `aws:cdk:asset` metadata (assets the CLI builds itself);
+//   - an asset source path, template file, asset manifest file, nested assembly directory or a
+//     template's `aws:asset:path` metadata that is absolute or climbs out with `..`;
 //   - a symbolic link in the assembly whose target lies outside it.
 //
 // CLI:
@@ -57,7 +60,62 @@ function walk(dir) {
 }
 
 /**
+ * The asset checks for one parsed asset manifest (or any JSON carrying `files` or `dockerImages`).
+ * @param {any} assets
+ * @param {string} where
+ * @param {string[]} problems
+ */
+function checkAssets(assets, where, problems) {
+  if (!assets || typeof assets !== 'object') return;
+  const files = assets.files;
+  if (files && typeof files === 'object') {
+    for (const [id, asset] of Object.entries(files)) {
+      const source = /** @type {any} */ (asset)?.source ?? {};
+      if (source.executable !== undefined) problems.push(`assembly: ${where}: file asset ${id} is built by running a command (source.executable); refused`);
+      if (source.path !== undefined && !staysInside(source.path)) problems.push(`assembly: ${where}: file asset ${id} source path must stay inside the assembly`);
+    }
+  }
+  const images = assets.dockerImages;
+  if (images && typeof images === 'object') {
+    for (const id of Object.keys(images)) {
+      problems.push(`assembly: ${where}: Docker image asset ${id} is not supported (it would run docker build with credentials)`);
+    }
+  }
+}
+
+/**
+ * `aws:asset:path` in a template's resource metadata (what `sam local` and the CLI read) must stay inside.
+ * @param {any} template
+ * @param {string} where
+ * @param {string[]} problems
+ */
+function checkTemplate(template, where, problems) {
+  const resources = template?.Resources;
+  if (!resources || typeof resources !== 'object') return;
+  for (const [id, resource] of Object.entries(resources)) {
+    const path = /** @type {any} */ (resource)?.Metadata?.['aws:asset:path'];
+    if (path !== undefined && !staysInside(path)) problems.push(`assembly: ${where}: resource ${id} aws:asset:path must stay inside the assembly`);
+  }
+}
+
+/**
+ * A path named in a manifest, resolved against the manifest's directory, still inside the assembly root.
+ * @param {string} root
+ * @param {string} base directory of the manifest, relative to root
+ * @param {unknown} path
+ * @returns {string | null} the path relative to root, or null when it leaves
+ */
+function inside(root, base, path) {
+  if (typeof path !== 'string' || !staysInside(path)) return null;
+  const rel = relative(root, join(root, base, path));
+  return rel === '' || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel) ? null : rel;
+}
+
+/**
  * Problems that make the assembly unsafe to publish and deploy with credentials.
+ * Asset manifests are found by what the manifests say (any `cdk:asset-manifest` artifact's
+ * `properties.file`), never by file name; and every JSON file in the assembly that carries `files`
+ * or `dockerImages` is checked as an asset manifest too.
  * @param {string} dir
  * @returns {string[]}
  */
@@ -71,6 +129,8 @@ export function checkAssembly(dir) {
   } catch (error) {
     return [`assembly: cannot read ${dir}/manifest.json: ${/** @type {Error} */ (error).message}`];
   }
+
+  // Every file: links that leave, and every JSON document (asset manifests under any name, templates).
   for (const path of walk(root)) {
     const full = join(root, path);
     const st = lstatSync(full);
@@ -86,40 +146,67 @@ export function checkAssembly(dir) {
       if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) problems.push(`assembly: ${path} links outside the assembly`);
       continue;
     }
-    if (!st.isFile()) continue;
-    if (path.endsWith('manifest.json')) {
-      let manifest;
-      try {
-        manifest = readJson(full);
-      } catch {
-        continue;
+    if (!st.isFile() || st.size > 50 * 1024 * 1024) continue;
+    let doc;
+    try {
+      const text = readFileSync(full, 'utf8');
+      if (!/^\s*\{/.test(text)) continue;
+      doc = JSON.parse(text);
+    } catch {
+      continue;
+    }
+    checkAssets(doc, path, problems);
+    checkTemplate(doc, path, problems);
+  }
+
+  // Every manifest reachable from the top one, through nested assemblies.
+  /** @type {string[]} */
+  const queue = [''];
+  const seen = new Set();
+  while (queue.length > 0) {
+    const base = /** @type {string} */ (queue.shift());
+    if (seen.has(base)) continue;
+    seen.add(base);
+    const where = base === '' ? 'manifest.json' : join(base, 'manifest.json');
+    let manifest;
+    try {
+      manifest = readJson(join(root, base, 'manifest.json'));
+    } catch (error) {
+      problems.push(`assembly: cannot read ${where}: ${/** @type {Error} */ (error).message}`);
+      continue;
+    }
+    for (const [id, artifact] of Object.entries(manifest?.artifacts ?? {})) {
+      const a = /** @type {any} */ (artifact) ?? {};
+      const props = a.properties ?? {};
+      for (const key of ['templateFile', 'file', 'directoryName']) {
+        if (props[key] !== undefined && inside(root, base, props[key]) === null) problems.push(`assembly: ${where}: artifact ${id} ${key} must stay inside the assembly`);
       }
-      for (const [id, artifact] of Object.entries(manifest.artifacts ?? {})) {
-        const props = /** @type {any} */ (artifact)?.properties ?? {};
-        for (const key of ['templateFile', 'file', 'directoryName']) {
-          if (props[key] !== undefined && !staysInside(props[key])) problems.push(`assembly: ${path}: artifact ${id} ${key} must stay inside the assembly`);
+      if (a.type === 'cdk:asset-manifest') {
+        const file = inside(root, base, props.file);
+        if (file === null) {
+          if (props.file === undefined) problems.push(`assembly: ${where}: asset manifest ${id} names no file`);
+          continue;
+        }
+        try {
+          checkAssets(readJson(join(root, file)), file, problems);
+        } catch (error) {
+          problems.push(`assembly: ${where}: asset manifest ${id} (${file}) cannot be read: ${/** @type {Error} */ (error).message}`);
+        }
+      }
+      if (a.type === 'cdk:cloud-assembly') {
+        const nested = inside(root, base, props.directoryName);
+        if (nested !== null) queue.push(nested);
+      }
+      if (a.type === 'aws:cloudformation:stack') {
+        for (const [path, entries] of Object.entries(a.metadata ?? {})) {
+          if (Array.isArray(entries) && entries.some((e) => e?.type === 'aws:cdk:asset')) {
+            problems.push(`assembly: ${where}: stack ${id} carries legacy asset metadata (aws:cdk:asset at ${path}); refused`);
+          }
         }
       }
     }
-    if (path.endsWith('.assets.json')) {
-      let assets;
-      try {
-        assets = readJson(full);
-      } catch (error) {
-        problems.push(`assembly: ${path} is not JSON: ${/** @type {Error} */ (error).message}`);
-        continue;
-      }
-      for (const [id, asset] of Object.entries(assets.files ?? {})) {
-        const source = /** @type {any} */ (asset)?.source ?? {};
-        if (source.executable !== undefined) problems.push(`assembly: ${path}: file asset ${id} is built by running a command (source.executable); refused`);
-        if (source.path !== undefined && !staysInside(source.path)) problems.push(`assembly: ${path}: file asset ${id} source path must stay inside the assembly`);
-      }
-      for (const id of Object.keys(assets.dockerImages ?? {})) {
-        problems.push(`assembly: ${path}: Docker image asset ${id} is not supported (it would run docker build with credentials)`);
-      }
-    }
   }
-  return problems;
+  return [...new Set(problems)];
 }
 
 /**

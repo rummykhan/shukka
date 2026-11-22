@@ -73,6 +73,11 @@ export function infraRoleName(project: string): string {
   return `${project}-shukka-infra`;
 }
 
+/** Name of the pipeline's app role (ShukkaAccess creates it). Only this role may list the SSM agents' status. */
+export function appRoleName(project: string): string {
+  return `${project}-shukka-app`;
+}
+
 const PROJECT_RE = /^[a-z][a-z0-9-]{1,20}$/;
 const QUALIFIER_RE = /^[a-z0-9]{1,10}$/;
 const DOMAIN_RE = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$/i;
@@ -310,13 +315,12 @@ export function fenceDocuments(inputs: FenceInputs): FenceDocuments {
     // instance-scoped calls need the project's tag on the instance; document-scoped calls name the documents.
     // Resource "*": what is left has no resource type (Systems Manager's service authorization reference lists
     // none for DescribeInstanceProperties, GetDeployablePatchSnapshotForInstance, ListAssociations, PutInventory,
-    // GetCommandInvocation, DescribeInstanceInformation (the app role waits on it before a release), and none at all
-    // for GetManifest and PutConfigurePackageResult).
+    // GetCommandInvocation, and none at all for GetManifest and PutConfigurePackageResult).
     {
       Sid: 'RuntimeAgents', Effect: 'Allow',
       Action: [
         'ssm:DescribeInstanceProperties', 'ssm:GetDeployablePatchSnapshotForInstance', 'ssm:GetManifest', 'ssm:ListAssociations', 'ssm:PutInventory',
-        'ssm:PutConfigurePackageResult', 'ssm:GetCommandInvocation', 'ssm:DescribeInstanceInformation', 'ssmmessages:*', 'ec2messages:*', 'cloudwatch:PutMetricData',
+        'ssm:PutConfigurePackageResult', 'ssm:GetCommandInvocation', 'ssmmessages:*', 'ec2messages:*', 'cloudwatch:PutMetricData',
         'sts:GetCallerIdentity', 'ec2:DescribeInstances', 'ec2:DescribeTags',
       ],
       Resource: '*',
@@ -353,6 +357,12 @@ export function fenceDocuments(inputs: FenceInputs): FenceDocuments {
     // Project tag. Split: the document by ARN, instances only with the project's tag.
     { Sid: 'RunOnOwnServersDocument', Effect: 'Allow', Action: 'ssm:SendCommand', Resource: `arn:aws:ssm:${region}::document/AWS-RunShellScript` },
     { Sid: 'RunOnOwnServers', Effect: 'Allow', Action: 'ssm:SendCommand', Resource: ec2('instance'), Condition: ownTag },
+    // Resource "*": DescribeInstanceInformation has no resource type and lists the account's managed instances, so
+    // only the pipeline's app role may (it waits for the agents before a release), never servers or Lambdas.
+    {
+      Sid: 'AppRoleAgentStatus', Effect: 'Allow', Action: 'ssm:DescribeInstanceInformation', Resource: '*',
+      Condition: { ArnEquals: { 'aws:PrincipalArn': `arn:aws:iam::${account}:role/${appRoleName(P)}` } },
+    },
   ];
 
   return {

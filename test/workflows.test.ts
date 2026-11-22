@@ -10,6 +10,7 @@ import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -65,7 +66,7 @@ test('shu-9zr: pipeline.yml has the design\'s jobs, each with its own permission
   assert.equal(pipeline.jobs.app.uses, './.github/workflows/ec2.yml');
   // The order of the chain: plan → checks + build → infra → app → smoke; diff on pull requests.
   assert.deepEqual(pipeline.jobs.infra.needs, ['plan', 'checks', 'build']);
-  assert.deepEqual(pipeline.jobs.app.needs, ['plan', 'infra']);
+  assert.deepEqual(pipeline.jobs.app.needs, ['plan', 'build', 'infra']);
   assert.deepEqual(pipeline.jobs.smoke.needs, ['plan', 'infra', 'app']);
   assert.match(pipeline.jobs.diff.if, /github\.event_name == 'pull_request'/);
   for (const id of ['build', 'infra']) assert.match(pipeline.jobs[id].if, /needs\.plan\.outputs\.deploy == 'true'/, id);
@@ -571,7 +572,7 @@ test('shu-9zr: a check runs each of its commands in its directory and fails on t
 test('shu-9zr: build runs the app\'s commands with its env and repository variables, bundles and tars the printed directory', async () => {
   const ws = workspace();
   const app = JSON.stringify({ ...fixtureConfig.apps[0] });
-  const r = await runStep(ws, pipeline, 'build', 'Build and bundle', { 'toJSON(matrix.app)': app, 'toJSON(vars)': JSON.stringify({ SHUKKATEST_GREETING: 'hello', OTHER: 'x' }) });
+  const r = await runStep(ws, pipeline, 'build', 'Build and bundle', { 'toJSON(matrix.app)': app, 'matrix.app.name': 'web', 'strategy.job-index': '0', 'toJSON(vars)': JSON.stringify({ SHUKKATEST_GREETING: 'hello', OTHER: 'x' }) });
   assert.equal(r.code, 0, r.out);
   assert.match(r.out, /build output goes to the log/);
   const listing = execFileSync('tar', ['-tzf', join(ws.temp, 'shukka-bundle', 'bundle.tgz')], { encoding: 'utf8' });
@@ -583,7 +584,7 @@ test('shu-9zr: build runs the app\'s commands with its env and repository variab
   assert.equal(upload.with.name, 'bundle-${{ matrix.app.name }}');
   assert.equal(upload.with.path, '${{ runner.temp }}/shukka-bundle/bundle.tgz');
 
-  const missing = await runStep(ws, pipeline, 'build', 'Build and bundle', { 'toJSON(matrix.app)': app, 'toJSON(vars)': '{}' });
+  const missing = await runStep(ws, pipeline, 'build', 'Build and bundle', { 'toJSON(matrix.app)': app, 'matrix.app.name': 'web', 'strategy.job-index': '0', 'toJSON(vars)': '{}' });
   assert.equal(missing.code, 1);
   assert.match(missing.out, /needs the repository variable SHUKKATEST_GREETING/);
 });
@@ -924,7 +925,10 @@ test('shu-9zr: ec2 release unpacks the artifact outside both checkouts, uploads 
   mkdirSync(join(ws.temp, 'shukka-artifact', 'web'), { recursive: true });
   execFileSync('tar', ['-C', bundleDir, '-czf', join(ws.temp, 'shukka-artifact', 'web', 'bundle.tgz'), '.']);
 
-  const unpack = await runStep(ws, ec2, 'release', 'Unpack the bundle', { 'matrix.app': 'web' });
+  const tarball = join(ws.temp, 'shukka-artifact', 'web', 'bundle.tgz');
+  const digest = createHash('sha256').update(readFileSync(tarball)).digest('hex');
+  const outputs = (d: string) => JSON.stringify({ digest_0: `web:${d}`, digest_1: 'api:' + 'b'.repeat(64), digest_2: '' });
+  const unpack = await runStep(ws, ec2, 'release', 'Unpack the bundle', { 'matrix.app': 'web', 'inputs.bundle_digests': outputs(digest) });
   assert.equal(unpack.code, 0, unpack.out);
   assert.ok(existsSync(join(ws.temp, 'shukka-bundle', 'web', 'server.py')));
 
@@ -947,4 +951,76 @@ test('shu-9zr: ec2 release unpacks the artifact outside both checkouts, uploads 
   assert.deepEqual(send.input.InstanceIds, ['i-0123456789abcdef0'], 'instances resolved from the Project tag, no Targets');
   assert.equal(send.input.Targets, undefined);
   assert.match(send.input.Parameters.commands.join('\n'), /--configure-key/);
+});
+
+test('shu-9zr: a bundle another job swapped under bundle-<app> is refused before it is unpacked', async () => {
+  const ws = workspace();
+  const built = join(ws.temp, 'built');
+  mkdirSync(built);
+  writeFileSync(join(built, 'server.py'), 'print(1)\n');
+  mkdirSync(join(ws.temp, 'shukka-artifact', 'web'), { recursive: true });
+  const tarball = join(ws.temp, 'shukka-artifact', 'web', 'bundle.tgz');
+  execFileSync('tar', ['-C', built, '-czf', tarball, '.']);
+  const real = createHash('sha256').update(readFileSync(tarball)).digest('hex');
+  // The build step's own output for this bundle.
+  const b = await runStep(ws, pipeline, 'build', 'Build and bundle', { 'toJSON(matrix.app)': JSON.stringify(fixtureConfig.apps[0]), 'matrix.app.name': 'web', 'strategy.job-index': '0', 'toJSON(vars)': JSON.stringify({ SHUKKATEST_GREETING: 'hi' }) });
+  assert.equal(b.code, 0, b.out);
+  assert.match(b.outputs.digest_0 as string, /^web:[0-9a-f]{64}$/);
+  assert.equal((b.outputs.digest_0 as string).slice(4), createHash('sha256').update(readFileSync(join(ws.temp, 'shukka-bundle', 'bundle.tgz'))).digest('hex'));
+  assert.equal(Object.keys(pipeline.jobs.build.outputs).length, 20);
+  assert.equal(pipeline.jobs.app.with.bundle_digests, '${{ toJSON(needs.build.outputs) }}');
+
+  writeFileSync(join(built, 'server.py'), 'print("swapped")\n');
+  execFileSync('tar', ['-C', built, '-czf', tarball, '.']);
+  for (const digests of [{ digest_0: `web:${real}` }, {}, { digest_0: 'web:' + 'c'.repeat(64), digest_1: `web:${real}` }]) {
+    const r = await runStep(ws, ec2, 'release', 'Unpack the bundle', { 'matrix.app': 'web', 'inputs.bundle_digests': JSON.stringify(digests) });
+    assert.equal(r.code, 1, JSON.stringify(digests));
+    assert.match(r.out, /::error::shukka: bundle-web is not the one the build job produced/);
+    assert.ok(!existsSync(join(ws.temp, 'shukka-bundle', 'web', 'server.py')));
+  }
+});
+
+test('shu-9zr: an assembly another job swapped under shukka-cdk-out is refused by changes, deploy and diff; diff also refuses a hostile one', async () => {
+  const ws = workspace();
+  const synth = await runStep(ws, infra, 'synth', 'Synthesize', { 'steps.config.outputs.infra_dir': 'infra', 'steps.config.outputs.account': '123456789012', 'steps.config.outputs.region': 'us-east-1' });
+  assert.equal(synth.code, 0, synth.out);
+  const digest = synth.outputs.digest as string;
+  assert.equal(digest, createHash('sha256').update(readFileSync(join(ws.temp, 'shukka-assembly', 'cdk.out.tgz'))).digest('hex'));
+  assert.equal(infra.jobs.synth.outputs.digest, '${{ steps.synth.outputs.digest }}');
+  const consumers: [string, string][] = [['changes', 'List the stacks'], ['deploy', 'Check the assembly'], ['diff', 'Check the assembly']];
+  for (const [job, name] of consumers) {
+    const ok = await runStep(ws, infra, job, name, { 'needs.synth.outputs.digest': digest });
+    assert.equal(ok.code, 0, `${job}: ${ok.out}`);
+  }
+  // Another job replaces the artifact with the security review's hostile assembly.
+  execFileSync('tar', ['-C', join(root, 'test', 'fixtures', 'assembly', 'hostile'), '-czf', join(ws.temp, 'shukka-assembly', 'cdk.out.tgz'), '.']);
+  for (const [job, name] of consumers) {
+    const r = await runStep(ws, infra, job, name, { 'needs.synth.outputs.digest': digest });
+    assert.equal(r.code, 1, job);
+    assert.match(r.out, /::error::shukka: the downloaded assembly is not the one the synth job produced/, job);
+  }
+  // Even with a matching digest (synth itself produced it), the diff job refuses the hostile assembly before cdk diff.
+  const hostile = createHash('sha256').update(readFileSync(join(ws.temp, 'shukka-assembly', 'cdk.out.tgz'))).digest('hex');
+  const r = await runStep(ws, infra, 'diff', 'Check the assembly', { 'needs.synth.outputs.digest': hostile });
+  assert.equal(r.code, 1);
+  assert.match(r.out, /Evil\.json: file asset abc is built by running a command/);
+  const names = steps(infra.jobs.diff).map((x) => x.name ?? x.uses);
+  assert.ok(names.indexOf('Check the assembly') < names.indexOf('Assume the diff role') && names.indexOf('Assume the diff role') < names.indexOf('Diff and guard'));
+});
+
+test('shu-9zr: the comment job refuses diff text another job swapped, and shares the diff\'s per-PR concurrency without cancelling', async () => {
+  const ws = workspace();
+  const d = await runStep(ws, infra, 'diff', 'Diff and guard', {}, { FAKE_DIFF: diffFixture('removed.txt') });
+  assert.equal(d.code, 0, d.out);
+  const digest = d.outputs.digest as string;
+  assert.match(digest, /^[0-9a-f]{64}$/);
+  const ok = await runStep(ws, infra, 'comment', 'Verify the diff', { 'needs.diff.outputs.digest': digest });
+  assert.equal(ok.code, 0, ok.out);
+  writeFileSync(join(ws.temp, 'shukka-pr-diff', 'guard-status'), '0\n');
+  const swapped = await runStep(ws, infra, 'comment', 'Verify the diff', { 'needs.diff.outputs.digest': digest });
+  assert.equal(swapped.code, 1);
+  assert.match(swapped.out, /::error::shukka: the downloaded diff is not the one the diff job produced/);
+  const names = steps(infra.jobs.comment).map((x) => x.name ?? x.uses);
+  assert.ok(names.indexOf('Verify the diff') < names.indexOf('Comment on the pull request'));
+  assert.deepEqual(infra.jobs.comment.concurrency, { group: infra.jobs.diff.concurrency.group, 'cancel-in-progress': false });
 });

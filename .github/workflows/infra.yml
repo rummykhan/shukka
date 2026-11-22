@@ -28,6 +28,8 @@
 #   comment  diff mode: posts shukka-diff as one PR comment marked <!-- shukka:diff -->, updated in
 #            place, saying the merge will stop when the guard refuses
 #
+# Artifacts are tied to the job that produced them: synth and diff output the sha256 of what they
+# upload, and every consumer refuses a download whose digest differs.
 # The project's code runs only in synth, which cannot obtain credentials. The credentialed jobs
 # (changes, deploy, diff) install nothing of the project's and run no project code: they read the
 # assembly with shukka's own scripts and shukka's own cdk CLI (aws-cdk from shukka's lockfile,
@@ -78,6 +80,8 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+    outputs:
+      digest: ${{ steps.synth.outputs.digest }}
     steps:
       # The default ref: on a pull request, GitHub's merge commit; never the pull request's head.
       - name: Check out the project
@@ -115,7 +119,10 @@ jobs:
         with:
           node-version: ${{ steps.config.outputs.node }}
 
+      # The digest travels as a job output: a consumer refuses an artifact another job of the run
+      # replaced under the same name.
       - name: Synthesize
+        id: synth
         env:
           INFRA_DIR: ${{ steps.config.outputs.infra_dir }}
           CDK_DEFAULT_ACCOUNT: ${{ steps.config.outputs.account }}
@@ -126,6 +133,19 @@ jobs:
           mkdir -p "$RUNNER_TEMP/shukka-assembly"
           tar -C "$RUNNER_TEMP/cdk.out" -czf "$RUNNER_TEMP/shukka-assembly/cdk.out.tgz" .
           echo "shukka: synthesized $(find "$RUNNER_TEMP/cdk.out" -name '*.template.json' | wc -l | tr -d ' ') template(s)"
+          digest() {
+            node --input-type=module - "$1" <<'JS'
+          import { createHash } from 'node:crypto';
+          import { readdirSync, readFileSync, statSync } from 'node:fs';
+          import { join } from 'node:path';
+          const path = process.argv[2];
+          const sha = (b) => createHash('sha256').update(b).digest('hex');
+          process.stdout.write(statSync(path).isDirectory()
+            ? sha(readdirSync(path).sort().map((n) => `${n}\0${sha(readFileSync(join(path, n)))}\n`).join(''))
+            : sha(readFileSync(path)));
+          JS
+          }
+          echo "digest=$(digest "$RUNNER_TEMP/shukka-assembly/cdk.out.tgz")" >>"$GITHUB_OUTPUT"
 
       - name: Upload the assembly
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -232,8 +252,27 @@ jobs:
 
       - name: List the stacks
         id: stacks
+        env:
+          DIGEST: ${{ needs.synth.outputs.digest }}
         run: |
           set -euo pipefail
+          digest() {
+            node --input-type=module - "$1" <<'JS'
+          import { createHash } from 'node:crypto';
+          import { readdirSync, readFileSync, statSync } from 'node:fs';
+          import { join } from 'node:path';
+          const path = process.argv[2];
+          const sha = (b) => createHash('sha256').update(b).digest('hex');
+          process.stdout.write(statSync(path).isDirectory()
+            ? sha(readdirSync(path).sort().map((n) => `${n}\0${sha(readFileSync(join(path, n)))}\n`).join(''))
+            : sha(readFileSync(path)));
+          JS
+          }
+          got=$(digest "$RUNNER_TEMP/shukka-assembly/cdk.out.tgz")
+          if [[ ! "$DIGEST" =~ ^[0-9a-f]{64}$ || "$got" != "$DIGEST" ]]; then
+            echo "::error::shukka: the downloaded assembly is not the one the synth job produced (sha256 $got); refusing it"
+            exit 1
+          fi
           rm -rf -- "$RUNNER_TEMP/cdk.out"
           mkdir -p -- "$RUNNER_TEMP/cdk.out"
           tar -xzf "$RUNNER_TEMP/shukka-assembly/cdk.out.tgz" -C "$RUNNER_TEMP/cdk.out" --no-same-owner --no-same-permissions
@@ -381,8 +420,27 @@ jobs:
       # Docker image or read outside the assembly.
       - name: Check the assembly
         id: assembly
+        env:
+          DIGEST: ${{ needs.synth.outputs.digest }}
         run: |
           set -euo pipefail
+          digest() {
+            node --input-type=module - "$1" <<'JS'
+          import { createHash } from 'node:crypto';
+          import { readdirSync, readFileSync, statSync } from 'node:fs';
+          import { join } from 'node:path';
+          const path = process.argv[2];
+          const sha = (b) => createHash('sha256').update(b).digest('hex');
+          process.stdout.write(statSync(path).isDirectory()
+            ? sha(readdirSync(path).sort().map((n) => `${n}\0${sha(readFileSync(join(path, n)))}\n`).join(''))
+            : sha(readFileSync(path)));
+          JS
+          }
+          got=$(digest "$RUNNER_TEMP/shukka-assembly/cdk.out.tgz")
+          if [[ ! "$DIGEST" =~ ^[0-9a-f]{64}$ || "$got" != "$DIGEST" ]]; then
+            echo "::error::shukka: the downloaded assembly is not the one the synth job produced (sha256 $got); refusing it"
+            exit 1
+          fi
           rm -rf -- "$RUNNER_TEMP/cdk.out"
           mkdir -p -- "$RUNNER_TEMP/cdk.out"
           tar -xzf "$RUNNER_TEMP/shukka-assembly/cdk.out.tgz" -C "$RUNNER_TEMP/cdk.out" --no-same-owner --no-same-permissions
@@ -529,6 +587,7 @@ jobs:
       cancel-in-progress: true
     outputs:
       available: ${{ steps.token.outputs.available }}
+      digest: ${{ steps.guard.outputs.digest }}
     steps:
       # Pull requests from forks and Dependabot get no OIDC token, so no diff role.
       - name: Check for an OIDC token
@@ -624,13 +683,34 @@ jobs:
           name: shukka-cdk-out
           path: ${{ runner.temp }}/shukka-assembly
 
-      - name: Unpack the assembly
+      # The template diff publishes nothing, but the CLI still reads the assembly: same checks as deploy.
+      - name: Check the assembly
         if: steps.token.outputs.available == 'true'
+        env:
+          DIGEST: ${{ needs.synth.outputs.digest }}
         run: |
           set -euo pipefail
+          digest() {
+            node --input-type=module - "$1" <<'JS'
+          import { createHash } from 'node:crypto';
+          import { readdirSync, readFileSync, statSync } from 'node:fs';
+          import { join } from 'node:path';
+          const path = process.argv[2];
+          const sha = (b) => createHash('sha256').update(b).digest('hex');
+          process.stdout.write(statSync(path).isDirectory()
+            ? sha(readdirSync(path).sort().map((n) => `${n}\0${sha(readFileSync(join(path, n)))}\n`).join(''))
+            : sha(readFileSync(path)));
+          JS
+          }
+          got=$(digest "$RUNNER_TEMP/shukka-assembly/cdk.out.tgz")
+          if [[ ! "$DIGEST" =~ ^[0-9a-f]{64}$ || "$got" != "$DIGEST" ]]; then
+            echo "::error::shukka: the downloaded assembly is not the one the synth job produced (sha256 $got); refusing it"
+            exit 1
+          fi
           rm -rf -- "$RUNNER_TEMP/cdk.out"
           mkdir -p -- "$RUNNER_TEMP/cdk.out"
           tar -xzf "$RUNNER_TEMP/shukka-assembly/cdk.out.tgz" -C "$RUNNER_TEMP/cdk.out" --no-same-owner --no-same-permissions
+          node .shukka/scripts/assembly.mjs check "$RUNNER_TEMP/cdk.out"
 
       - name: Assume the diff role
         if: steps.token.outputs.available == 'true'
@@ -663,6 +743,19 @@ jobs:
           if [[ $guard_status -ne 0 ]]; then
             echo "::warning::shukka: this merge will stop at the guard unless it is rerun by hand with allow_replacement"
           fi
+          digest() {
+            node --input-type=module - "$1" <<'JS'
+          import { createHash } from 'node:crypto';
+          import { readdirSync, readFileSync, statSync } from 'node:fs';
+          import { join } from 'node:path';
+          const path = process.argv[2];
+          const sha = (b) => createHash('sha256').update(b).digest('hex');
+          process.stdout.write(statSync(path).isDirectory()
+            ? sha(readdirSync(path).sort().map((n) => `${n}\0${sha(readFileSync(join(path, n)))}\n`).join(''))
+            : sha(readFileSync(path)));
+          JS
+          }
+          echo "digest=$(digest "$out")" >>"$GITHUB_OUTPUT"
 
       - name: Upload the diff for the comment
         if: steps.token.outputs.available == 'true'
@@ -683,6 +776,9 @@ jobs:
     timeout-minutes: 10
     permissions:
       pull-requests: write
+    concurrency:
+      group: shukka-diff-${{ github.event.pull_request.number || github.run_id }}
+      cancel-in-progress: false
     steps:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
@@ -693,6 +789,29 @@ jobs:
         with:
           name: shukka-diff
           path: ${{ runner.temp }}/shukka-pr-diff
+
+      - name: Verify the diff
+        env:
+          DIGEST: ${{ needs.diff.outputs.digest }}
+        run: |
+          set -euo pipefail
+          digest() {
+            node --input-type=module - "$1" <<'JS'
+          import { createHash } from 'node:crypto';
+          import { readdirSync, readFileSync, statSync } from 'node:fs';
+          import { join } from 'node:path';
+          const path = process.argv[2];
+          const sha = (b) => createHash('sha256').update(b).digest('hex');
+          process.stdout.write(statSync(path).isDirectory()
+            ? sha(readdirSync(path).sort().map((n) => `${n}\0${sha(readFileSync(join(path, n)))}\n`).join(''))
+            : sha(readFileSync(path)));
+          JS
+          }
+          got=$(digest "$RUNNER_TEMP/shukka-pr-diff")
+          if [[ ! "$DIGEST" =~ ^[0-9a-f]{64}$ || "$got" != "$DIGEST" ]]; then
+            echo "::error::shukka: the downloaded diff is not the one the diff job produced (sha256 $got); refusing it"
+            exit 1
+          fi
 
       - name: Comment on the pull request
         env:

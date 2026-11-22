@@ -33,6 +33,10 @@ on:
         description: Release every app, whatever changed
         type: boolean
         default: false
+      bundle_digests:
+        description: JSON object of the build job's outputs, values "<app>:<sha256 of bundle.tgz>"
+        type: string
+        default: '{}'
     outputs:
       released:
         description: Whether any app was due for release
@@ -249,15 +253,32 @@ jobs:
           name: bundle-${{ matrix.app }}
           path: ${{ runner.temp }}/shukka-artifact/${{ matrix.app }}
 
+      # Only the bundle the build job produced: its digest came through the job outputs, not the artifact.
       - name: Unpack the bundle
         env:
           APP: ${{ matrix.app }}
+          BUNDLE_DIGESTS: ${{ inputs.bundle_digests }}
         run: |
           set -euo pipefail
+          file="$RUNNER_TEMP/shukka-artifact/$APP/bundle.tgz"
+          node --input-type=module - "$file" <<'JS'
+          import { createHash } from 'node:crypto';
+          import { readFileSync } from 'node:fs';
+          const app = process.env.APP;
+          let digests = {};
+          try { digests = JSON.parse(process.env.BUNDLE_DIGESTS || '{}'); } catch { digests = {}; }
+          const wanted = [...new Set(Object.values(digests).filter((v) => typeof v === 'string' && v.startsWith(`${app}:`)).map((v) => v.slice(app.length + 1)))];
+          const got = createHash('sha256').update(readFileSync(process.argv[2])).digest('hex');
+          if (wanted.length !== 1 || !/^[0-9a-f]{64}$/.test(wanted[0]) || wanted[0] !== got) {
+            console.log(`::error::shukka: bundle-${app} is not the one the build job produced (sha256 ${got}); refusing it`);
+            process.exit(1);
+          }
+          console.log(`shukka: bundle-${app} matches the build job's sha256 ${got}`);
+          JS
           dest="$RUNNER_TEMP/shukka-bundle/$APP"
           rm -rf -- "$dest"
           mkdir -p -- "$dest"
-          tar -xzf "$RUNNER_TEMP/shukka-artifact/$APP/bundle.tgz" -C "$dest" --no-same-owner --no-same-permissions
+          tar -xzf "$file" -C "$dest" --no-same-owner --no-same-permissions
           echo "shukka: unpacked bundle-$APP into $dest"
 
       - name: Assume the app role
