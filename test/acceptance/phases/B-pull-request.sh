@@ -10,7 +10,8 @@ phase_B() {
   snapshot before_pr
   c_git checkout -q -B "$branch" main || return 1
   # An app change that keeps the smoke marker, a harmless infra change (a new output), the probe
-  # workflows, and the escape probe inside the CDK app (it runs with the diff role in the PR).
+  # workflows, and the escape probe inside the CDK app (it runs in the pull request's synth job, which
+  # must hold no token and no credentials).
   printf 'shukkatest-web-ok\npull request %s\n' "$RUN_ID" >"$RUN_DIR/consumer/apps/web/page.txt"
   # shellcheck disable=SC2016 # a jq program
   json_edit infra/settings.json --arg n "pr-$RUN_ID" '.note = $n'

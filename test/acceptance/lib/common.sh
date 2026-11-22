@@ -23,15 +23,22 @@ export AWS_DEFAULT_REGION=$AWS_REGION
 export AWS_PAGER=""
 export GH_PAGER=""
 
-# Job display names in the pipeline are not fixed by the design; these patterns (case-insensitive,
-# matched against `gh run view --json jobs` names such as "shukka / infra / deploy") are the suite's
-# reading of C1. Asked on shu-9zr's mailbox; adjust here only.
+# Job display names, matched case-insensitively against `gh run view --json jobs` names. The caller's
+# job is `shukka`, so pipeline.yml's jobs read "shukka / plan", "shukka / check <name>",
+# "shukka / build <app>", and the nested ones "shukka / stacks / synth|changes|deploy",
+# "shukka / pull request / synth|diff|comment", "shukka / servers / changes|release <app>",
+# "shukka / smoke" (names from pipeline.yml, infra.yml and ec2.yml since shu-9zr). Adjust here only.
 JOB_RE_PLAN=${JOB_RE_PLAN:-'plan'}
 JOB_RE_CHECKS=${JOB_RE_CHECKS:-'check'}
 JOB_RE_BUILD=${JOB_RE_BUILD:-'build'}
-JOB_RE_INFRA=${JOB_RE_INFRA:-'infra|deploy'}
-JOB_RE_DIFF=${JOB_RE_DIFF:-'diff'}
-JOB_RE_APP=${JOB_RE_APP:-'app|ec2|release'}
+# The infra deploy job (the guard, the assembly check and cdk deploy run here).
+JOB_RE_INFRA=${JOB_RE_INFRA:-'stacks / deploy'}
+# The job without id-token that runs the project's npm ci and cdk synth, on a merge and on a PR.
+JOB_RE_INFRA_SYNTH=${JOB_RE_INFRA_SYNTH:-'stacks / synth'}
+JOB_RE_PR_SYNTH=${JOB_RE_PR_SYNTH:-'pull request / synth'}
+JOB_RE_DIFF=${JOB_RE_DIFF:-'pull request / diff'}
+JOB_RE_COMMENT=${JOB_RE_COMMENT:-'pull request / comment'}
+JOB_RE_APP=${JOB_RE_APP:-'servers / release'}
 JOB_RE_SMOKE=${JOB_RE_SMOKE:-'smoke'}
 
 ACCEPT_DIR=${ACCEPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
@@ -291,10 +298,11 @@ guard_offending() {
   awk -v h="$GUARD_HEADER" '$0 == h { on = 1; next } /^guard: / { on = 0 } on' <<<"$1"
 }
 
-# observed <log-file> <observation-id>: the verdict a probe printed ("RESULT <id> <VERDICT> ..."), or ERROR.
+# observed <log-file> <observation-id>: the verdict a probe printed ("RESULT <id> <VERDICT> ..."), or
+# MISSING. Verdicts are upper case and may hold a dash (NO-TOKEN, NO-CREDS).
 observed() {
   local v
-  v=$(grep -Eo "RESULT $2 [A-Z]+" "$1" | head -n 1 | awk '{print $3}')
+  v=$(grep -Eo "RESULT $2 [A-Z][A-Z-]*" "$1" | head -n 1 | awk '{print $3}')
   printf '%s\n' "${v:-MISSING}"
 }
 
@@ -303,9 +311,65 @@ observed() {
 expect_observation() {
   local v detail
   v=$(observed "$1" "$2")
-  detail=$(grep -Eo "RESULT $2 [A-Z]+.*" "$1" | head -n 1 | cut -d' ' -f4- | cut -c1-160)
+  detail=$(grep -Eo "RESULT $2 [A-Z][A-Z-]*.*" "$1" | head -n 1 | cut -d' ' -f4- | cut -c1-160)
   result "$2" "$v" "(run $4${detail:+: $detail})"
   assert_eq "$v" "$3" "$2 is $3"
+}
+
+# job_messages_file <run-id> <job-regex> <name>: job_messages saved under the run directory, so an
+# observation can be read from exactly one job (expect_observation takes a file).
+job_messages_file() {
+  local f="$RUN_DIR/runs/$1.$3.messages.txt"
+  job_messages "$1" "$2" >"$f"
+  printf '%s\n' "$f"
+}
+
+# ---------------------------------------------------------------------------------------------
+# Admin-side refusal checks (shu-9bj.3)
+#
+# Since shu-9zr no project code runs in a job that holds a role, so nothing the suite plants in the
+# consumer can act as the infra, diff or project deploy role. What those roles may do is read from IAM
+# with the admin profile: simulate-principal-policy evaluates the role's identity policies and its
+# permissions boundary for one action on one resource (not resource policies, not SCPs, and not the
+# target role's trust policy for sts:AssumeRole: a refusal on the caller's side is enough to refuse).
+# Each set has an ALLOWED control with the same action and context shape, so a wrong ARN or a missing
+# context key cannot pass as a refusal.
+
+# simulated <role-arn> <action> <resource-arn> [key=value...]: allowed|explicitDeny|implicitDeny|ERROR.
+# Context values are strings; aws:RequestedRegion is always supplied.
+simulated() {
+  local role=$1 action=$2 resource=$3 kv out
+  shift 3
+  local ctx=("ContextKeyName=aws:RequestedRegion,ContextKeyValues=$AWS_REGION,ContextKeyType=string")
+  for kv in "$@"; do
+    ctx+=("ContextKeyName=${kv%%=*},ContextKeyValues=${kv#*=},ContextKeyType=string")
+  done
+  out=$(aws iam simulate-principal-policy --policy-source-arn "$role" --action-names "$action" \
+    --resource-arns "$resource" --context-entries "${ctx[@]}" \
+    --query 'EvaluationResults[0].EvalDecision' --output text 2>&1) || { printf 'ERROR %s\n' "$(tr '\n' ' ' <<<"$out" | cut -c1-160)"; return 0; }
+  printf '%s\n' "$out"
+}
+
+# expect_simulated <observation-id> <ALLOWED|DENIED> <role-arn> <action> <resource-arn> [key=value...]
+# Prints "RESULT <id> <verdict> (simulator: ...)" in the suite log and asserts it.
+expect_simulated() {
+  local id=$1 want=$2 role=$3 action=$4 resource=$5 d v
+  shift 5
+  d=$(simulated "$role" "$action" "$resource" "$@")
+  case "$d" in
+    allowed) v=ALLOWED ;;
+    explicitDeny | implicitDeny) v=DENIED ;;
+    *) v=ERROR ;;
+  esac
+  result "$id" "$v" "(simulator: ${role##*/} $action on $resource: $d)"
+  assert_eq "$v" "$want" "$id is $want (IAM simulator)"
+}
+
+# stack_arn <name>: the stack's full id, or a name-only ARN when it does not exist (a refusal then
+# still has a resource to be evaluated on).
+stack_arn() {
+  aws cloudformation describe-stacks --stack-name "$1" --query 'Stacks[0].StackId' --output text 2>/dev/null ||
+    printf 'arn:aws:cloudformation:%s:%s:stack/%s/00000000-0000-0000-0000-000000000000\n' "$AWS_REGION" "$ACCOUNT" "$1"
 }
 
 # ---------------------------------------------------------------------------------------------
