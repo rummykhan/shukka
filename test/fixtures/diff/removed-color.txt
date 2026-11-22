@@ -1,0 +1,8 @@
+AI agent detected
+Stack [1mTrendigle-prod-Data[22m
+[0m[4m[1mResources[22m[24m[0m
+[0m[31m[-][39m [36mAWS::DynamoDB::Table[39m GoneRetain [3m[33morphan[39m[23m[0m
+[0m[31m[-][39m [36mAWS::DynamoDB::Table[39m GoneDelete [3m[1m[31mdestroy[39m[22m[23m[0m
+[0m[4m[1mOutputs[22m[24m[0m
+[0m[31m[-][39m [36mOutput[39m OldOut: [31m{"Value":"x"}[39m[0m
+✨  Number of stacks with differences: 1

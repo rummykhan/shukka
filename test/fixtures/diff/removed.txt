@@ -1,0 +1,14 @@
+AI agent detected
+
+Stack Trendigle-prod-Data
+Resources
+[-] AWS::DynamoDB::Table GoneRetain orphan
+[-] AWS::DynamoDB::Table GoneDelete destroy
+
+Outputs
+[-] Output OldOut: {"Value":"x"}
+
+
+
+✨  Number of stacks with differences: 1
+

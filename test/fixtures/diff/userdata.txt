@@ -1,0 +1,53 @@
+AI agent detected
+stacks/instance-stack.ts:27:16
+WARNING VpcId: 'vpc-12345' does not match format 'AWS::EC2::VPC.Id' (CloudFormation Validate)
+   Trendigle-prod-Instance/Sg/Resource (SgD4954771) aws-cdk-lib.aws_ec2.CfnSecurityGroup
+   Acknowledge with 'CloudFormation-Validate::E1151'
+stacks/instance-stack.ts:125:22
+WARNING SubnetId: 's-12345' does not match format 'AWS::EC2::Subnet.Id' (CloudFormation Validate)
+   Trendigle-prod-Instance/Box/Resource (BoxA0510527) aws-cdk-lib.aws_ec2.CfnInstance
+   Acknowledge with 'CloudFormation-Validate::E1154'
+stacks/instance-stack.ts:125:22
+WARNING ImageId: Hardcoded AMI ID - use a parameter or mapping for portability (CloudFormation Validate)
+   Trendigle-prod-Instance/Box/Resource (BoxA0510527) aws-cdk-lib.aws_ec2.CfnInstance
+   Acknowledge with 'CloudFormation-Validate::W9010'
+WARNING No cross-stack-reference strength configured, defaulting to "strong". We recommend you set feature flag "@aws-cdk/core:defaultCrossStackReferences" to "both", then deploy everywhere, then set it to "weak". Alternatively, set it to "strong" explicitly to lock in the current producer-protecting behavior. (See: https://github.com/aws/aws-cdk/blob/main/packages/aws-cdk-lib/README.md#reference-strength) (Construct Annotations)
+   Trendigle-prod-Instance
+   Acknowledge with 'Annotation::@aws-cdk/core:crossStackReferencesDefaultStrong'
+Stack Trendigle-prod-Instance
+Resources
+[~] AWS::EC2::Instance Box BoxA0510527 may be replaced
+ └─ [~] UserData (may cause replacement)
+     └─ [~] .Fn::Base64:
+         ├─ [-] old
+         └─ [+] #!/bin/bash
+set -x
+dnf install -y nodejs22 tar gzip
+curl -fsSL https://github.com/caddyserver/caddy/releases/download/v2.11.9/caddy_2.11.9_linux_arm64.tar.gz | tar xz -C /usr/bin caddy
+groupadd --system caddy
+useradd --system --gid caddy --create-home --home-dir /var/lib/caddy --shell /usr/sbin/nologin caddy
+install -d /etc/caddy/conf.d
+echo 'import /etc/caddy/conf.d/*.caddy' > /etc/caddy/Caddyfile
+cat > /etc/systemd/system/caddy.service <<'UNIT'
+[Unit]
+Description=Caddy
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=notify
+User=caddy
+Group=caddy
+ExecStart=/usr/bin/caddy run --environ --config /etc/caddy/Caddyfile
+ExecReload=/usr/bin/caddy reload --config /etc/caddy/Caddyfile --force
+TimeoutStopSec=5s
+LimitNOFILE=1048576
+PrivateTmp=true
+ProtectSystem=full
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload
+systemctl enable caddy
+✨  Number of stacks with differences: 1
