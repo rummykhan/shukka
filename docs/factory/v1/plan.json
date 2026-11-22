@@ -1,0 +1,407 @@
+{
+  "nodes": [
+    {
+      "key": "e1",
+      "title": "shukka v1 works end to end on a test consumer",
+      "type": "epic",
+      "priority": 1,
+      "description": "Serves R1-R8 and R10 in docs/factory/v1/requirements.md. Design: docs/factory/v1/design.md.\n\n## Success Criteria\n- The test consumer rummykhan/shukka-consumer-test, whose CI file is only the caller workflow and whose config is shukka.json, deploys a throwaway project `shukkatest` (instance, elastic IP, security group, launch template, role and profile, table, bucket, DNS record in its own throwaway zone) on merge to main from a release-candidate tag\n- A pull request in the test consumer shows the infrastructure diff as a comment and cannot assume the deploy roles\n- A job that builds application code cannot assume the infrastructure role (observed AccessDenied)\n- shukkatest's pipeline is refused on a Trendigle resource\n- A destructive change stops the merge; a manual run with allow_replacement deploys it\n- A deliberately unhealthy release rolls back to the previous one and the run is red\n- A docs-only merge deploys nothing\n- `shukka deploy` from a laptop deploys the same commit with the same guard and rollback\n- shukka's own CI is green; all throwaway resources are deleted at the end",
+      "design": "Components C1-C8 of the design; contracts there are binding."
+    },
+    {
+      "key": "scaffold",
+      "title": "Repository scaffold: package, TypeScript, lint, test runner, gate and shukka's own CI",
+      "type": "task",
+      "priority": 1,
+      "description": "Serves R10. Creates the structure every other task builds in.",
+      "acceptance_criteria": "- `npm ci && npm run gate` passes on a fresh clone \u2014 run: `npm ci && npm run gate` \u2192 exit 0\n- `npm run gate` runs lint, typecheck, tests, actionlint on .github/workflows and shellcheck on box/ and scripts/ shell files \u2014 run: read package.json scripts\n- Tests run with node:test through tsx and print test names; a test named `<id>: \u2026` can be selected with `--test-name-pattern` \u2014 test: one smoke test named with this task's id\n- `.github/workflows/test.yml` runs the gate on pull requests and pushes to main, with `permissions: contents: read` and no id-token, and a secret scan (gitleaks or trufflehog, pinned by version) \u2014 run: actionlint passes; read the file\n- aws-cdk-lib and constructs are peer dependencies (^2.170 / ^10) and dev dependencies; no runtime dependency outside the AWS SDK v3 clients the scripts need \u2014 run: read package.json",
+      "design": "Owns package.json, package-lock.json, tsconfig.json, eslint config, .github/workflows/test.yml, test/smoke.test.ts, lib/index.ts (empty barrel), scripts/ and box/ directories with a .gitkeep. Node 22, ES modules. Follow koujou's tests/ layout only for naming ideas.",
+      "parent_key": "e1"
+    },
+    {
+      "key": "config",
+      "title": "shukka.json schema and loader",
+      "type": "task",
+      "priority": 1,
+      "description": "Serves R1, R8, R9 (D11). The single config read by the workflows and the CLI.",
+      "acceptance_criteria": "- `schema/shukka.schema.json` describes exactly the `shukka.json` contract in the design (project, qualifier, aws, node, checks, infra, apps with build and server, smoke, alwaysDeploy, buildEnv) \u2014 test: the design's Trendigle example validates\n- `scripts/config.mjs` loads and validates a file and exits non-zero with one line per problem: project and qualifier formats, qualifier at most 10 lowercase alphanumerics, unknown keys, missing commands, health not an http URL, app names unique \u2014 test: one case per rule\n- A project name that is a prefix of another known project name (or has one as its prefix) is refused when a list of known names is given \u2014 test\n- Role and stack names are derived, never written in the file: `<project>-shukka-infra|app|diff` \u2014 test: the derived names for the example\n- CLI form: `node scripts/config.mjs <path> --json` prints the normalised config \u2014 test",
+      "design": "Owns schema/, scripts/config.mjs, test/config.test.ts and fixtures under test/fixtures/config/. Contract: `shukka.json` section of the design.",
+      "parent_key": "e1"
+    },
+    {
+      "key": "guard",
+      "title": "Infrastructure diff guard",
+      "type": "task",
+      "priority": 1,
+      "description": "Serves R4. Port of Trendigle's diff-guard.sh (trendigle/trendigle implementation/infra/diff-guard.sh) to Node, with the same rules plus: a removed stack Output is not destructive.",
+      "acceptance_criteria": "- `scripts/guard.mjs` reads a full `cdk diff --no-color` output on stdin; exit 0 when nothing is deleted or replaced, exit 1 with the offending lines when something is, or when the closing line `Number of stacks with differences:` is missing \u2014 test: every case in Trendigle's diff-guard.test.sh\n- Real cdk diff samples stop it: removed table (orphan and destroy), replaced table name, AMI, bucket rename, instance type and user-data (may be replaced), type change \u2014 test: recorded samples copied into test/fixtures/diff/\n- Colour codes are stripped before matching \u2014 test\n- `[-] Output` alone passes \u2014 test\n- `--allow` turns a stop into exit 0 with a notice naming what was allowed \u2014 test\n- Writes a markdown section `### Guard` for the step summary when `--summary <file>` is given \u2014 test",
+      "design": "Owns scripts/guard.mjs, test/guard.test.ts, test/fixtures/diff/. Samples to copy: the 12 cases in Trendigle's diff-guard.test.sh, and the real outputs recorded by the security reviewer in /private/tmp/claude-501/-Users-rehan-Documents-Workspace-software-factory/62583049-5144-4d17-806a-e9e165f32653/scratchpad/sec-b04/out/*.txt (copy them; strip nothing but the account number if present).",
+      "parent_key": "e1"
+    },
+    {
+      "key": "fence",
+      "title": "Constructs: account stack, project boundary and execution policies, project synthesizer",
+      "type": "task",
+      "priority": 1,
+      "description": "Serves R3 (D5). Port docs/factory/v1/spikes/s2/policy.py to TypeScript constructs.",
+      "acceptance_criteria": "- `ShukkaBoundary` produces the boundary and the two execution managed policies with exactly the statements of spike S2's policy.py for the same inputs \u2014 test: compare against s2/trendigle.json (normalised)\n- Each managed policy is under 6,144 characters without whitespace for the Trendigle inputs \u2014 test\n- `ssm:SendCommand` in the boundary is split: the document by ARN, instances with StringEquals on the Project tag (closes the IfExists loophole from spike S2 finding 4) \u2014 test\n- No statement has Resource `*` except actions with no resource type, each listed with a comment \u2014 test: scan of the synthesized documents against an allow-list\n- `ShukkaAccountStack` creates the GitHub OIDC provider (client sts.amazonaws.com) and outputs its ARN and the known project names; it can import an existing provider instead \u2014 test: synthesized template\n- `shukkaSynthesizer(qualifier)` returns a DefaultStackSynthesizer using that qualifier \u2014 test\n- `applyBoundary(app, project)` sets the boundary on every role in an app \u2014 test: a role in a sample stack carries it\n- The simulator script runs the 58 spike cases against the construct's output \u2014 run: `AWS_PROFILE=stelking node test/simulate/run.mjs` \u2192 58 ok (needs AWS, read-only; not in the gate)",
+      "design": "Owns lib/boundary.ts, lib/account-stack.ts, lib/synthesizer.ts, test/fence.test.ts, test/simulate/. Shares lib/index.ts with `access`: add exports only, expect to rebase. Contract: ShukkaBoundary and Shukka-Account sections of the design.",
+      "parent_key": "e1",
+      "labels": [
+        "security"
+      ]
+    },
+    {
+      "key": "access",
+      "title": "Construct: ShukkaAccess (infra, app and diff roles with workflow-scoped trust)",
+      "type": "task",
+      "priority": 1,
+      "description": "Serves R2, R4 (D3, D10). Spike S1 fixed the trust shape.",
+      "acceptance_criteria": "- Each role's trust has aud=sts.amazonaws.com, sub StringEquals `repo:<githubRepo>:ref:refs/heads/main` (infra, app) or `repo:<githubRepo>:pull_request` (diff), and job_workflow_ref StringLike `rummykhan/shukka/.github/workflows/infra.yml@refs/tags/<versions>` (infra, diff) or `.../ec2.yml@refs/tags/<versions>` (app) \u2014 test: synthesized template, one assertion per condition per role\n- No pattern starts with `*` and `githubRepo` is validated (owner/repo or the immutable `owner@id/repo@id`) \u2014 test\n- Infra role may only sts:AssumeRole the project-qualifier bootstrap roles; app role exactly the permissions in the design; diff role only cloudformation:GetTemplate and DescribeStacks on the project's stacks and the bootstrap version parameter \u2014 test\n- The provider is imported by ARN (from the account stack), never created by this construct \u2014 test\n- `shukkaVersions` defaults to `v1*`; an `allowBranch` option exists only for release-candidate testing and is off by default \u2014 test",
+      "design": "Owns lib/access.ts, test/access.test.ts. Shares lib/index.ts with `fence`: add exports only, expect to rebase. Contract: ShukkaAccess section of the design.",
+      "parent_key": "e1",
+      "labels": [
+        "security"
+      ]
+    },
+    {
+      "key": "release",
+      "title": "Server release script with rollback, tested in Docker",
+      "type": "task",
+      "priority": 1,
+      "description": "Serves R5 (D6).",
+      "acceptance_criteria": "- `box/shukka-release.sh` implements the contract in the design: arguments, exit codes 0/10/11/12/13, last line format \u2014 test: Docker harness, one case each\n- Configure failure switches nothing and deletes the new release \u2014 test\n- Unhealthy release rolls back to `previous`, restarts it and checks it \u2014 test\n- Two releases of one app at once are serialised by flock; releases of two apps on one box do not wait for each other and one app's release leaves the other running \u2014 test\n- Keeps the last 5 releases; `current/REVISION` holds the sha \u2014 test\n- Never prints the contents of settings files \u2014 test: a fixture secret is absent from output\n- shellcheck clean \u2014 run: gate",
+      "design": "Owns box/shukka-release.sh, test/box/ (Dockerfile with a fake systemctl shim, two fake apps that serve /health, run.sh selecting cases by task id). Contract: shukka-release.sh section of the design. The script downloads with `aws s3 cp`; the harness stubs `aws` with a local file copy.",
+      "parent_key": "e1",
+      "labels": [
+        "security"
+      ]
+    },
+    {
+      "key": "ship",
+      "title": "Scripts: upload a bundle and run a release through SSM; Next.js bundle helper",
+      "type": "task",
+      "priority": 1,
+      "description": "Serves R5, R8. Called by ec2.yml and the CLI.",
+      "acceptance_criteria": "- `scripts/upload.mjs` uploads a directory as `s3://<bucket>/<project>/<app>/<sha>.tgz` (tar without macOS extended attributes, `.env*` refused) \u2014 test with a stubbed S3 client\n- `scripts/release.mjs` sends box/shukka-release.sh with arguments through SSM Run Command to instances tagged Project=<project>, waits, prints the script output, and maps its exit code to a failure message per code \u2014 test with a stubbed SSM client\n- The configure hook is read from the git checkout path given, never from the bundle \u2014 test\n- `scripts/bundle.sh` turns a Next.js standalone build into a deployable directory (static, public, no .env) and prints its path \u2014 test against a fixture build tree\n- shellcheck clean \u2014 run: gate",
+      "design": "Owns scripts/upload.mjs, scripts/release.mjs, scripts/bundle.sh, their tests. Uses the exit-code contract of box/shukka-release.sh from the design (do not wait for `release`).",
+      "parent_key": "e1",
+      "labels": [
+        "security"
+      ]
+    },
+    {
+      "key": "changed",
+      "title": "Scripts: what changed since the last deploy",
+      "type": "task",
+      "priority": 1,
+      "description": "Serves R7 (D7).",
+      "acceptance_criteria": "- `scripts/changed.mjs` prints JSON `{infra: bool, apps: {<name>: bool}, base: {infra: sha|null, apps: {...}}}` using the last deployed revisions: the `shukka:revision` tag on the project's stacks and each app's `current/REVISION` on the server \u2014 test with stubbed AWS clients and a fixture git repo\n- A path change is matched with the config's globs; a docs-only change gives all false \u2014 test\n- An unknown last revision (first deploy, missing tag, unreachable server) means `true` for that part \u2014 test\n- `alwaysDeploy` or `--force` gives all true \u2014 test",
+      "design": "Owns scripts/changed.mjs, test/changed.test.ts. Reads config through scripts/config.mjs.",
+      "parent_key": "e1"
+    },
+    {
+      "key": "workflows",
+      "title": "Reusable workflows: pipeline.yml, infra.yml, ec2.yml",
+      "type": "task",
+      "priority": 1,
+      "description": "Serves R1, R4, R5, R6, R7 (C1-C3, D3, D4, D8, D10).",
+      "acceptance_criteria": "- `pipeline.yml` jobs and permissions match the design: plan, checks and build with contents read only and no id-token, infra via `./.github/workflows/infra.yml`, app matrix via `./.github/workflows/ec2.yml`, smoke without id-token \u2014 run: actionlint, and a test that parses the YAML and asserts no job outside infra.yml and ec2.yml has id-token\n- No `${{ }}` from inputs, events or matrix is interpolated directly in `run:`; all go through `env:` \u2014 test: YAML scan\n- Pull requests run plan, checks and diff (diff role, comment marked `<!-- shukka:diff -->` updated in place); merges run the full chain; workflow_dispatch passes allow_replacement and force \u2014 run: test consumer in the QA task\n- infra.yml tags stacks `shukka:revision=<sha>` on deploy and writes `### Infrastructure changes` and `### Guard` to the step summary \u2014 run: test consumer\n- ec2.yml checks out the repository without installing anything, downloads the artifact, uploads, releases, with concurrency `shukka-<project>-<app>` and cancel-in-progress false \u2014 test: YAML assertions\n- A docs-only merge runs no deploy job \u2014 run: test consumer",
+      "design": "Owns .github/workflows/pipeline.yml, infra.yml, ec2.yml, test/workflows.test.ts. Calls the scripts by path from the shukka checkout at the same ref (`actions/checkout` of rummykhan/shukka into ./.shukka at the exact commit the caller resolved: find out what GitHub exposes for this; the OIDC token's `job_workflow_sha` claim is one known source; if nothing reliable exists, fall back to a `shukka_ref` input in the caller and say so in the report. Spike S1's workflows on branch spike-s1 are a working starting point for nesting.). Pin third-party actions by full commit sha.",
+      "parent_key": "e1",
+      "labels": [
+        "security"
+      ]
+    },
+    {
+      "key": "cli",
+      "title": "CLI: bootstrap, diff and emergency deploy",
+      "type": "task",
+      "priority": 1,
+      "description": "Serves R3, R8, R9 (C7).",
+      "acceptance_criteria": "- `shukka bootstrap --account` deploys ShukkaAccountStack with the caller's credentials and can import an existing OIDC provider \u2014 test: dry run prints the cdk commands; real run in the QA task\n- `shukka bootstrap <project>` deploys the project's boundary and execution policies, runs `cdk bootstrap --qualifier <q> --cloudformation-execution-policies <a>,<b> --custom-permissions-boundary <boundary>`, and copies `buildEnv` values from Parameter Store to GitHub repository variables with `gh variable set` \u2014 test: dry run output\n- `shukka diff` and `shukka deploy` refuse unless the working tree is clean and HEAD equals origin/main, then run the same config, guard, upload and release modules as the workflows \u2014 test: refusal cases; dry run\n- `--help` documents every command \u2014 test",
+      "design": "Owns bin/shukka, scripts/cli/*.mjs, test/cli.test.ts. Uses config, guard, upload, release modules; adds none of its own logic for those.",
+      "parent_key": "e1",
+      "labels": [
+        "security"
+      ]
+    },
+    {
+      "key": "docs",
+      "title": "README: consumer guide, security model, emergency path",
+      "type": "task",
+      "priority": 1,
+      "description": "Serves R1, R8.",
+      "acceptance_criteria": "- README explains in order: what shukka does, the security model (who can reach which role, what the fence stops, what it does not), adopting it (account bootstrap, project bootstrap, ShukkaAccess, synthesizer, shukka.json, caller workflow), the destructive-change path, the rollback, the emergency deploy, versioning and pins, cost \u2014 run: a reader follows it in the QA task to set up the test consumer\n- `docs/consumer-checklist.md` lists every step a new project takes, each with its command \u2014 run: used by the QA task",
+      "design": "Owns README.md, docs/consumer-checklist.md. Written after the workflows and CLI exist; follow their real flags.",
+      "parent_key": "e1"
+    },
+    {
+      "key": "qa",
+      "title": "Acceptance suite against the test consumer and throwaway resources",
+      "type": "task",
+      "priority": 1,
+      "description": "Serves R1-R8, R10. Built by factory-tester from the requirements and design, not the implementation.",
+      "acceptance_criteria": "- Every acceptance line of R1-R8 and every success criterion of this epic has a named step in `test/acceptance/` or a stated reason it is manual \u2014 run: read the coverage table in test/acceptance/README.md\n- `bash test/acceptance/run.sh <rc-tag>` sets up `shukkatest` (account stack import, project bootstrap, shukkatest stacks in the test consumer), runs every case, and tears down every throwaway resource it created, even after a failure \u2014 run: the command, then `aws resourcegroupstaggingapi get-resources --tag-filters Key=Project,Values=shukkatest` \u2192 empty\n- Trust is observed, not reasoned: AccessDenied from a pull request, from a non-main branch, from a job outside infra.yml, and for shukkatest credentials on a Trendigle resource \u2014 run: the suite's log lines `RESULT <case> DENIED`\n- Rollback is observed: an unhealthy release leaves the previous REVISION live \u2014 run: suite\n- The throwaway hosted zone is deleted within the run (free under 12 hours) \u2014 run: suite",
+      "design": "Owns test/acceptance/ and the test consumer repository's contents (rummykhan/shukka-consumer-test). May create and delete only resources named or tagged `shukkatest*` in account 818221194501 and the throwaway zone; never touches Trendigle or Orbitary resources except the read-only refusal check. Stops if a teardown fails and reports what is left.",
+      "parent_key": "e1",
+      "labels": [
+        "qa",
+        "security"
+      ]
+    },
+    {
+      "key": "e2",
+      "title": "Trendigle deploys through shukka",
+      "type": "epic",
+      "priority": 1,
+      "description": "Serves R9, and R3 and R5 on the real project. Design: Rollout steps 4-6.\n\n## Success Criteria\n- Trendigle's ci.yml is only the caller workflow; shukka.json holds its settings\n- A merge to Trendigle main deploys infrastructure and both apps through shukka, the CDK diff of the switch shows only role, boundary and synthesizer changes, and the smoke test passes\n- Trendigle's stacks deploy through the trendigle bootstrap with the limited execution role\n- The GitHub OIDC provider lives in Shukka-Account and still exists\n- One deliberately unhealthy admin release rolled back on the real server (owner's leave P8)\n- After two clean deploys, the old roles and the diff guard script are gone and shukka is tagged v1.0.0 and v1",
+      "design": "Changes in trendigle/trendigle on branch factory/<epic-id>; production steps by the orchestrator with the owner's leave (P3, P4, P8, P9)."
+    },
+    {
+      "key": "oidc",
+      "title": "Trendigle Ci stack releases the OIDC provider (RETAIN, then remove)",
+      "type": "task",
+      "priority": 1,
+      "description": "Design risk: the provider must survive leaving the stack. Two merges or two manual Ci deploys under the old admin execution role.",
+      "acceptance_criteria": "- Step 1 deploys the custom resource with DeletionPolicy Retain and nothing else changes \u2014 run: cdk diff shows only the policy change; `aws iam list-open-id-connect-providers` lists the provider after\n- Step 2 removes it from the stack; the guard shows the removal and it is allowed by hand \u2014 run: same check after\n- Step 3 `shukka bootstrap --account` imports the provider into Shukka-Account \u2014 run: describe-stacks output has the provider ARN\n- Trendigle's app deploy still works after each step \u2014 run: a CI run on main or the existing deploy role assumed in a test",
+      "design": "Owns implementation/infra/stacks/ci-stack.ts in Trendigle. Production steps run by the orchestrator, one at a time, provider listed between steps.",
+      "parent_key": "e2",
+      "labels": [
+        "security"
+      ]
+    },
+    {
+      "key": "tbootstrap",
+      "title": "Bootstrap Trendigle into its own fence",
+      "type": "task",
+      "priority": 1,
+      "description": "P4. `shukka bootstrap trendigle`.",
+      "acceptance_criteria": "- CDKToolkit-trendigle exists with qualifier trendigle, the two execution policies and the boundary \u2014 run: describe-stacks and get-role on cdk-trendigle-cfn-exec-role\n- LEGAL_ENTITY and CONTACT_EMAIL are GitHub repository variables in trendigle/trendigle (P9) \u2014 run: gh variable list\n- The default bootstrap is untouched (Orbitary still uses it) \u2014 run: describe-stacks CDKToolkit unchanged",
+      "design": "Ops task, no code. Run by the orchestrator.",
+      "parent_key": "e2",
+      "labels": [
+        "security"
+      ]
+    },
+    {
+      "key": "tcdk",
+      "title": "Trendigle CDK: ShukkaAccess, boundary on every role, project synthesizer",
+      "type": "task",
+      "priority": 1,
+      "description": "Serves R9, R3.",
+      "acceptance_criteria": "- Ci stack uses ShukkaAccess with the imported provider; the old github-deploy and github-infra roles stay until cleanup \u2014 run: cdk synth; cdk diff against prod shows only added roles and policies and boundary attachments\n- Every stack uses shukkaSynthesizer('trendigle') and applyBoundary \u2014 run: cdk diff shows no resource replacement (guard passes)\n- The infra tsc and tests pass \u2014 run: `npx tsc --noEmit` in implementation/infra",
+      "design": "Owns implementation/infra/app.ts, stacks/*.ts (except changes owned by `oidc`), infra package.json (adds shukka as git dependency from the rc tag).",
+      "parent_key": "e2",
+      "labels": [
+        "security"
+      ]
+    },
+    {
+      "key": "tbox",
+      "title": "Trendigle server: configure hooks and units on release directories",
+      "type": "task",
+      "priority": 1,
+      "description": "Serves R5 on Trendigle.",
+      "acceptance_criteria": "- box/install.sh is split into configure-app.sh and configure-admin.sh following the hook contract (idempotent, never restarts units, units point at /opt/trendigle/<app>/current) \u2014 test: run both in shukka's Docker harness with Trendigle's settings stubbed\n- The first release migrates from /opt/trendigle/app without losing settings; the old directory stays until the second successful release \u2014 test: harness case starting from today's layout\n- Caddy configuration unchanged \u2014 test: rendered Caddyfile identical",
+      "design": "Owns implementation/infra/box/. Uses shukka's harness from the rc tag.",
+      "parent_key": "e2",
+      "labels": [
+        "security"
+      ]
+    },
+    {
+      "key": "tci",
+      "title": "Trendigle CI: shukka.json and the caller workflow",
+      "type": "task",
+      "priority": 1,
+      "description": "Serves R9.",
+      "acceptance_criteria": "- `shukka.json` validates and matches today's commands, apps, health URLs and smoke \u2014 run: `node .shukka/scripts/config.mjs shukka.json`\n- ci.yml is the caller only \u2014 run: read the file; actionlint\n- README and FACTORY.md describe deploying through shukka; diff-guard.sh, its test and deploy.sh's deploy path are removed or point at `shukka deploy` \u2014 run: read",
+      "design": "Owns shukka.json, .github/workflows/ci.yml, README section 4, FACTORY.md commands and deploy policy, implementation/infra/deploy.sh, diff-guard*.sh.",
+      "parent_key": "e2"
+    },
+    {
+      "key": "switch",
+      "title": "Switch-over merge and validation on production",
+      "type": "task",
+      "priority": 1,
+      "description": "Merge the Trendigle branch in a quiet moment with the owner's approval and watch everything.",
+      "acceptance_criteria": "- The merge's run: diff only expected changes, guard passed, infra deployed through the trendigle bootstrap, both apps released, smoke green \u2014 run: gh run view\n- Server reports the merged sha in /opt/trendigle/app/current/REVISION and admin likewise \u2014 run: ssm send-command cat (read-only)\n- One deliberately unhealthy admin release rolls back and the site stays up (P8) \u2014 run: CI run red with exit 12; curl the admin login and the site\n- A second normal deploy is clean \u2014 run: gh run view",
+      "design": "Ops task by the orchestrator.",
+      "parent_key": "e2",
+      "labels": [
+        "security"
+      ]
+    },
+    {
+      "key": "cleanup",
+      "title": "Remove the old roles and default-bootstrap use; tag shukka v1.0.0",
+      "type": "task",
+      "priority": 1,
+      "description": "Rollout step 6.",
+      "acceptance_criteria": "- Old github-deploy and github-infra roles removed from Trendigle's Ci stack and from IAM \u2014 run: aws iam get-role \u2192 NoSuchEntity\n- `AWS_DEPLOY_ROLE_ARN` and `AWS_INFRA_ROLE_ARN` variables removed \u2014 run: gh variable list\n- shukka tagged v1.0.0 and v1; Trendigle pins v1 \u2014 run: git tag; Trendigle ci.yml",
+      "design": "Trendigle Ci stack and variables; shukka tags.",
+      "parent_key": "e2",
+      "labels": [
+        "security"
+      ]
+    }
+  ],
+  "edges": [
+    {
+      "from_key": "config",
+      "to_key": "scaffold",
+      "type": "blocks"
+    },
+    {
+      "from_key": "guard",
+      "to_key": "scaffold",
+      "type": "blocks"
+    },
+    {
+      "from_key": "fence",
+      "to_key": "scaffold",
+      "type": "blocks"
+    },
+    {
+      "from_key": "access",
+      "to_key": "scaffold",
+      "type": "blocks"
+    },
+    {
+      "from_key": "release",
+      "to_key": "scaffold",
+      "type": "blocks"
+    },
+    {
+      "from_key": "ship",
+      "to_key": "scaffold",
+      "type": "blocks"
+    },
+    {
+      "from_key": "changed",
+      "to_key": "config",
+      "type": "blocks"
+    },
+    {
+      "from_key": "ship",
+      "to_key": "config",
+      "type": "blocks"
+    },
+    {
+      "from_key": "workflows",
+      "to_key": "config",
+      "type": "blocks"
+    },
+    {
+      "from_key": "workflows",
+      "to_key": "guard",
+      "type": "blocks"
+    },
+    {
+      "from_key": "workflows",
+      "to_key": "changed",
+      "type": "blocks"
+    },
+    {
+      "from_key": "workflows",
+      "to_key": "ship",
+      "type": "blocks"
+    },
+    {
+      "from_key": "workflows",
+      "to_key": "access",
+      "type": "blocks"
+    },
+    {
+      "from_key": "cli",
+      "to_key": "config",
+      "type": "blocks"
+    },
+    {
+      "from_key": "cli",
+      "to_key": "guard",
+      "type": "blocks"
+    },
+    {
+      "from_key": "cli",
+      "to_key": "fence",
+      "type": "blocks"
+    },
+    {
+      "from_key": "cli",
+      "to_key": "ship",
+      "type": "blocks"
+    },
+    {
+      "from_key": "docs",
+      "to_key": "workflows",
+      "type": "blocks"
+    },
+    {
+      "from_key": "docs",
+      "to_key": "cli",
+      "type": "blocks"
+    },
+    {
+      "from_key": "qa",
+      "to_key": "scaffold",
+      "type": "blocks"
+    },
+    {
+      "from_key": "e2",
+      "to_key": "e1",
+      "type": "blocks"
+    },
+    {
+      "from_key": "oidc",
+      "to_key": "e1",
+      "type": "blocks"
+    },
+    {
+      "from_key": "tbootstrap",
+      "to_key": "oidc",
+      "type": "blocks"
+    },
+    {
+      "from_key": "tcdk",
+      "to_key": "oidc",
+      "type": "blocks"
+    },
+    {
+      "from_key": "tbox",
+      "to_key": "e1",
+      "type": "blocks"
+    },
+    {
+      "from_key": "tci",
+      "to_key": "e1",
+      "type": "blocks"
+    },
+    {
+      "from_key": "switch",
+      "to_key": "tbootstrap",
+      "type": "blocks"
+    },
+    {
+      "from_key": "switch",
+      "to_key": "tcdk",
+      "type": "blocks"
+    },
+    {
+      "from_key": "switch",
+      "to_key": "tbox",
+      "type": "blocks"
+    },
+    {
+      "from_key": "switch",
+      "to_key": "tci",
+      "type": "blocks"
+    },
+    {
+      "from_key": "cleanup",
+      "to_key": "switch",
+      "type": "blocks"
+    }
+  ]
+}

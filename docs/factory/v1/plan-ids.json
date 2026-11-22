@@ -1,0 +1,26 @@
+{
+  "ids": {
+    "access": "shu-7nw",
+    "changed": "shu-8f5",
+    "cleanup": "shu-60n",
+    "cli": "shu-5ix",
+    "config": "shu-9wa",
+    "docs": "shu-e08",
+    "e1": "shu-9bj",
+    "e2": "shu-li0",
+    "fence": "shu-i1b",
+    "guard": "shu-bp6",
+    "oidc": "shu-li5",
+    "qa": "shu-95y",
+    "release": "shu-766",
+    "scaffold": "shu-5ze",
+    "ship": "shu-mf3",
+    "switch": "shu-ba1",
+    "tbootstrap": "shu-ab2",
+    "tbox": "shu-ph3",
+    "tcdk": "shu-xer",
+    "tci": "shu-95g",
+    "workflows": "shu-9zr"
+  },
+  "schema_version": 1
+}
