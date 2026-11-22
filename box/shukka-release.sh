@@ -232,13 +232,26 @@ else
   rm -rf -- "$staging/REVISION"
   printf '%s\n' "$sha" >"$staging/REVISION" || finish 10 download-failed
   rm -f -- "$tgz"; tgz=
-  rm -rf -- "$new_dir"
+  # Redeploying an older sha (often the one `previous` points at): swap the fresh copy in, then
+  # drop the old one, so `previous` is never left dangling.
+  aside=''
+  if [ -e "$new_dir" ] || [ -L "$new_dir" ]; then
+    aside=$releases/.new-old-$sha.$$
+    mv -T -- "$new_dir" "$aside" || finish 10 download-failed
+  fi
   mv -T -- "$staging" "$new_dir" || finish 10 download-failed
   staging=
+  [ -n "$aside" ] && rm -rf -- "$aside"
 fi
 
 # --- configure ---------------------------------------------------------------------------------
-drop_new() { [ "$rerelease" = 1 ] || rm -rf -- "$new_dir" "$hook"; }
+# A failed release is deleted with its hook, unless it is the live one (redeploying the live sha)
+# or the one `previous` points at (redeploying that sha), which must stay.
+drop_new() {
+  [ "$rerelease" = 1 ] && return
+  [ "$new_dir" = "$prev_target" ] && return
+  rm -rf -- "$new_dir" "$hook"
+}
 
 say "running the configure hook"
 if ! (cd -- "$new_dir" && PROJECT=$project APP=$app SHA=$sha REGION=$region bash /dev/fd/8 "$new_dir" </dev/null 2>&1 9>&-); then
@@ -284,6 +297,17 @@ say "rolling back to $rollback_sha"
 point "$base/current" "$rollback_to"
 if [ -n "$prev_target" ]; then point "$base/previous" "$prev_target"; else rm -f -- "$base/previous"; fi
 drop_new
+# Give the previous release its own settings and units back: re-run its kept hook (root-only, in
+# hooks/), again from an open file. If it is missing or fails, the health check still decides.
+rollback_hook=$hooks/$rollback_sha.sh
+if [ -f "$rollback_hook" ] && [ ! -L "$rollback_hook" ] && exec 7<"$rollback_hook"; then
+  say "running the configure hook of $rollback_sha"
+  if ! (cd -- "$rollback_to" && PROJECT=$project APP=$app SHA=$rollback_sha REGION=$region bash /dev/fd/7 "$rollback_to" </dev/null 2>&1 8<&- 9>&-); then
+    say "the configure hook of $rollback_sha failed"
+  fi
+else
+  say "no configure hook kept for $rollback_sha; restarting it as it is"
+fi
 if restart_units && healthy "$rollback_sha"; then
   finish 12 rolled-back
 fi

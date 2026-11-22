@@ -164,6 +164,8 @@ case_rolled_back() {
   expect_eq "health" "$(health_code 8101)" "200"
   expect_eq "served" "$(served 8101)" "bbbbbbb"
   printf '%s\n' "$OUT" | grep -q "checking health of bbbbbbb" || fail "rollback health check not reported"
+  expect_eq "previous release's hook re-run before its restart" "$(x 'tail -n 1 /var/log/hook-env.log')" \
+    "hook: PROJECT=demo APP=web SHA=bbbbbbb REGION=us-east-1 dir=/opt/demo/web/releases/bbbbbbb"
 }
 
 case_rollback_unhealthy() {
@@ -211,17 +213,15 @@ case_two_apps_independent() {
   bundle demo api 2222222 8102 good
   release web aaaaaaa 8101; expect_rc 0
   release api 1111111 8102; expect_rc 0
-  local w rw t0 t1 api_pid
+  local w rw api_pid
   # shellcheck disable=SC2046
   docker exec "$BOX" bash /shukka/box/shukka-release.sh $(release_args web bbbbbbb 8101) >"$work/w" 2>&1 & w=$!
   sleep 1
-  t0=$(date +%s)
   release api 2222222 8102
-  t1=$(date +%s)
   expect_rc 0
   expect_last "shukka: demo/api 1111111 -> 2222222 live"
-  [ $((t1 - t0)) -lt 4 ] || fail "api release took $((t1 - t0))s: it waited for web"
-  kill -0 "$w" 2>/dev/null || fail "web release had already finished, so nothing ran in parallel"
+  # The web release (a 5 s hook) is still running: the api release did not wait for it.
+  kill -0 "$w" 2>/dev/null || fail "web release had already finished, so the api release waited for it"
   api_pid=$(unit_pid api)
   wait "$w"; rw=$?
   expect_eq "web exit" "$rw" 0
@@ -354,6 +354,49 @@ case_lock_root_only() {
   if x "runuser -u app -- flock -n /opt/demo/web/.lock true" 2>/dev/null; then fail "the app user could take the lock"; fi
 }
 
+case_redeploy_previous_kept() {
+  bundle demo web aaaaaaa 8101 good
+  bundle demo web bbbbbbb 8101 good
+  release web aaaaaaa 8101; expect_rc 0
+  release web bbbbbbb 8101; expect_rc 0
+  bundle demo web aaaaaaa 8101 hookfail
+  release web aaaaaaa 8101
+  expect_rc 11
+  expect_eq "previous" "$(link web previous)" "/opt/demo/web/releases/aaaaaaa"
+  x "test -d /opt/demo/web/previous/ && test -f /opt/demo/web/hooks/aaaaaaa.sh" || fail "previous left dangling after a configure failure"
+  bundle demo web aaaaaaa 8101 unhealthy
+  release web aaaaaaa 8101
+  expect_rc 12
+  expect_last "shukka: demo/web bbbbbbb -> aaaaaaa rolled-back"
+  expect_eq "current" "$(link web current)" "/opt/demo/web/releases/bbbbbbb"
+  expect_eq "previous" "$(link web previous)" "/opt/demo/web/releases/aaaaaaa"
+  x "test -d /opt/demo/web/previous/ && test -f /opt/demo/web/hooks/aaaaaaa.sh" || fail "previous left dangling after a rollback"
+  expect_eq "served" "$(served 8101)" "bbbbbbb"
+}
+
+case_app_dir_swap_during_download() {
+  # Modelled on the review's probe3.sh: /opt/demo and /opt/demo/web owned by the app user (as
+  # Trendigle's are today); while the bundle downloads, the app user renames the whole app
+  # directory and puts its own hooks/<sha>.sh where the old one was.
+  bundle demo web ddddddd 8101 good
+  x "install -d -o app -g app -m 755 /opt/demo /opt/demo/web"
+  # shellcheck disable=SC2016 # expanded in the container
+  x 'sed -i "s|^cp \"\$path\" \"\$dest\"|case \$path in *.tgz) sleep 3;; esac; cp \"\$path\" \"\$dest\"|" /usr/local/bin/aws'
+  # shellcheck disable=SC2046
+  docker exec "$BOX" bash /shukka/box/shukka-release.sh $(release_args web ddddddd 8101) >"$work/r" 2>&1 & local r=$!
+  sleep 1.5
+  x 'runuser -u app -- bash -c "
+    mv /opt/demo/web /opt/demo/web.x && mkdir -p /opt/demo/web/hooks &&
+    ln -s /opt/demo/web.x/releases /opt/demo/web/releases &&
+    printf \"#!/bin/bash\nid > /tmp/pwned\n\" > /opt/demo/web/hooks/ddddddd.sh" 2>/dev/null' \
+    && fail "the app user could swap /opt/demo/web during the release"
+  wait "$r"; RC=$?; OUT=$(cat "$work/r")
+  expect_rc 0
+  expect_last "shukka: demo/web none -> ddddddd live"
+  x "test ! -e /tmp/pwned" || fail "the attacker's hook ran as root: $(x 'cat /tmp/pwned')"
+  expect_eq "served" "$(served 8101)" "ddddddd"
+}
+
 # ---------------------------------------------------------------------------------------------
 
 cases=(
@@ -373,6 +416,8 @@ cases=(
   "shu-766: refuses to release through a symlinked directory with exit 10|case_symlinked_dirs_refused"
   "shu-766: refuses devices and fifos (exit 10), strips setuid, setgid and world-write, never writes through REVISION|case_hostile_bundles"
   "shu-766: the lock file is root-only and the app user cannot flock it|case_lock_root_only"
+  "shu-766: redeploying the sha previous points at never leaves previous dangling|case_redeploy_previous_kept"
+  "shu-766: the app user cannot swap the app directory during the download to run its own hook|case_app_dir_swap_during_download"
 )
 
 ran=0
