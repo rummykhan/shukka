@@ -310,12 +310,13 @@ export function fenceDocuments(inputs: FenceInputs): FenceDocuments {
     // instance-scoped calls need the project's tag on the instance; document-scoped calls name the documents.
     // Resource "*": what is left has no resource type (Systems Manager's service authorization reference lists
     // none for DescribeInstanceProperties, GetDeployablePatchSnapshotForInstance, ListAssociations, PutInventory,
-    // GetCommandInvocation, and none at all for GetManifest and PutConfigurePackageResult).
+    // GetCommandInvocation, DescribeInstanceInformation (the app role waits on it before a release), and none at all
+    // for GetManifest and PutConfigurePackageResult).
     {
       Sid: 'RuntimeAgents', Effect: 'Allow',
       Action: [
         'ssm:DescribeInstanceProperties', 'ssm:GetDeployablePatchSnapshotForInstance', 'ssm:GetManifest', 'ssm:ListAssociations', 'ssm:PutInventory',
-        'ssm:PutConfigurePackageResult', 'ssm:GetCommandInvocation', 'ssmmessages:*', 'ec2messages:*', 'cloudwatch:PutMetricData',
+        'ssm:PutConfigurePackageResult', 'ssm:GetCommandInvocation', 'ssm:DescribeInstanceInformation', 'ssmmessages:*', 'ec2messages:*', 'cloudwatch:PutMetricData',
         'sts:GetCallerIdentity', 'ec2:DescribeInstances', 'ec2:DescribeTags',
       ],
       Resource: '*',

@@ -365,6 +365,8 @@ const STAR_ALLOWED: Record<string, StarReason> = {
   'ssm:PutInventory': 'none',
   'ssm:PutConfigurePackageResult': 'none',
   'ssm:GetCommandInvocation': 'none',
+  // No resource type; the app role (bounded) waits on the instances' SSM agent before a release.
+  'ssm:DescribeInstanceInformation': 'none',
   // Session Manager and the agent's message channels have no resource types.
   'ssmmessages:*': 'none',
   'ec2messages:*': 'none',
