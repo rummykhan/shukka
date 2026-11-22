@@ -195,7 +195,7 @@ What each piece is for:
 
 - **`shukkaSynthesizer(qualifier)`** makes every stack deploy through your project's own bootstrap (the fenced execution role) instead of the account's default one.
 - **`applyBoundary(app, project)`** puts your permissions boundary on every IAM role in the app, including the ones CDK makes for custom resources. Without it, the execution role refuses to create the role.
-- **`ShukkaAccess`** creates `acme-shukka-infra`, `acme-shukka-app` and `acme-shukka-diff`. Options: `oidcProviderArn` (default: the account's GitHub provider ARN), `shukkaVersions` (the release line the roles trust, default `v1`; `v1.2` narrows it), `instanceTag` (default `Project=<project>`), `ssmPath` (default `/<project>/prod`), `qualifier` (default the project name), and `allowBranch` (release-candidate testing only; never in production).
+- **`ShukkaAccess`** creates `acme-shukka-infra`, `acme-shukka-app` and `acme-shukka-diff`. Options: `oidcProviderArn` (default: the account's GitHub provider ARN), `shukkaVersions` (the release line the roles trust, default `v1`; `v1.2` narrows it), `instanceTag` (default `Project=<project>`), `qualifier` (default the project name), and `allowPrerelease` and `allowBranch` (release-candidate testing only: trust pre-release tags such as `v1.0.0-rc.1`, which are refused by default, or a branch of shukka; never in production).
 - To get your repository's immutable subject: `gh api repos/acme-org/acme --jq '"\(.owner.login)@\(.owner.id)/\(.name)@\(.id)"'`.
 
 Rules your stacks must follow:
