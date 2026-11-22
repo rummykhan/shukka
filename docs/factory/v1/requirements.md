@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 lane: L
 ---
 # shukka: reusable deployment pipeline (GitHub Actions + CDK)
@@ -112,8 +112,8 @@ Acceptance:
 |---|---|---|---|---|---|
 | P1 | Repository name, owner and package name | all | Public home | provided: rummykhan/shukka (2026-11-22) | — |
 | P2 | Leave to create the public repository rummykhan/shukka and push to it | R1, R2 | Projects pull from it | provided by the owner's choice of home (2026-11-22); confirmed before the first push | — |
-| P3 | Leave to deploy Trendigle's Ci stack by hand once when its roles change (as on 2026-11-22) | R2, R3 | A pipeline cannot create the role it runs as | pending | The owner runs one command |
-| P4 | Leave to change Trendigle's CDK bootstrap: a new, limited execution role for its deploys | R3 | The fence | pending | R3 moves to the next pass; Trendigle keeps the admin execution role |
+| P3 | Leave to deploy Trendigle's Ci stack by hand once when its roles change (as on 2026-11-22) | R2, R3 | A pipeline cannot create the role it runs as | provided (2026-11-22) | — |
+| P4 | Leave to change Trendigle's CDK bootstrap: a new, limited execution role for its deploys | R3 | The fence | provided (2026-11-22) | — |
 | P5 | Leave to create and delete a throwaway stack in the shared account to prove the fence | R3 | Prove the fence | provided (2026-11-22) | — |
 
 ## Open questions
