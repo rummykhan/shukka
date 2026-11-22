@@ -11,14 +11,11 @@
 //   3. buildEnv values copied from Parameter Store /<project>/prod/<NAME> to GitHub repository variables;
 //   4. the project added to Shukka-Account's list, when that stack exists.
 
-import { mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { dirname, join } from 'node:path';
 import { checkProjectName, loadConfig } from '../config.mjs';
-import { CliError, mustRun } from './exec.mjs';
-
-/** The CDK CLI the bootstrap runs (the project's own infra directory is not needed to bootstrap). */
-export const CDK_CLI = 'aws-cdk@2.1148.1';
+import { CliError, NPM_SAFE, cdkBin, mustRun, tempDir } from './exec.mjs';
 export const ACCOUNT_STACK = 'Shukka-Account';
 /** Tag on the stacks `shukka bootstrap` deploys, naming the project; how shukka knows a bootstrap is its own. */
 export const PROJECT_TAG = 'shukka:project';
@@ -41,16 +38,35 @@ function profileArgs(target) {
 }
 
 /**
- * The `cdk deploy` of one stack from a synthesized cloud assembly.
+ * The `cdk deploy` of one stack from a synthesized cloud assembly, with shukka's own pinned cdk (`node <bin>`, never
+ * npx), in the shukka temp directory that holds the assembly: nothing in the directory the admin runs this from
+ * (a project's .npmrc or cdk.json, whose plugins would run with admin credentials) is read.
  * @param {Io} io
  * @param {string} assembly
  * @param {string} stack
  * @param {Target & { region: string }} target
  */
 function cdkDeploy(io, assembly, stack, target) {
-  mustRun(io, `cdk deploy ${stack}`, 'npx', [
-    '--yes', CDK_CLI, 'deploy', stack, '--app', assembly, '--require-approval', 'never', '--no-color', ...profileArgs(target),
-  ], { env: { AWS_REGION: target.region, AWS_DEFAULT_REGION: target.region } });
+  mustRun(io, `cdk deploy ${stack}`, process.execPath, [
+    cdkBin(), 'deploy', stack, '--app', assembly, '--require-approval', 'never', '--no-color', ...profileArgs(target),
+  ], { cwd: dirname(assembly), env: { ...NPM_SAFE, AWS_REGION: target.region, AWS_DEFAULT_REGION: target.region } });
+}
+
+/**
+ * Warn when the aws-cdk-lib that synthesizes shukka's stacks is not the version shukka was tested with: it is a
+ * peer dependency, so npm resolves it when the CLI is installed rather than taking it from npm-shrinkwrap.json.
+ * @param {Io} io
+ */
+function checkCdkLib(io) {
+  const require = createRequire(import.meta.url);
+  const tested = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')).devDependencies?.['aws-cdk-lib'];
+  const loaded = JSON.parse(readFileSync(require.resolve('aws-cdk-lib/package.json'), 'utf8')).version;
+  if (tested && loaded !== tested) io.warn(`aws-cdk-lib ${loaded} is synthesizing shukka's stacks; shukka was tested with ${tested}`);
+}
+
+/** A new cloud assembly directory inside its own shukka temp directory (the cwd cdk runs in). */
+function newAssemblyDir(/** @type {string} */ name) {
+  return join(tempDir(name), 'cdk.out');
 }
 
 /**
@@ -72,18 +88,54 @@ export async function principalFor(aws, callerArn) {
   throw new CliError(`cannot use ${callerArn} as the emergency principal; name one with --emergency-principal <role or user ARN>`);
 }
 
+const BOUNDARY_SUFFIX = '-shukka-boundary';
+
 /**
- * Known projects in the account: Shukka-Account's list and every Shukka-Boundary-<project> stack.
+ * Known projects in the account: every IAM policy named `<project>-shukka-boundary` (IAM is global, so this sees
+ * projects bootstrapped in any region), Shukka-Account's list and every Shukka-Boundary-<project> stack in this
+ * region. Refuses when the IAM list cannot be read: the prefix check would be blind.
  * @param {Aws} aws
- * @returns {Promise<{ projects: string[], account: import('./aws.mjs').StackInfo | null }>}
  */
 async function knownProjects(aws) {
+  /** @type {import('./aws.mjs').LocalPolicy[]} */
+  let policies;
+  try {
+    policies = await aws.localPolicies();
+  } catch (error) {
+    throw new CliError(`cannot list the account's IAM policies to find other projects (${/** @type {Error} */ (error).message}); `
+      + 'the fence is global, so the project name cannot be checked without them');
+  }
+  const fromIam = policies.filter((p) => p.name.endsWith(BOUNDARY_SUFFIX)).map((p) => p.name.slice(0, -BOUNDARY_SUFFIX.length)).filter(Boolean);
   const account = await aws.describeStack(ACCOUNT_STACK);
   const listed = account ? listOf(account.outputs.Projects) : [];
   const { boundaryStackName } = await import('../../lib/bootstrap.js');
   const prefix = boundaryStackName('');
   const boundaries = (await aws.listStackNames(prefix)).map((n) => n.slice(prefix.length)).filter(Boolean);
-  return { projects: [...new Set([...listed, ...boundaries])], account };
+  return { projects: [...new Set([...fromIam, ...listed, ...boundaries])], account, policies };
+}
+
+/**
+ * Hosted zones and mail domains other projects' fences already hold, read from their execution policies in IAM.
+ * @param {Aws} aws
+ * @param {import('./aws.mjs').LocalPolicy[]} policies
+ * @param {string} project
+ * @param {string[]} others
+ * @returns {Promise<{ project: string, zones: Set<string>, domains: Set<string> }[]>}
+ */
+async function fencedElsewhere(aws, policies, project, others) {
+  const out = [];
+  for (const other of others) {
+    if (other === project) continue;
+    const zones = new Set();
+    const domains = new Set();
+    for (const p of policies.filter((x) => x.name.startsWith(`${other}-shukka-execution`) || x.name === `${other}${BOUNDARY_SUFFIX}`)) {
+      const doc = await aws.policyDocument(p);
+      for (const m of doc.matchAll(/hostedzone\/(Z[A-Z0-9]+)/g)) zones.add(m[1]);
+      for (const m of doc.matchAll(/:identity\/([A-Za-z0-9.-]+)/g)) domains.add(String(m[1]).toLowerCase());
+    }
+    out.push({ project: other, zones, domains });
+  }
+  return out;
 }
 
 /**
@@ -97,13 +149,15 @@ function listOf(output) {
 
 /**
  * Synthesize Shukka-Account into a new cloud assembly directory; returns its path.
+ * @param {Io} io
  * @param {{ account: string, region: string, projects: string[], oidcProviderArn?: string }} inputs
  * @returns {Promise<string>}
  */
-async function synthAccount(inputs) {
+async function synthAccount(io, inputs) {
+  checkCdkLib(io);
   const { App, BootstraplessSynthesizer } = await import('aws-cdk-lib');
   const { ShukkaAccountStack } = await import('../../lib/index.js');
-  const outdir = mkdtempSync(join(tmpdir(), 'shukka-account-'));
+  const outdir = newAssemblyDir('account');
   const app = new App({ outdir });
   new ShukkaAccountStack(app, ACCOUNT_STACK, {
     env: { account: inputs.account, region: inputs.region },
@@ -117,13 +171,15 @@ async function synthAccount(inputs) {
 
 /**
  * Synthesize Shukka-Boundary-<project> into a new cloud assembly directory; returns its path.
+ * @param {Io} io
  * @param {{ project: string, qualifier: string, account: string, region: string, hostedZoneId: string, mailDomains: string[] }} inputs
  * @returns {Promise<string>}
  */
-async function synthBoundary(inputs) {
+async function synthBoundary(io, inputs) {
+  checkCdkLib(io);
   const { App, BootstraplessSynthesizer, Stack } = await import('aws-cdk-lib');
   const { ShukkaBoundary, boundaryStackName } = await import('../../lib/index.js');
-  const outdir = mkdtempSync(join(tmpdir(), 'shukka-boundary-'));
+  const outdir = newAssemblyDir('boundary');
   const app = new App({ outdir });
   const stack = new Stack(app, boundaryStackName(inputs.project), {
     env: { account: inputs.account, region: inputs.region },
@@ -182,7 +238,7 @@ export async function bootstrapAccount({ io, aws, target, oidcProviderArn, proje
   const list = projects ?? (existing ? listOf(existing.outputs.Projects) : []);
   await checkProjectList(list);
   io.say(`projects: ${list.length > 0 ? list.join(', ') : 'none'}; GitHub OIDC provider: ${provider ? `imported (${provider})` : 'owned by the stack'}`);
-  const assembly = await synthAccount({ account: caller.account, region: target.region, projects: list, ...(provider ? { oidcProviderArn: provider } : {}) });
+  const assembly = await synthAccount(io, { account: caller.account, region: target.region, projects: list, ...(provider ? { oidcProviderArn: provider } : {}) });
   cdkDeploy(io, assembly, ACCOUNT_STACK, target);
   io.say(io.dryRun ? `dry run: ${ACCOUNT_STACK} not deployed` : `${ACCOUNT_STACK} deployed`);
 }
@@ -253,6 +309,17 @@ export async function bootstrapProject(options) {
     throw new CliError(/** @type {Error} */ (error).message.replace(/^shukka: /, ''));
   }
 
+  /** @param {string[]} principals */
+  const buildTemplate = (principals) => {
+    try {
+      return lib.bootstrapTemplate({ project, qualifier, emergencyPrincipals: principals });
+    } catch (error) {
+      throw new CliError(/** @type {Error} */ (error).message.replace(/^shukka: /, ''));
+    }
+  };
+  // Named emergency principals are checked before anything is looked up or changed.
+  if (options.emergencyPrincipals && options.emergencyPrincipals.length > 0) buildTemplate(options.emergencyPrincipals);
+
   const caller = await aws.callerArn();
   if (caller.account !== config.aws.account) {
     throw new CliError(`the credentials are for account ${caller.account}, but ${options.configPath} names ${config.aws.account}`);
@@ -262,12 +329,27 @@ export async function bootstrapProject(options) {
   const emergency = options.emergencyPrincipals && options.emergencyPrincipals.length > 0
     ? options.emergencyPrincipals
     : [await principalFor(aws, caller.arn)];
+  const template = buildTemplate(emergency);
 
   // Other projects: a name that prefixes another (either way) would let one fence reach the other.
   const known = await knownProjects(aws);
   const clash = checkProjectName(project, known.projects);
   if (clash.length > 0) throw new CliError(`${clash.join('; ')} in this account`);
-  if (!known.account) io.warn(`${ACCOUNT_STACK} does not exist; project names were checked against the Shukka-Boundary-* stacks only`);
+  if (!known.account) io.warn(`${ACCOUNT_STACK} does not exist; project names were checked against IAM and the Shukka-Boundary-* stacks only`);
+
+  // What the fence holds outside the name prefix, shown with where it came from, and never another project's.
+  const zoneSource = options.hostedZoneIds && options.hostedZoneIds.length > 0 ? '--hosted-zone-id' : options.configPath;
+  const mailSource = options.mailDomains && options.mailDomains.length > 0 ? '--mail-domain' : options.configPath;
+  const zoneName = await aws.hostedZoneName(hostedZoneId);
+  for (const other of await fencedElsewhere(aws, known.policies, project, known.projects)) {
+    if (other.zones.has(hostedZoneId)) throw new CliError(`hosted zone ${hostedZoneId} (${zoneName}) is already in project ${other.project}'s fence`);
+    for (const d of mailDomains) {
+      if (other.domains.has(d.toLowerCase())) throw new CliError(`mail domain ${d} is already in project ${other.project}'s fence`);
+    }
+  }
+  const fenceLine = `fence: hosted zone ${hostedZoneId} (${zoneName}) from ${zoneSource}; `
+    + `mail domains ${mailDomains.length > 0 ? `${mailDomains.join(', ')} from ${mailSource}` : 'none'}`;
+  io.say(fenceLine);
 
   // The qualifier must be new, or a bootstrap shukka made for this project.
   const toolkitName = lib.bootstrapStackName(qualifier);
@@ -321,19 +403,13 @@ export async function bootstrapProject(options) {
 
   // 1. The fence.
   const boundaryStack = lib.boundaryStackName(project);
-  io.say(`1/4 ${boundaryStack}: boundary ${lib.boundaryPolicyName(project)} and execution policies ${lib.executionPolicyNames(project).join(', ')}`);
-  const assembly = await synthBoundary({ project, qualifier, account: caller.account, region, hostedZoneId, mailDomains });
+  io.say(`1/4 ${boundaryStack}: boundary ${lib.boundaryPolicyName(project)} and execution policies ${lib.executionPolicyNames(project).join(', ')}; ${fenceLine}`);
+  const assembly = await synthBoundary(io, { project, qualifier, account: caller.account, region, hostedZoneId, mailDomains });
   cdkDeploy(io, assembly, boundaryStack, target);
 
   // 2. The project's bootstrap.
   io.say(`2/4 ${toolkitName}: qualifier ${qualifier}, execution role with ${lib.executionPolicyNames(project).join(', ')}; emergency principals ${emergency.join(', ')}`);
-  let template;
-  try {
-    template = lib.bootstrapTemplate({ project, qualifier, emergencyPrincipals: emergency });
-  } catch (error) {
-    throw new CliError(/** @type {Error} */ (error).message.replace(/^shukka: /, ''));
-  }
-  const templateFile = join(mkdtempSync(join(tmpdir(), 'shukka-bootstrap-')), `${toolkitName}.json`);
+  const templateFile = join(tempDir('bootstrap'), `${toolkitName}.json`);
   writeFileSync(templateFile, `${JSON.stringify(template, null, 2)}\n`);
   mustRun(io, `deploying ${toolkitName}`, 'aws', [
     'cloudformation', 'deploy', '--stack-name', toolkitName, '--template-file', templateFile,
@@ -358,7 +434,7 @@ export async function bootstrapProject(options) {
     } else {
       io.say(`4/4 adding ${project} to ${ACCOUNT_STACK}'s project list`);
       const provider = await importedProvider(aws, known.account);
-      const accountAssembly = await synthAccount({
+      const accountAssembly = await synthAccount(io, {
         account: caller.account, region, projects: [...listed, project], ...(provider ? { oidcProviderArn: provider } : {}),
       });
       cdkDeploy(io, accountAssembly, ACCOUNT_STACK, target);

@@ -5,7 +5,7 @@
 // 10 to 13 a release failed with the release script's code (scripts/release.mjs).
 
 import { realAws } from './aws.mjs';
-import { CliError, createIo } from './exec.mjs';
+import { CliError, cleanTemps, createIo } from './exec.mjs';
 
 /**
  * @typedef {{ name: string, value?: string, repeat?: boolean, help: string }} FlagSpec
@@ -57,8 +57,9 @@ export const COMMANDS = [
     name: 'diff',
     usage: 'shukka diff [--config <path>] [--profile <name>] [--region <region>]',
     summary: [
-      'Refuses unless the working tree is clean and HEAD equals origin/main. Synthesizes the CDK app (npm ci, cdk synth',
-      'in infra.dir), prints cdk diff with your credentials and the guard\'s verdict (scripts/guard.mjs). Exit 0 when',
+      'Refuses unless the working tree is clean and HEAD equals origin/main. Synthesizes the CDK app from a fresh',
+      'worktree of origin/main (npm ci, cdk synth in infra.dir, no AWS credentials), prints cdk diff run as the',
+      'project\'s bootstrap deploy role (as for deploy, below) and the guard\'s verdict (scripts/guard.mjs). Exit 0 when',
       'nothing would be deleted or replaced, 1 when something would be or the diff is incomplete.',
     ].join('\n'),
     flags: [CONFIG, PROFILE, REGION],
@@ -68,11 +69,19 @@ export const COMMANDS = [
     usage: 'shukka deploy [--config <path>] [--profile <name>] [--region <region>] [--bucket <name>] [--allow-replacement] [--skip-checks] [--dry-run]',
     summary: [
       'The emergency path when GitHub is down. Refuses unless the working tree is clean and HEAD equals origin/main,',
-      'then does what the workflows do, in their order, with your credentials: the checks, build and bundle every',
+      'then does what the workflows do, in their order (credentials below): the checks, build and bundle every',
       'app (buildEnv values from the environment, else from Parameter Store /<project>/prod/<NAME>), cdk synth,',
       'cdk diff and the guard, cdk deploy with the shukka:revision tag, then for each app upload the bundle',
       '(scripts/upload.mjs) and release it on the servers (scripts/release.mjs), and the smoke test. Every part',
-      'deploys, whatever changed.',
+      'deploys, whatever changed. It builds from a fresh worktree of origin/main and reads shukka.json from there.',
+      '',
+      "Credentials: the project's own code (checks, build, npm ci, cdk synth, smoke) runs with every AWS_* variable",
+      'removed, the AWS config and credentials files pointed at empty files and instance metadata off. cdk diff and',
+      "cdk deploy run with shukka's pinned cdk and only a session of the project's bootstrap deploy role",
+      '(cdk-<qualifier>-deploy-role-<account>-<region>), which your principal must be allowed to assume (an',
+      "emergency principal named at bootstrap). Upload and release are shukka's own code and use your credentials.",
+      'Code that reads ~/.aws files directly by path is not stopped: where possible, run the emergency deploy as a',
+      'non-admin emergency principal rather than an admin.',
     ].join('\n'),
     flags: [
       CONFIG,
@@ -186,6 +195,8 @@ function list(flags, name) {
  *   aws?: (target: { profile?: string, region: string }, io: import('./exec.mjs').Io) => import('./aws.mjs').Aws,
  *   cwd?: string,
  *   env?: Record<string, string | undefined>,
+ *   checkAssembly?: (dir: string) => string[],
+ *   keepTemp?: boolean,
  * }} Deps
  */
 
@@ -260,16 +271,13 @@ export async function main(argv, deps = {}) {
     }
 
     if (positional.length > 0) throw new CliError(`${spec.name}: unexpected argument ${JSON.stringify(positional[0])}`, 2);
-    const { loadConfig } = await import('../config.mjs');
-    const { resolve } = await import('node:path');
-    const { config, problems } = loadConfig(resolve(cwd, configPath));
-    if (!config) throw new CliError(problems.join('\n'));
+    // shukka.json is read from the fresh worktree of origin/main, not from this working tree.
     const target = { ...(profile ? { profile } : {}), ...(region ? { region } : {}) };
-    const aws = makeAws(region ?? config.aws.region);
     const { deployCommand, diffCommand } = await import('./deploy.mjs');
-    if (spec.name === 'diff') return await diffCommand({ io, aws, target, configPath, cwd });
+    const checkAssembly = deps.checkAssembly ? { checkAssembly: deps.checkAssembly } : {};
+    if (spec.name === 'diff') return await diffCommand({ io, makeAws, target, configPath, cwd, ...checkAssembly });
     return await deployCommand({
-      io, aws, target, configPath, cwd,
+      io, makeAws, target, configPath, cwd, env, ...checkAssembly,
       ...(str(flags, 'bucket') ? { bucket: str(flags, 'bucket') } : {}),
       allowReplacement: flags['allow-replacement'] === true,
       skipChecks: flags['skip-checks'] === true,
@@ -282,5 +290,7 @@ export async function main(argv, deps = {}) {
     }
     err(`shukka: ${/** @type {Error} */ (error).message}\n`);
     return 1;
+  } finally {
+    if (!deps.keepTemp) cleanTemps();
   }
 }

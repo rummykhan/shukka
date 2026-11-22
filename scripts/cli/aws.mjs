@@ -11,7 +11,14 @@ import {
   ListTypesCommand,
 } from '@aws-sdk/client-cloudformation';
 import { EC2Client } from '@aws-sdk/client-ec2';
-import { GetRoleCommand, IAMClient, ListOpenIDConnectProvidersCommand, ListRolesCommand } from '@aws-sdk/client-iam';
+import {
+  GetPolicyVersionCommand,
+  GetRoleCommand,
+  IAMClient,
+  ListOpenIDConnectProvidersCommand,
+  ListPoliciesCommand,
+  ListRolesCommand,
+} from '@aws-sdk/client-iam';
 import { S3Client } from '@aws-sdk/client-s3';
 import { GetParameterCommand, SSMClient } from '@aws-sdk/client-ssm';
 import { CliError } from './exec.mjs';
@@ -21,6 +28,8 @@ import { CliError } from './exec.mjs';
  * @typedef {{ kind: string, typeName: string, executionRoleArn: string | null }} PrivateType
  * @typedef {{ roleName: string, arn: string, boundaryArn?: string }} UnboundedRole
  * @typedef {{ send(command: any): Promise<any> }} Client
+ * @typedef {{ name: string, arn: string, defaultVersionId: string }} LocalPolicy
+ * @typedef {{ accessKeyId: string, secretAccessKey: string, sessionToken: string }} Session
  * @typedef {{
  *   callerArn: () => Promise<{ account: string, arn: string }>,
  *   roleArn: (roleName: string) => Promise<string>,
@@ -31,6 +40,10 @@ import { CliError } from './exec.mjs';
  *   privateTypes: () => Promise<PrivateType[]>,
  *   unboundedRoles: (project: string) => Promise<UnboundedRole[]>,
  *   oidcProviders: () => Promise<string[]>,
+ *   hostedZoneName: (id: string) => Promise<string>,
+ *   localPolicies: () => Promise<LocalPolicy[]>,
+ *   policyDocument: (policy: LocalPolicy) => Promise<string>,
+ *   assumeRole: (roleArn: string, sessionName: string) => Promise<Session>,
  *   clients: () => { s3: Client, ssm: Client, ec2: Client },
  * }} Aws
  */
@@ -54,6 +67,8 @@ export function realAws({ profile, region, io }) {
   const cfn = new CloudFormationClient(config);
   const ssm = new SSMClient(config);
   const iam = new IAMClient(config);
+
+  const cliArgs = ['--output', 'json', '--region', region, ...(profile ? ['--profile', profile] : [])];
 
   /** @type {Aws} */
   const aws = {
@@ -147,6 +162,37 @@ export function realAws({ profile, region, io }) {
     async oidcProviders() {
       const r = await iam.send(new ListOpenIDConnectProvidersCommand({}));
       return (r.OpenIDConnectProviderList ?? []).map((/** @type {any} */ p) => String(p.Arn ?? ''));
+    },
+    async hostedZoneName(id) {
+      // Route 53 through the AWS CLI (read-only), as STS: no extra SDK client for one call.
+      const r = io.run('aws', ['route53', 'get-hosted-zone', '--id', id, ...cliArgs], { mutates: false, capture: 'stdout' });
+      if (r.status !== 0) throw new CliError(`cannot read hosted zone ${id} (aws route53 get-hosted-zone failed); is it in this account?`);
+      return String(JSON.parse(r.stdout).HostedZone?.Name ?? '');
+    },
+    async localPolicies() {
+      /** @type {LocalPolicy[]} */
+      const found = [];
+      /** @type {string | undefined} */
+      let marker;
+      do {
+        const r = await iam.send(new ListPoliciesCommand({ Scope: 'Local', ...(marker ? { Marker: marker } : {}) }));
+        for (const p of r.Policies ?? []) {
+          if (p.PolicyName && p.Arn) found.push({ name: p.PolicyName, arn: p.Arn, defaultVersionId: String(p.DefaultVersionId ?? '') });
+        }
+        marker = r.IsTruncated ? r.Marker : undefined;
+      } while (marker);
+      return found;
+    },
+    async policyDocument(policy) {
+      const r = await iam.send(new GetPolicyVersionCommand({ PolicyArn: policy.arn, VersionId: policy.defaultVersionId }));
+      return decodeURIComponent(String(r.PolicyVersion?.Document ?? ''));
+    },
+    async assumeRole(roleArn, sessionName) {
+      // The output holds the session's keys: captured, never printed.
+      const r = io.run('aws', ['sts', 'assume-role', '--role-arn', roleArn, '--role-session-name', sessionName, ...cliArgs], { mutates: false, capture: 'stdout' });
+      if (r.status !== 0) throw new CliError(`cannot assume ${roleArn}; is your principal one of the project's emergency principals (shukka bootstrap --emergency-principal)?`);
+      const c = JSON.parse(r.stdout).Credentials ?? {};
+      return { accessKeyId: String(c.AccessKeyId), secretAccessKey: String(c.SecretAccessKey), sessionToken: String(c.SessionToken) };
     },
     clients() {
       return { s3: new S3Client(config), ssm, ec2: new EC2Client(config) };

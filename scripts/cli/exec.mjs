@@ -5,14 +5,16 @@
 // commands (git, `aws sts get-caller-identity`) still run in a dry run, because what is printed depends on them.
 
 import { spawnSync } from 'node:child_process';
-import { closeSync, mkdtempSync, openSync, readFileSync, rmSync } from 'node:fs';
+import { closeSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 /**
  * @typedef {{
  *   cwd?: string,
  *   env?: Record<string, string | undefined>,
+ *   fullEnv?: Record<string, string>,
  *   input?: string,
  *   mutates?: boolean,
  *   capture?: false | 'stdout' | 'merged',
@@ -30,6 +32,26 @@ import { join } from 'node:path';
  *   warn: (line: string) => void,
  * }} Io
  */
+
+/** Temp directories this process made; main removes them when a command ends (cleanTemps). */
+const temps = new Set();
+
+/**
+ * A new temp directory, removed by cleanTemps().
+ * @param {string} name
+ * @returns {string}
+ */
+export function tempDir(name) {
+  const dir = mkdtempSync(join(tmpdir(), `shukka-${name}-`));
+  temps.add(dir);
+  return dir;
+}
+
+/** Remove every directory tempDir() made. */
+export function cleanTemps() {
+  for (const dir of temps) rmSync(dir, { recursive: true, force: true });
+  temps.clear();
+}
 
 /** A failure the CLI reports as one `shukka: ...` message and exit code (1: refused or failed). */
 export class CliError extends Error {
@@ -67,7 +89,8 @@ export function commandLine(cmd, args) {
  * @type {Spawn}
  */
 export function realSpawn(cmd, args, options) {
-  const env = options.env ? { ...process.env, ...options.env } : process.env;
+  // fullEnv is the child's whole environment (nothing inherited); env is merged over this process's.
+  const env = options.fullEnv ?? (options.env ? { ...process.env, ...options.env } : process.env);
   const base = { cwd: options.cwd, env, encoding: /** @type {const} */ ('utf8'), maxBuffer: 256 * 1024 * 1024 };
   if (options.capture === 'merged') {
     const dir = mkdtempSync(join(tmpdir(), 'shukka-out-'));
@@ -135,4 +158,45 @@ export function mustRun(io, what, cmd, args, options = {}) {
   const r = io.run(cmd, args, options);
   if (r.status !== 0) throw new CliError(`${what} failed (exit ${r.status})`);
   return r;
+}
+
+/**
+ * The environment for the project's own code (checks, build, npm ci, synth, smoke): this process's environment
+ * without any AWS_* variable, the AWS config and credentials files pointed at empty files, and the instance
+ * metadata service off, so the SDKs and CLIs in that code find no credentials. Code that reads ~/.aws itself by
+ * path is not stopped by this.
+ * @param {Record<string, string | undefined>} [extra] added after stripping
+ * @param {Record<string, string | undefined>} [from] the environment to strip (default process.env)
+ * @returns {Record<string, string>}
+ */
+export function projectEnv(extra = {}, from = process.env) {
+  /** @type {Record<string, string>} */
+  const env = {};
+  for (const [k, v] of Object.entries(from)) {
+    if (v !== undefined && !/^AWS_/i.test(k)) env[k] = v;
+  }
+  const dir = tempDir('noaws');
+  writeFileSync(join(dir, 'config'), '');
+  writeFileSync(join(dir, 'credentials'), '');
+  env.AWS_CONFIG_FILE = join(dir, 'config');
+  env.AWS_SHARED_CREDENTIALS_FILE = join(dir, 'credentials');
+  env.AWS_EC2_METADATA_DISABLED = 'true';
+  for (const [k, v] of Object.entries(extra)) if (v !== undefined) env[k] = v;
+  return env;
+}
+
+/** npm settings for the cdk child: no project .npmrc can choose the shell or the registry. */
+export const NPM_SAFE = Object.freeze({ npm_config_script_shell: '/bin/sh', npm_config_registry: 'https://registry.npmjs.org/' });
+
+/**
+ * Path of the cdk CLI shukka depends on (aws-cdk, pinned in package.json), run as `node <path>`: never npx, which
+ * would read the project's .npmrc, and never the project's own cdk.
+ * @returns {string}
+ */
+export function cdkBin() {
+  const require = createRequire(import.meta.url);
+  const pkgFile = require.resolve('aws-cdk/package.json');
+  const pkg = JSON.parse(readFileSync(pkgFile, 'utf8'));
+  const bin = typeof pkg.bin === 'string' ? pkg.bin : pkg.bin.cdk;
+  return join(dirname(pkgFile), bin);
 }
