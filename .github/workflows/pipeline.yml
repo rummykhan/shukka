@@ -1,0 +1,426 @@
+# shukka pipeline: the reusable workflow a project calls from its whole CI file (design C1).
+#
+#   jobs:
+#     shukka:
+#       uses: rummykhan/shukka/.github/workflows/pipeline.yml@v1
+#       permissions: { contents: read, id-token: write, pull-requests: write }
+#       with:
+#         allow_replacement: ${{ inputs.allow_replacement || false }}
+#         force: ${{ inputs.force || false }}
+#
+# Inputs
+#   config             path of shukka.json in the project (default shukka.json)
+#   allow_replacement  let the infrastructure deploy delete or replace resources (workflow_dispatch only)
+#   force              deploy every part whatever changed
+#   deploy_bucket      the bucket bundles go to; default <project>-deploy-<account>
+#   shukka_ref         only when the caller file cannot be read: the shukka ref this run uses (see plan)
+#
+# Jobs, by id and by the name a run shows (prefixed with the caller's job, e.g. "shukka / plan"; a
+# nested workflow's jobs show as "<caller> / <job>", and its skipped jobs are listed too):
+#   plan     plan                      reads and validates shukka.json; no AWS access, does not decide what changed
+#   checks   check <name>              one per shukka.json check (pull requests and merges); no AWS access
+#   build    build <app>               one per app (merges only): build, bundle, upload bundle-<app>; no AWS access
+#   diff     pull request / diff       pull requests: infra.yml in diff mode, the read-only diff role, one PR
+#                                      comment marked <!-- shukka:diff --> updated in place
+#   infra    stacks / changes          merges: infra.yml decides whether the stacks changed (infra role, read only)
+#            stacks / deploy           merges: synth, diff, guard, cdk deploy; skipped when the stacks did not change
+#   app      servers / changes         merges: ec2.yml decides which apps changed (app role, read only)
+#            servers / release <app>   merges: one per changed app: upload the bundle and release it through SSM
+#   smoke    smoke                     the project's smoke command, when anything was deployed; no AWS access
+# Only the deploy job says "deploy", only the pull-request diff says "diff", only the release jobs say
+# "release": the caller jobs are named "pull request", "stacks" and "servers" so that the read-only
+# "changes" jobs and the skipped jobs of the other mode never carry those words.
+# A docs-only merge runs plan, check, build and the two read-only "changes" jobs; no deploy job runs.
+#
+# Only infra.yml and ec2.yml get id-token: write (design D3); every job sets its own permissions.
+# No ${{ }} expression from inputs, events or matrix is written into a run: script; they go through env:.
+#
+# Workspace layout in every job: the project is checked out at ./project, shukka's own scripts at
+# ./.shukka (the same shukka commit as this file), artifacts outside both under $RUNNER_TEMP.
+name: shukka
+
+on:
+  workflow_call:
+    inputs:
+      config:
+        description: Path of shukka.json in the project
+        type: string
+        default: shukka.json
+      allow_replacement:
+        description: Let the infrastructure deploy delete or replace resources
+        type: boolean
+        default: false
+      force:
+        description: Deploy every part, whatever changed
+        type: boolean
+        default: false
+      deploy_bucket:
+        description: Bucket for app bundles; default <project>-deploy-<account>
+        type: string
+        default: ''
+      shukka_ref:
+        description: The shukka ref this run uses, when plan cannot read it from the caller file
+        type: string
+        default: ''
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      config: ${{ steps.config.outputs.config }}
+      node: ${{ steps.config.outputs.node }}
+      has_checks: ${{ steps.config.outputs.has_checks }}
+      has_apps: ${{ steps.config.outputs.has_apps }}
+      has_smoke: ${{ steps.config.outputs.has_smoke }}
+      shukka_repository: ${{ steps.shukka.outputs.repository }}
+      shukka_sha: ${{ steps.sha.outputs.sha }}
+    steps:
+      - name: Check out the project
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: project
+          persist-credentials: false
+
+      # GitHub gives a job no context naming the reusable workflow's own commit, and this job has no
+      # id-token (whose job_workflow_sha claim infra.yml and ec2.yml use). The caller file names it:
+      # the one `uses: <owner>/<repo>/.github/workflows/pipeline.yml@<ref>` line in the workflow
+      # this run started from (github.workflow_ref), read at the commit being built.
+      - name: Find the shukka version this run uses
+        id: shukka
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          SHUKKA_REF: ${{ inputs.shukka_ref }}
+        run: |
+          set -euo pipefail
+          ref_re='^[A-Za-z0-9._/-]+$'
+          if [[ -n "$SHUKKA_REF" ]]; then
+            [[ "$SHUKKA_REF" =~ $ref_re && "$SHUKKA_REF" != -* ]] || { echo "::error::shukka: shukka_ref is not a ref"; exit 1; }
+            repository=rummykhan/shukka
+            ref=$SHUKKA_REF
+          else
+            path=${WORKFLOW_REF#*/*/}
+            path=${path%%@*}
+            [[ "$path" =~ ^\.github/workflows/[A-Za-z0-9._-]+\.ya?ml$ && -f "project/$path" ]] || {
+              echo "::error::shukka: cannot read the caller workflow file; pass shukka_ref"
+              exit 1
+            }
+            found=$(grep -oE '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/\.github/workflows/pipeline\.yml@[A-Za-z0-9._/-]+' "project/$path" | sort -u || true)
+            count=$(grep -c . <<<"$found" || true)
+            [[ $count -eq 1 ]] || {
+              echo "::error::shukka: expected one pipeline.yml reference in $path, found $count; pass shukka_ref"
+              exit 1
+            }
+            repository=${found%%/.github/*}
+            ref=${found#*@}
+          fi
+          echo "shukka: this run uses $repository at $ref"
+          {
+            echo "repository=$repository"
+            echo "ref=$ref"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Check out shukka
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ steps.shukka.outputs.repository }}
+          ref: ${{ steps.shukka.outputs.ref }}
+          path: .shukka
+          persist-credentials: false
+
+      - name: Record the shukka commit
+        id: sha
+        run: |
+          set -euo pipefail
+          sha=$(git -C .shukka rev-parse HEAD)
+          echo "shukka: commit $sha"
+          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Read shukka.json
+        id: config
+        env:
+          CONFIG: ${{ inputs.config }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$CONFIG" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ || "/$CONFIG/" == */../* ]]; then
+            echo "::error::shukka: config must be a path inside the project"
+            exit 1
+          fi
+          node .shukka/scripts/config.mjs "project/$CONFIG" --json >"$RUNNER_TEMP/shukka-config.json"
+          node --input-type=module - "$RUNNER_TEMP/shukka-config.json" <<'JS'
+          import { appendFileSync, readFileSync } from 'node:fs';
+          const config = JSON.parse(readFileSync(process.argv[2], 'utf8'));
+          const out = {
+            config: JSON.stringify(config),
+            node: config.node,
+            has_checks: String(config.checks.length > 0),
+            has_apps: String(config.apps.length > 0),
+            has_smoke: String(config.smoke !== null),
+          };
+          appendFileSync(process.env.GITHUB_OUTPUT, Object.entries(out).map(([k, v]) => `${k}=${v}\n`).join(''));
+          console.log(`shukka: project ${config.project}: ${config.checks.length} check(s), ${config.apps.length} app(s)`);
+          JS
+
+  checks:
+    name: check ${{ matrix.check.name }}
+    needs: plan
+    if: needs.plan.outputs.has_checks == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        check: ${{ fromJSON(needs.plan.outputs.config).checks }}
+    steps:
+      - name: Check out the project
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: project
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ needs.plan.outputs.node }}
+
+      - name: Start services
+        env:
+          SERVICES: ${{ toJSON(matrix.check.services) }}
+        run: |
+          set -euo pipefail
+          jq -r '.[]' <<<"$SERVICES" | while IFS= read -r service; do
+            case "$service" in
+              dynamodb-local)
+                docker run -d --name shukka-dynamodb-local -p 8000:8000 \
+                  amazon/dynamodb-local:3.3.1@sha256:ff89bd48ff32cd8d9be5fee8873b65b8854dc408f1afe881be6eb00247bc0dab
+                ;;
+              *)
+                echo "::error::shukka: unknown service '$service' (known: dynamodb-local)"
+                exit 1
+                ;;
+            esac
+          done
+
+      - name: Run the check
+        working-directory: project
+        env:
+          CHECK: ${{ toJSON(matrix.check) }}
+        run: |
+          set -euo pipefail
+          cat >"$RUNNER_TEMP/shukka-run.mjs" <<'JS'
+          // Run each command of a check (or build) in its directory, one bash per command, stop at the first failure.
+          import { spawnSync } from 'node:child_process';
+          import { resolve } from 'node:path';
+          const step = JSON.parse(process.env.CHECK);
+          const cwd = resolve(step.dir);
+          step.run.forEach((command, i) => {
+            console.log(`shukka: check ${step.name}, command ${i + 1} of ${step.run.length}: ${JSON.stringify(command)}`);
+            const r = spawnSync('bash', ['-eo', 'pipefail', '-c', command], { cwd, stdio: 'inherit' });
+            if (r.status !== 0) {
+              console.log(`::error::shukka: check ${step.name} failed at command ${i + 1} (exit ${r.status ?? r.signal})`);
+              process.exit(1);
+            }
+          });
+          JS
+          node "$RUNNER_TEMP/shukka-run.mjs"
+
+  build:
+    name: build ${{ matrix.app.name }}
+    needs: plan
+    if: github.event_name != 'pull_request' && needs.plan.outputs.has_apps == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        app: ${{ fromJSON(needs.plan.outputs.config).apps }}
+    steps:
+      - name: Check out the project
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: project
+          persist-credentials: false
+
+      - name: Check out shukka
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ needs.plan.outputs.shukka_repository }}
+          ref: ${{ needs.plan.outputs.shukka_sha }}
+          path: .shukka
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ needs.plan.outputs.node }}
+
+      # buildEnv names are read from repository variables (design D9); vars holds no secrets.
+      - name: Build and bundle
+        working-directory: project
+        env:
+          APP: ${{ toJSON(matrix.app) }}
+          REPOSITORY_VARS: ${{ toJSON(vars) }}
+        run: |
+          set -euo pipefail
+          cat >"$RUNNER_TEMP/shukka-build.mjs" <<'JS'
+          // Build one app with its env, run its bundle script and print the bundle directory last.
+          import { existsSync, statSync } from 'node:fs';
+          import { isAbsolute, resolve } from 'node:path';
+          import { spawnSync } from 'node:child_process';
+          const app = JSON.parse(process.env.APP);
+          const vars = JSON.parse(process.env.REPOSITORY_VARS || '{}');
+          const env = { ...process.env, ...app.build.env };
+          delete env.APP;
+          delete env.REPOSITORY_VARS;
+          for (const name of app.build.buildEnv) {
+            if (typeof vars[name] !== 'string') {
+              console.error(`::error::shukka: build ${app.name} needs the repository variable ${name}, which is not set`);
+              process.exit(1);
+            }
+            env[name] = vars[name];
+          }
+          const cwd = resolve(app.build.dir);
+          app.build.run.forEach((command, i) => {
+            console.error(`shukka: build ${app.name}, command ${i + 1} of ${app.build.run.length}: ${JSON.stringify(command)}`);
+            const r = spawnSync('bash', ['-eo', 'pipefail', '-c', command], { cwd, env, stdio: ['ignore', 2, 2] });
+            if (r.status !== 0) {
+              console.error(`::error::shukka: build ${app.name} failed at command ${i + 1} (exit ${r.status ?? r.signal})`);
+              process.exit(1);
+            }
+          });
+          // The bundle script is the project's own file in the build dir; scripts/bundle.sh, when the
+          // project has no such file, is the one shukka provides for Next.js standalone output.
+          let script = resolve(cwd, app.build.bundle);
+          if (!existsSync(script) && app.build.bundle === 'scripts/bundle.sh') script = resolve(process.env.SHUKKA_DIR, 'scripts/bundle.sh');
+          if (!existsSync(script)) {
+            console.error(`::error::shukka: build ${app.name}: no bundle script ${app.build.bundle} in ${app.build.dir}`);
+            process.exit(1);
+          }
+          const r = spawnSync('bash', [script], { cwd, env, stdio: ['ignore', 'pipe', 2], encoding: 'utf8' });
+          if (r.status !== 0) {
+            console.error(`::error::shukka: build ${app.name}: the bundle script failed (exit ${r.status ?? r.signal})`);
+            process.exit(1);
+          }
+          const printed = r.stdout.split('\n').map((l) => l.trim()).filter(Boolean).pop() ?? '';
+          const dir = isAbsolute(printed) ? printed : resolve(cwd, printed);
+          if (printed === '' || !existsSync(dir) || !statSync(dir).isDirectory()) {
+            console.error(`::error::shukka: build ${app.name}: the bundle script did not print a directory`);
+            process.exit(1);
+          }
+          process.stdout.write(`${dir}\n`);
+          JS
+          dir=$(SHUKKA_DIR="$GITHUB_WORKSPACE/.shukka" node "$RUNNER_TEMP/shukka-build.mjs" | tail -n 1)
+          mkdir -p "$RUNNER_TEMP/shukka-bundle"
+          # A tarball keeps symbolic links as links; upload.mjs checks them on the deploy side.
+          tar -C "$dir" -czf "$RUNNER_TEMP/shukka-bundle/bundle.tgz" .
+          echo "shukka: bundled $dir ($(du -h "$RUNNER_TEMP/shukka-bundle/bundle.tgz" | cut -f1))"
+
+      - name: Upload the bundle
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bundle-${{ matrix.app.name }}
+          path: ${{ runner.temp }}/shukka-bundle/bundle.tgz
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
+
+  diff:
+    name: pull request
+    needs: plan
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    uses: ./.github/workflows/infra.yml
+    with:
+      mode: diff
+      config: ${{ inputs.config }}
+
+  infra:
+    name: stacks
+    needs: [plan, checks, build]
+    if: >-
+      !cancelled() && github.event_name != 'pull_request'
+      && needs.plan.result == 'success'
+      && contains(fromJSON('["success","skipped"]'), needs.checks.result)
+      && contains(fromJSON('["success","skipped"]'), needs.build.result)
+    # pull-requests: write is not used by the deploy; infra.yml's diff job asks for it, and a caller
+    # must grant every permission any job of the called workflow names.
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    uses: ./.github/workflows/infra.yml
+    with:
+      mode: deploy
+      config: ${{ inputs.config }}
+      allow_replacement: ${{ inputs.allow_replacement }}
+      force: ${{ inputs.force }}
+
+  app:
+    name: servers
+    needs: [plan, infra]
+    if: >-
+      !cancelled() && needs.infra.result == 'success' && needs.plan.outputs.has_apps == 'true'
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/ec2.yml
+    with:
+      config: ${{ inputs.config }}
+      force: ${{ inputs.force }}
+      deploy_bucket: ${{ inputs.deploy_bucket }}
+
+  smoke:
+    name: smoke
+    needs: [plan, infra, app]
+    if: >-
+      !cancelled() && needs.plan.outputs.has_smoke == 'true'
+      && needs.infra.result == 'success'
+      && contains(fromJSON('["success","skipped"]'), needs.app.result)
+      && (needs.infra.outputs.deployed == 'true' || needs.app.outputs.released == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the project
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: project
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ needs.plan.outputs.node }}
+
+      - name: Smoke test
+        working-directory: project
+        env:
+          SMOKE: ${{ fromJSON(needs.plan.outputs.config).smoke.run }}
+        run: |
+          set +e -uo pipefail
+          printf 'shukka: smoke: %q\n' "$SMOKE"
+          bash -c "$SMOKE"
+          code=$?
+          if [[ $code -ne 0 ]]; then
+            echo "::error::shukka: the site is live but failing its smoke test (the smoke command exited $code)"
+            exit 1
+          fi
+          echo "shukka: smoke test passed"

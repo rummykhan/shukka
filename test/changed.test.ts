@@ -465,3 +465,70 @@ test('shu-8f5: usage errors and an invalid config exit non-zero', async () => {
     rmSync(bad);
   }
 });
+
+// ---------------------------------------------------------------------------
+// shu-9zr: --part, so infra.yml decides the stacks under the deploy role and ec2.yml the apps under
+// the app role, each reading only what its role may read.
+// ---------------------------------------------------------------------------
+async function runMain(world: World, args: string[]) {
+  const { clients, sent } = stubs(world);
+  let printed = '';
+  const errors: string[] = [];
+  const code = await main([join(repo, 'shukka.json'), ...args], {
+    clients, wait: noWait, out: (t) => { printed += t; }, err: (t) => { errors.push(t); },
+  });
+  return { code, printed, errors: errors.join(''), sent };
+}
+
+test('shu-9zr: --part infra reads only the stacks and prints only the infra part', async () => {
+  const { code, printed, errors, sent } = await runMain({
+    stacks: [stack('Trendigle-prod-Data', c3)],
+    servers: [{ id: 'i-1', revisions: { app: c1, admin: c5 } }],
+  }, ['--part', 'infra', '--stacks', 'Trendigle-prod-Data']);
+  assert.equal(code, 0, errors);
+  assert.deepEqual(JSON.parse(printed), { infra: true, apps: {}, base: { infra: c3, apps: {} } });
+  assert.deepEqual([...new Set(sent.map((s) => s.client))], ['cfn']);
+});
+
+test('shu-9zr: --part app:<name> reads only the servers and decides only the apps named', async () => {
+  const { code, printed, errors, sent } = await runMain({
+    stacks: [stack('Trendigle-prod-Data', c5)],
+    servers: [{ id: 'i-1', revisions: { app: c1, admin: c5 } }],
+  }, ['--part', 'app:admin']);
+  assert.equal(code, 0, errors);
+  assert.deepEqual(JSON.parse(printed), { apps: { admin: false }, base: { apps: { admin: c5 } } });
+  assert.ok(!sent.some((s) => s.client === 'cfn'), 'no stack is read for an app part');
+  const send = sent.find((s) => s.command === 'SendCommandCommand');
+  assert.doesNotMatch(send?.input.Parameters.commands[0], /\/app\/current/);
+
+  const both = await runMain({
+    stacks: [stack('Trendigle-prod-Data', c5)],
+    servers: [{ id: 'i-1', revisions: { app: c1, admin: c5 } }],
+  }, ['--part', 'app:app', '--part', 'app:admin']);
+  assert.deepEqual(JSON.parse(both.printed), { apps: { app: true, admin: false }, base: { apps: { app: c1, admin: c5 } } });
+});
+
+test('shu-9zr: a part that cannot be read counts as changed', async () => {
+  const infra = await runMain({ stacks: new Error('AccessDenied') }, ['--part', 'infra']);
+  assert.equal(infra.code, 0, infra.errors);
+  assert.equal(JSON.parse(infra.printed).infra, true);
+  const app = await runMain({ servers: new Error('AccessDenied') }, ['--part', 'app:app']);
+  assert.equal(app.code, 0, app.errors);
+  assert.deepEqual(JSON.parse(app.printed).apps, { app: true });
+});
+
+test('shu-9zr: --force with --part gives the named parts true without reading AWS', async () => {
+  const { code, printed, sent } = await runMain(deployedAtHead(), ['--force', '--part', 'app:app']);
+  assert.equal(code, 0);
+  assert.deepEqual(JSON.parse(printed), { apps: { app: true }, base: { apps: { app: null } } });
+  assert.deepEqual(sent, []);
+});
+
+test('shu-9zr: a malformed --part is a usage error and an unknown app fails', async () => {
+  for (const bad of [['--part'], ['--part', 'stacks'], ['--part', 'app:'], ['--part', 'app:Bad'], ['--part', '--force']]) {
+    assert.equal((await runMain(deployedAtHead(), bad)).code, 2, bad.join(' '));
+  }
+  const unknown = await runMain(deployedAtHead(), ['--part', 'app:nope']);
+  assert.equal(unknown.code, 1);
+  assert.match(unknown.errors, /no app "nope"/);
+});

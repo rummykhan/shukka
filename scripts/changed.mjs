@@ -6,9 +6,14 @@
 // (first deploy, missing tag, unreachable server, a commit not in this checkout) is changed.
 //
 // CLI: node scripts/changed.mjs <shukka.json> [--force] [--head <ref>] [--repo <dir>] [--stacks a,b]
+//        [--part infra|app:<name>]...
 //   prints {"infra": bool, "apps": {"<name>": bool}, "base": {"infra": sha|null, "apps": {"<name>": sha|null}}}
-//   exit 0: printed; exit 1: config invalid or git failed; exit 2: usage error
+//   exit 0: printed; exit 1: config invalid, unknown app or git failed; exit 2: usage error
 //   --stacks names the project's stacks instead of listing every stack whose name starts with the project
+//   --part (repeatable) decides only the parts named and reads AWS only for them: `infra` reads the
+//   stack tags (the workflows run it under the infrastructure deploy role), `app:<name>` reads that
+//   app's REVISION on the servers (under the app role). Parts not named are left out of the output
+//   (`infra` and `base.infra` absent, `apps` holding only the apps named).
 //
 // The config's globs are matched only against the git-relative names printed by
 // `git diff --name-only`; they are never expanded on the filesystem.
@@ -26,7 +31,8 @@ import { loadConfig } from './config.mjs';
  * @typedef {import('./config.mjs').Config} Config
  * @typedef {{ send: (command: any) => Promise<any> }} Client
  * @typedef {{ cfn: Client, ec2: Client, ssm: Client }} Clients
- * @typedef {{ infra: boolean, apps: Record<string, boolean>, base: { infra: string | null, apps: Record<string, string | null> } }} Changes
+ * @typedef {{ infra?: boolean, apps: Record<string, boolean>, base: { infra?: string | null, apps: Record<string, string | null> } }} Changes
+ * @typedef {{ infra: boolean, apps: string[] }} Parts which parts to decide; every part when absent
  * @typedef {(string | null)[]} Revisions one entry per stack or server; null where it could not be read
  * @typedef {{ sleep?: (ms: number) => Promise<void>, timeoutMs?: number, intervalMs?: number }} Wait
  * @typedef {{
@@ -35,6 +41,7 @@ import { loadConfig } from './config.mjs';
  *   head?: string,
  *   force?: boolean,
  *   stacks?: string[],
+ *   parts?: Parts,
  *   clients: Clients,
  *   wait?: Wait,
  *   warn?: (line: string) => void,
@@ -393,16 +400,31 @@ export async function readAppRevisions(ec2, ssm, project, apps, wait = {}, warn 
 }
 
 /**
- * @param {Config} config
+ * @param {Parts} parts
  * @param {boolean} value
  * @returns {Changes}
  */
-function everything(config, value) {
-  return {
-    infra: value,
-    apps: Object.fromEntries(config.apps.map((a) => [a.name, value])),
-    base: { infra: null, apps: Object.fromEntries(config.apps.map((a) => [a.name, null])) },
-  };
+function everything(parts, value) {
+  const apps = Object.fromEntries(parts.apps.map((name) => [name, value]));
+  const bases = Object.fromEntries(parts.apps.map((name) => [name, null]));
+  return parts.infra
+    ? { infra: value, apps, base: { infra: null, apps: bases } }
+    : { apps, base: { apps: bases } };
+}
+
+/**
+ * The parts to decide, checked against the config.
+ * @param {Config} config
+ * @param {Parts} [parts]
+ * @returns {Parts}
+ */
+function resolveParts(config, parts) {
+  const names = config.apps.map((a) => a.name);
+  if (!parts) return { infra: true, apps: names };
+  for (const name of parts.apps) {
+    if (!names.includes(name)) throw new Error(`no app ${JSON.stringify(name)} in the config`);
+  }
+  return { infra: parts.infra, apps: names.filter((name) => parts.apps.includes(name)) };
 }
 
 /**
@@ -412,28 +434,32 @@ function everything(config, value) {
 export async function computeChanges(options) {
   const { config, repo, clients } = options;
   const warn = options.warn ?? (() => {});
+  const parts = resolveParts(config, options.parts);
   if (options.force || config.alwaysDeploy) {
     warn(options.force ? 'forced: every part deploys' : 'alwaysDeploy: every part deploys');
-    return everything(config, true);
+    return everything(parts, true);
   }
   const head = git(repo, ['rev-parse', '--verify', '--end-of-options', `${options.head ?? 'HEAD'}^{commit}`]).trim();
 
-  /** @type {Revisions} */
-  let stackRevisions;
-  try {
-    stackRevisions = await readStackRevisions(clients.cfn, config.project, options.stacks);
-  } catch (error) {
-    warn(`stacks: cannot read: ${/** @type {Error} */ (error).message}`);
-    stackRevisions = [null];
-  }
-  const appRevisions = await readAppRevisions(
-    clients.ec2, clients.ssm, config.project, config.apps.map((a) => a.name), options.wait, warn,
-  );
-
-  const infra = decidePart(repo, head, stackRevisions, config.infra.paths, 'infra', warn);
   /** @type {Changes} */
-  const changes = { infra: infra.changed, apps: {}, base: { infra: infra.base, apps: {} } };
-  for (const app of config.apps) {
+  const changes = parts.infra ? { infra: true, apps: {}, base: { infra: null, apps: {} } } : { apps: {}, base: { apps: {} } };
+  if (parts.infra) {
+    /** @type {Revisions} */
+    let stackRevisions;
+    try {
+      stackRevisions = await readStackRevisions(clients.cfn, config.project, options.stacks);
+    } catch (error) {
+      warn(`stacks: cannot read: ${/** @type {Error} */ (error).message}`);
+      stackRevisions = [null];
+    }
+    const infra = decidePart(repo, head, stackRevisions, config.infra.paths, 'infra', warn);
+    changes.infra = infra.changed;
+    changes.base.infra = infra.base;
+  }
+  if (parts.apps.length === 0) return changes;
+  const appRevisions = await readAppRevisions(clients.ec2, clients.ssm, config.project, parts.apps, options.wait, warn);
+
+  for (const app of config.apps.filter((a) => parts.apps.includes(a.name))) {
     const part = decidePart(repo, head, appRevisions[app.name] ?? [], app.paths, `app ${app.name}`, warn);
     changes.apps[app.name] = part.changed;
     changes.base.apps[app.name] = part.base;
@@ -446,7 +472,8 @@ function defaultClients() {
   return { cfn: new CloudFormationClient({}), ec2: new EC2Client({}), ssm: new SSMClient({}) };
 }
 
-const USAGE = 'usage: node scripts/changed.mjs <shukka.json> [--force] [--head <ref>] [--repo <dir>] [--stacks a,b]';
+const USAGE = 'usage: node scripts/changed.mjs <shukka.json> [--force] [--head <ref>] [--repo <dir>] [--stacks a,b] [--part infra|app:<name>]...';
+const APP_PART = /^app:([a-z][a-z0-9-]{0,30})$/;
 
 /**
  * @param {string[]} argv
@@ -464,11 +491,23 @@ export async function main(argv, deps = {}) {
   let repo;
   /** @type {string[] | undefined} */
   let stacks;
+  /** @type {Parts | undefined} */
+  let parts;
   let force = false;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--force') {
       force = true;
+    } else if (arg === '--part') {
+      const value = argv[++i] ?? '';
+      const app = APP_PART.exec(value);
+      if (value !== 'infra' && !app) {
+        err(`${USAGE}\n`);
+        return 2;
+      }
+      parts ??= { infra: false, apps: [] };
+      if (app) parts.apps.push(/** @type {string} */ (app[1]));
+      else parts.infra = true;
     } else if (arg === '--head' || arg === '--repo' || arg === '--stacks') {
       const value = argv[++i];
       if (value === undefined || value.startsWith('-')) {
@@ -503,6 +542,7 @@ export async function main(argv, deps = {}) {
       warn: (line) => err(`changed: ${line}\n`),
       ...(head !== undefined ? { head } : {}),
       ...(stacks !== undefined ? { stacks } : {}),
+      ...(parts !== undefined ? { parts } : {}),
       ...(deps.wait ? { wait: deps.wait } : {}),
     });
     out(`${JSON.stringify(changes)}\n`);
