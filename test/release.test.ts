@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { gunzipSync } from 'node:zlib';
@@ -11,6 +12,8 @@ import { buildCommands, checkArgs, EXIT_MESSAGES, hookKey, main, readHook, relea
 import { upload } from '../scripts/upload.mjs';
 import { bundleDir, GOOD_HOOK, gitCheckout, headOf, HOOK, SHA, stubClient, tarEntries, withTmp, write } from './helpers/release-fixtures.js';
 
+const BUNDLE_SHA256 = 'b'.repeat(64);
+const sha256 = (data: string | Buffer) => createHash('sha256').update(data).digest('hex');
 const SCRIPT = '#!/usr/bin/env bash\n# stand-in for box/shukka-release.sh\nprintf "%s\\n" "$@"\n';
 
 type Invocation = { Status: string; ResponseCode?: number; StandardOutputContent?: string; StandardErrorContent?: string };
@@ -46,7 +49,7 @@ function baseOptions(root: string, scriptPath: string) {
   return {
     project: 'shukkatest', app: 'web', sha: SHA, bucket: 'shukkatest-deploy-123', region: 'us-east-1',
     units: ['shukkatest-web', 'shukkatest-tick'], health: 'http://127.0.0.1:3000/login',
-    checkout: gitCheckout(root), configure: HOOK, script: scriptPath, pollMs: 0,
+    checkout: gitCheckout(root), configure: HOOK, script: scriptPath, pollMs: 0, bundleSha256: BUNDLE_SHA256,
   };
 }
 
@@ -78,8 +81,9 @@ test('shu-mf3: release sends shukka-release.sh with its arguments through SSM to
   assert.equal(run.status, 0, run.stderr);
   assert.deepEqual(run.stdout.trim().split('\n'), [
     '--project', 'shukkatest', '--app', 'web', '--sha', SHA, '--bucket', 'shukkatest-deploy-123', '--region', 'us-east-1',
-    '--configure-key', `shukkatest/web/${SHA}.configure.sh`, '--units', 'shukkatest-web shukkatest-tick',
-    '--health', 'http://127.0.0.1:3000/login',
+    '--configure-key', `shukkatest/web/${SHA}.configure.sh`,
+    '--configure-sha256', sha256(GOOD_HOOK), '--bundle-sha256', BUNDLE_SHA256,
+    '--units', 'shukkatest-web shukkatest-tick', '--health', 'http://127.0.0.1:3000/login',
   ]);
   assert.match(printed, /released on i-0aaa/);
   assert.match(printed, /released on i-0bbb/);
@@ -148,7 +152,7 @@ test('shu-mf3: the configure hook is read from the git checkout, uploaded beside
   assert.equal(Buffer.from(hookPut.input.Body as Buffer).toString(), GOOD_HOOK);
   const commands = (ssm.calls.find((c) => c instanceof SendCommandCommand)!.input.Parameters as { commands: string[] }).commands;
   assert.ok(commands.join('\n').includes(`'--configure-key' 'shukkatest/web/${SHA}.configure.sh'`));
-  assert.ok(!scriptArgs(options).includes('--configure'));
+  assert.ok(!scriptArgs(options, sha256(GOOD_HOOK)).includes('--configure'));
 }));
 
 test('shu-mf3: a hook that is not a committed regular file at the checkout root is refused', withTmp(async (root) => {
@@ -186,7 +190,7 @@ test('shu-mf3: release CLI takes project, hook path, units and health from shukk
   let stdout = '';
   const out = (t: string) => { stdout += t; };
   const code = await main(
-    ['--config', config, '--app', 'web', '--bucket', 'b-bucket', '--sha', SHA, '--checkout', checkout, '--script', scriptFile(root)],
+    ['--config', config, '--app', 'web', '--bucket', 'b-bucket', '--sha', SHA, '--checkout', checkout, '--script', scriptFile(root), '--bundle-sha256', BUNDLE_SHA256],
     { ssm: ssm.client, ec2: stubEc2(['i-0aaa']).client, s3: s3.client, pollMs: 0, out },
   );
   assert.equal(code, 12);
@@ -252,3 +256,33 @@ test('shu-9zr: release waits for the SSM agents to report Online before sending,
   const denied = stubClient(() => { throw Object.assign(new Error('no'), { name: 'AccessDeniedException' }); });
   await waitOnline(denied.client, ['i-1'], 0, 60, () => {});
 });
+
+test('shu-9bj.7: release passes --configure-sha256 (of the hook it uploads) and --bundle-sha256 (of the uploaded tarball) to the release script', withTmp(async (root) => {
+  const dir = bundleDir(root);
+  const s3 = stubClient();
+  const uploaded = await upload({ dir, bucket: 'shukkatest-deploy-123', project: 'shukkatest', app: 'web', sha: SHA, s3: s3.client });
+  assert.equal(uploaded.sha256, sha256(s3.calls[0]!.input.Body as Buffer));
+  const ssm = stubSsm(() => ({ Status: 'Success', ResponseCode: 0 }));
+  await release({ ...baseOptions(root, scriptFile(root)), bundleSha256: uploaded.sha256, ec2: stubEc2(['i-0aaa']).client, ssm: ssm.client, s3: s3.client, out: () => {} });
+  const hookBody = Buffer.from(s3.calls[1]!.input.Body as Buffer);
+  const commands = (ssm.calls.find((c) => c instanceof SendCommandCommand)!.input.Parameters as { commands: string[] }).commands;
+  const args = spawnSync('sh', ['-c', commands.join('\n')], { encoding: 'utf8' }).stdout.trim().split('\n');
+  assert.equal(args[args.indexOf('--configure-sha256') + 1], sha256(hookBody));
+  assert.equal(args[args.indexOf('--bundle-sha256') + 1], uploaded.sha256);
+}));
+
+test('shu-9bj.7: release refuses a missing or malformed bundle digest before anything is uploaded or sent', withTmp(async (root) => {
+  const options = baseOptions(root, scriptFile(root));
+  for (const bad of [undefined, '', 'B'.repeat(64), 'b'.repeat(63)]) {
+    const args = { ...options, bundleSha256: bad };
+    if (bad === undefined) delete args.bundleSha256;
+    assert.ok(checkArgs(args).some((p) => /bundle-sha256/.test(p)), String(bad));
+    const ssm = stubSsm(() => ({ Status: 'Success', ResponseCode: 0 }));
+    const s3 = stubClient();
+    await assert.rejects(release({ ...args, ec2: stubEc2().client, ssm: ssm.client, s3: s3.client, out: () => {} }), /bundle-sha256/);
+    assert.equal(ssm.calls.length + s3.calls.length, 0);
+  }
+  const code = await main(['--project', 'shukkatest', '--app', 'web', '--region', 'us-east-1', '--configure', HOOK, '--units', 'u',
+    '--health', 'http://127.0.0.1/', '--bucket', 'b-bucket', '--sha', SHA, '--checkout', options.checkout]);
+  assert.equal(code, 2);
+}));

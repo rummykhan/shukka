@@ -7,7 +7,7 @@ set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/../.." && pwd)
 pattern=${1:-}
-tag=$(printf '%s' "${pattern:-all}" | tr -c 'a-zA-Z0-9-' '-' | tr '[:upper:]' '[:lower:]')
+tag=$(printf '%s' "${pattern:-all}" | tr -c 'a-zA-Z0-9.-' '-' | tr '[:upper:]' '[:lower:]')
 image="shukka-box-test:$tag-$$"
 prefix="shukka-box-$tag-$$"
 work=$(mktemp -d)
@@ -40,11 +40,15 @@ x() { docker exec "$BOX" bash -c "$1"; }
 bundle() { x "/fixtures/make-bundle.sh $BUCKET $*"; } # project app sha port variant [sleep]
 
 # release <app> <sha> <port> [extra args]: runs the release script as the SSM agent would (root).
+# The digests are those of the objects in the fake S3 now, as release.mjs computes them at upload
+# (all zeros for a missing object); a later --configure-sha256 or --bundle-sha256 overrides them.
+s3_sha256() { x "sha256sum </fake-s3/$BUCKET/$1 2>/dev/null | cut -c1-64 | grep . || printf '0%.0s' {1..64}"; }
 release_args() {
   local app=$1 sha=$2 port=$3
   echo --project demo --app "$app" --sha "$sha" --bucket "$BUCKET" --region us-east-1 \
     --configure-key "demo/$app/$sha.configure.sh" --units "demo-$app" --health "http://127.0.0.1:$port/health" \
-    --health-timeout 6
+    --health-timeout 6 --configure-sha256 "$(s3_sha256 "demo/$app/$sha.configure.sh")" \
+    --bundle-sha256 "$(s3_sha256 "demo/$app/$sha.tgz")"
 }
 release() {
   local app=$1 sha=$2 port=$3; shift 3
@@ -397,6 +401,131 @@ case_app_dir_swap_during_download() {
   expect_eq "served" "$(served 8101)" "ddddddd"
 }
 
+# The review's layout (access-2): before the first shukka release the app user owns the base and
+# plants a release, a hook that records who ran it, and current pointing at the planted release.
+plant_layout() {
+  x "install -d -o app -g app -m 755 /opt/demo /opt/demo/web /opt/demo/web/releases /opt/demo/web/hooks"
+  x "runuser -u app -- bash -c '
+    mkdir -p /opt/demo/web/releases/1111111/public && echo 1111111 >/opt/demo/web/releases/1111111/REVISION &&
+    echo ok >/opt/demo/web/releases/1111111/public/health &&
+    printf \"#!/bin/bash\nid -u >>/tmp/planted-hook-ran\n\" >/opt/demo/web/hooks/1111111.sh &&
+    chmod 700 /opt/demo/web/hooks/1111111.sh &&
+    ln -s /opt/demo/web/releases/1111111 /opt/demo/web/current &&
+    ln -s /opt/demo/web/releases/1111111 /opt/demo/web/previous'"
+}
+
+case_planted_previous_removed() {
+  plant_layout
+  bundle demo web aaaaaaa 8101 unhealthy
+  release web aaaaaaa 8101
+  x "test ! -e /tmp/planted-hook-ran" || fail "the planted hook ran, as uid $(x 'cat /tmp/planted-hook-ran')"
+  expect_rc 13
+  expect_last "shukka: demo/web none -> aaaaaaa rollback-unhealthy"
+  x "test ! -e /opt/demo/web/releases/1111111 && test ! -e /opt/demo/web/hooks/1111111.sh" \
+    || fail "the planted release or hook was kept: $(x 'ls -lA /opt/demo/web/releases /opt/demo/web/hooks')"
+  x "test ! -L /opt/demo/web/previous" || fail "previous still points at $(link web previous)"
+  printf '%s\n' "$OUT" | grep -q "removing /opt/demo/web/releases/1111111 (owned by app" || fail "removal not reported"
+  bundle demo web bbbbbbb 8101 good
+  release web bbbbbbb 8101
+  expect_rc 0
+  expect_last "shukka: demo/web aaaaaaa -> bbbbbbb live"
+}
+
+case_current_dir_kept() {
+  # current (or previous) as a real directory, as an app user may have it before shukka: never
+  # deleted, the release refuses over it.
+  local l
+  for l in current previous; do
+    x "rm -rf /opt/demo && install -d -o app -g app -m 755 /opt/demo /opt/demo/web /opt/demo/web/$l"
+    x "runuser -u app -- bash -c 'echo app-data >/opt/demo/web/$l/server.js'"
+    bundle demo web aaaaaaa 8101 unhealthy
+    release web aaaaaaa 8101
+    expect_rc 10
+    expect_last "shukka: demo/web none -> aaaaaaa download-failed"
+    printf '%s\n' "$OUT" | grep -q "/opt/demo/web/$l is not a symlink; refusing to release over it" || fail "$l: not reported"
+    expect_eq "$l contents survive" "$(x "cat /opt/demo/web/$l/server.js")" "app-data"
+    x "test ! -e /opt/demo/web/releases/aaaaaaa" || fail "$l: a release was unpacked"
+  done
+}
+
+case_rollback_hook_checked() {
+  # A root-owned release whose kept hook is not root:root 0700 (or a symlink, or a group-writable
+  # release dir) is restarted as it is, never configured with that hook.
+  local kind
+  # The late* kinds change the kept hook from inside the unhealthy release's own hook, after the
+  # start-of-release cleanup, so only the check made at rollback time can stop it.
+  for kind in hookmode hookowner hooklink dirmode latemode latelink; do
+    bundle demo web aaaaaaa 8101 good
+    bundle demo web bbbbbbb 8101 unhealthy
+    x "rm -rf /opt/demo /tmp/hook-ran"
+    release web aaaaaaa 8101; expect_rc 0
+    x "printf '#!/bin/bash\nid -u >>/tmp/hook-ran\n' >/tmp/other.sh && chmod 700 /tmp/other.sh"
+    case $kind in
+      hookmode) x "cp /tmp/other.sh /opt/demo/web/hooks/aaaaaaa.sh && chmod 755 /opt/demo/web/hooks/aaaaaaa.sh" ;;
+      hookowner) x "cp /tmp/other.sh /opt/demo/web/hooks/aaaaaaa.sh && chown app /opt/demo/web/hooks/aaaaaaa.sh" ;;
+      hooklink) x "ln -sfn /tmp/other.sh /opt/demo/web/hooks/aaaaaaa.sh" ;;
+      dirmode) x "cp /tmp/other.sh /opt/demo/web/hooks/aaaaaaa.sh && chmod 775 /opt/demo/web/releases/aaaaaaa" ;;
+      latemode) x "echo 'cp /tmp/other.sh /opt/demo/web/hooks/aaaaaaa.sh; chmod 755 /opt/demo/web/hooks/aaaaaaa.sh' >>/fake-s3/$BUCKET/demo/web/bbbbbbb.configure.sh" ;;
+      latelink) x "echo 'ln -sfn /tmp/other.sh /opt/demo/web/hooks/aaaaaaa.sh' >>/fake-s3/$BUCKET/demo/web/bbbbbbb.configure.sh" ;;
+    esac
+    release web bbbbbbb 8101
+    expect_rc 12
+    x "test ! -e /tmp/hook-ran" || fail "$kind: the rollback hook ran"
+    printf '%s\n' "$OUT" | grep -q "no usable configure hook kept for aaaaaaa" || fail "$kind: not reported"
+  done
+  # And a proper root:root 0700 hook in a proper release dir does run on rollback.
+  bundle demo web bbbbbbb 8101 unhealthy
+  x "rm -rf /opt/demo /tmp/hook-ran"
+  release web aaaaaaa 8101; expect_rc 0
+  x "cp /tmp/other.sh /opt/demo/web/hooks/aaaaaaa.sh"
+  release web bbbbbbb 8101
+  expect_rc 12
+  expect_eq "proper hook ran as root" "$(x 'cat /tmp/hook-ran')" "0"
+}
+
+case_rollback_target_checked() {
+  # current pointing anywhere but releases/<hex sha> (here a root-owned dir outside releases/) is
+  # never rolled back to and its hook never runs.
+  x "install -d -m 755 /opt/demo/web/hooks /srv/1111111 && echo 1111111 >/srv/1111111/REVISION"
+  x "printf '#!/bin/bash\nid -u >>/tmp/hook-ran\n' >/opt/demo/web/hooks/1111111.sh && chmod 700 /opt/demo/web/hooks/1111111.sh"
+  x "ln -s /srv/1111111 /opt/demo/web/current"
+  bundle demo web aaaaaaa 8101 unhealthy
+  release web aaaaaaa 8101
+  expect_rc 13
+  x "test ! -e /tmp/hook-ran" || fail "the hook of a release outside releases/ ran"
+}
+
+case_digests_checked() {
+  bundle demo web aaaaaaa 8101 good
+  bundle demo web bbbbbbb 8101 good
+  bundle demo web ccccccc 8101 good
+  release web aaaaaaa 8101; expect_rc 0
+  # The hook in S3 is swapped after release.mjs computed its digest.
+  local hsum bsum
+  hsum=$(x "sha256sum </fake-s3/$BUCKET/demo/web/bbbbbbb.configure.sh | cut -c1-64")
+  x "printf '#!/bin/bash\nid -u >>/tmp/swapped-ran\n' >/fake-s3/$BUCKET/demo/web/bbbbbbb.configure.sh"
+  release web bbbbbbb 8101 --configure-sha256 "$hsum"
+  expect_rc 10
+  expect_last "shukka: demo/web aaaaaaa -> bbbbbbb download-failed"
+  printf '%s\n' "$OUT" | grep -q "the configure hook does not match its sha256" || fail "hook mismatch not reported"
+  x "test ! -e /tmp/swapped-ran" || fail "the swapped hook ran"
+  x "test ! -e /opt/demo/web/hooks/bbbbbbb.sh" || fail "the swapped hook was kept"
+  # The bundle in S3 is swapped.
+  bsum=$(x "sha256sum </fake-s3/$BUCKET/demo/web/ccccccc.tgz | cut -c1-64")
+  x "cp /fake-s3/$BUCKET/demo/web/aaaaaaa.tgz /fake-s3/$BUCKET/demo/web/ccccccc.tgz"
+  release web ccccccc 8101 --bundle-sha256 "$bsum"
+  expect_rc 10
+  expect_last "shukka: demo/web aaaaaaa -> ccccccc download-failed"
+  printf '%s\n' "$OUT" | grep -q "the bundle does not match its sha256" || fail "bundle mismatch not reported"
+  expect_eq "releases" "$(x 'ls -A /opt/demo/web/releases | tr "\n" " "')" "aaaaaaa "
+  expect_eq "hooks" "$(x 'ls -A /opt/demo/web/hooks | tr "\n" " "')" "aaaaaaa.sh "
+  expect_eq "current" "$(link web current)" "/opt/demo/web/releases/aaaaaaa"
+  # Both digests are required and must be 64 lowercase hex characters.
+  release web ccccccc 8101 --bundle-sha256 ABC; expect_rc 2
+  OUT=$(x "bash /shukka/box/shukka-release.sh $(release_args web ccccccc 8101 | sed 's/ --configure-sha256 [0-9a-f]*//')" 2>&1); RC=$?
+  expect_rc 2
+}
+
 # ---------------------------------------------------------------------------------------------
 
 cases=(
@@ -418,6 +547,11 @@ cases=(
   "shu-766: the lock file is root-only and the app user cannot flock it|case_lock_root_only"
   "shu-766: redeploying the sha previous points at never leaves previous dangling|case_redeploy_previous_kept"
   "shu-766: the app user cannot swap the app directory during the download to run its own hook|case_app_dir_swap_during_download"
+  "shu-9bj.7: a release, hook and current/previous planted by the app user are removed before anything runs; the planted hook never runs as root|case_planted_previous_removed"
+  "shu-9bj.7: a current or previous that is a real directory owned by the app user is never deleted; the release refuses with exit 10|case_current_dir_kept"
+  "shu-9bj.7: a rollback hook runs only when it is a regular root:root 0700 file and the release dir is root's and not group/other-writable|case_rollback_hook_checked"
+  "shu-9bj.7: a rollback target outside releases/<hex sha> is never rolled back to and its hook never runs|case_rollback_target_checked"
+  "shu-9bj.7: a hook or bundle swapped in S3 (digest differs) is refused with exit 10 and nothing changes|case_digests_checked"
 )
 
 ran=0

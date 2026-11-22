@@ -915,7 +915,7 @@ test('shu-9zr: only pushes to main and runs by hand on main deploy; by hand else
   assert.match(branch.out, /^::notice::shukka: deploys run only on main; workflow_dispatch on refs\/heads\/feature runs plan and checks only$/m);
 });
 
-test('shu-9zr: ec2 release unpacks the artifact outside both checkouts, uploads it and releases with the hook from git', async () => {
+test('shu-9zr, shu-9bj.7: ec2 release unpacks the artifact outside both checkouts, uploads it and releases with the hook from git and the upload\'s --bundle-sha256', async () => {
   const ws = workspace();
   // The artifact as build uploads it: a tarball of the bundle directory.
   const bundleDir = join(ws.temp, 'built');
@@ -939,11 +939,13 @@ test('shu-9zr: ec2 release unpacks the artifact outside both checkouts, uploads 
   const put = (upload.calls[0] as Loose).sent.find((s: Loose) => s.command === 'PutObjectCommand');
   assert.equal(put.input.Key, `shukkatest/web/${head}.tgz`);
   assert.equal(put.input.Bucket, 'shukkatest-deploy-123456789012');
+  const bundleSha256 = createHash('sha256').update(Buffer.from(put.input.Body)).digest('hex');
+  assert.equal(upload.outputs.bundle_sha256, bundleSha256);
 
-  const release = await runStep(ws, ec2, 'release', 'Release', exprs);
+  const release = await runStep(ws, ec2, 'release', 'Release', { ...exprs, 'steps.upload.outputs.bundle_sha256': bundleSha256 });
   assert.equal(release.code, 0, release.out);
   const call = release.calls[0] as Loose;
-  assert.deepEqual(call.args, ['--bucket', 'shukkatest-deploy-123456789012', '--sha', head, '--checkout', 'project', '--config', 'project/shukka.json', '--app', 'web']);
+  assert.deepEqual(call.args, ['--bucket', 'shukkatest-deploy-123456789012', '--sha', head, '--checkout', 'project', '--config', 'project/shukka.json', '--app', 'web', '--bundle-sha256', bundleSha256]);
   const hook = call.sent.find((s: Loose) => s.command === 'PutObjectCommand');
   assert.equal(hook.input.Key, `shukkatest/web/${head}.configure.sh`);
   assert.equal(Buffer.from(hook.input.Body).toString(), '#!/bin/sh\necho configure from git\n');

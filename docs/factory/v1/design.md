@@ -162,9 +162,11 @@ Deployed with admin credentials by `shukka bootstrap --account`. Owns the GitHub
 ```
 shukka-release.sh --project P --app A --sha SHA --bucket B --region R
                   --configure-key <s3 key of the hook>     (uploaded by ec2.yml from the git checkout, never from the bundle)
+                  --configure-sha256 <hex>                 (sha256 of the hook release.mjs uploaded)
+                  --bundle-sha256 <hex>                    (sha256 of the tarball upload.mjs uploaded)
                   --units "u1 u2" --health URL [--keep 5] [--health-timeout 60]
 exit 0  = new release live and healthy
-exit 10 = download or unpack failed      (nothing changed)
+exit 10 = download or unpack failed, a digest differs, or the layout cannot be made root's (nothing changed)
 exit 11 = configure hook failed          (nothing switched)
 exit 12 = unhealthy, rolled back, previous healthy
 exit 13 = unhealthy, rollback also unhealthy (manual attention)
@@ -173,6 +175,8 @@ stdout last line: "shukka: <project>/<app> <old-sha> -> <new-sha> <result>"
 ```
 
 Where the hook comes from (decided 2026-11-22 after the security review of shu-9bj.1 found the two readings of this contract): `ec2.yml` (through `scripts/release.mjs`) reads the hook from the **git checkout** at the config's `server.configure` path and uploads it to `s3://<bucket>/<project>/<app>/<sha>.configure.sh`; `shukka-release.sh` downloads that object to `/opt/<project>/<app>/hooks/<sha>.sh` (outside every release directory, root-owned, mode 0700) and runs only that file. A file at the same path inside the bundle is never executed.
+
+Digests and planted entries (decided 2026-11-22, shu-9bj.7): the hook and the bundle are checked against `--configure-sha256` and `--bundle-sha256` (computed by `release.mjs` from the hook it uploads and by `upload.mjs` from the tarball it uploads) before either is run or unpacked; a mismatch exits 10 and leaves nothing behind. Before anything else, entries in `releases/` that are not root-owned directories and entries in `hooks/` that are not regular root:root 0700 files are removed, with `current`/`previous` links that do not point at a kept `releases/<hex sha>`. On rollback, the kept hook runs only when the target is exactly `releases/<hex sha>`, a real root:root directory not writable by group or others, and `hooks/<sha>.sh` is a regular root:root 0700 file; otherwise the release is restarted as it is.
 
 Configure hook contract: called as `hook.sh <release-dir>` with `PROJECT`, `APP`, `SHA`, `REGION` in the environment, as root. It writes settings files, users and systemd units (pointing at `/opt/<project>/<app>/current`), and must be idempotent. It must not start or restart the app's units; the release script does that after the switch. It must enable its units (`systemctl enable`); the release script only restarts them. `/opt/<project>` and `/opt/<project>/<app>` are root-owned and not writable by group or others (the release script enforces it); the app user's home and writable data live elsewhere. A release whose hook fails is deleted.
 

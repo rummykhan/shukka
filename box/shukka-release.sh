@@ -4,6 +4,7 @@
 #
 # usage: shukka-release.sh --project P --app A --sha SHA --bucket B --region R
 #                          --configure-key <s3 key of the hook>   (uploaded by ec2.yml from git)
+#                          --configure-sha256 <hex> --bundle-sha256 <hex>   (digests of what was uploaded)
 #                          --units "u1 u2" --health URL [--keep 5] [--health-timeout 60]
 #
 # Layout: /opt/<project>/<app>/releases/<sha>/ (bundle + REVISION), current -> one release,
@@ -13,7 +14,8 @@
 # Exit codes, and the result word on the last line of stdout:
 #   0  live                new release live and healthy
 #   2  invalid-arguments   bad or missing arguments (nothing changed)
-#   10 download-failed     download or unpack failed (nothing changed)
+#   10 download-failed     download or unpack failed, a digest differs, or the layout cannot be
+#                          made root's (nothing changed)
 #   11 configure-failed    configure hook failed (nothing switched; the new release is deleted)
 #   12 rolled-back         unhealthy, rolled back, previous healthy
 #   13 rollback-unhealthy  unhealthy, and the rollback is unhealthy too or there is nothing to roll
@@ -26,11 +28,16 @@
 # run as the hook (a build dependency could plant a file there). Called as `hook.sh <release-dir>` with PROJECT, APP, SHA, REGION set, as root.
 # It writes settings, users and units (pointing at /opt/<project>/<app>/current), is idempotent and
 # never starts or restarts the app's units. This script never prints settings files.
+#
+# The hook and the bundle are checked against the sha256 digests release.mjs computed when it
+# uploaded them; a different object in S3 is refused (exit 10) before it is run or unpacked.
+# Before anything else, whatever in releases/ and hooks/ is not root's (left by whoever owned the
+# base before the first release) is removed, with current/previous links pointing at it.
 set -uo pipefail
 umask 022
 export LC_ALL=C
 
-project='' app='' sha='' bucket='' region='' configure_key='' units='' health='' keep=5 health_timeout=60
+project='' app='' sha='' bucket='' region='' configure_key='' configure_sha256='' bundle_sha256='' units='' health='' keep=5 health_timeout=60
 old=none
 staging='' tgz='' hook_tmp=''
 
@@ -67,6 +74,8 @@ while [ $# -gt 0 ]; do
     --bucket) bucket=$2 ;;
     --region) region=$2 ;;
     --configure-key) configure_key=$2 ;;
+    --configure-sha256) configure_sha256=$2 ;;
+    --bundle-sha256) bundle_sha256=$2 ;;
     --units) units=$2 ;;
     --health) health=$2 ;;
     --keep) keep=$2 ;;
@@ -83,6 +92,8 @@ done
 [[ $region =~ ^[a-z]{2}(-[a-z]+)+-[0-9]+$ ]] || invalid "--region is not a region"
 [[ $configure_key =~ ^[A-Za-z0-9._-][A-Za-z0-9._/-]*$ ]] || invalid "--configure-key must be an S3 key"
 [[ /$configure_key/ == */../* || /$configure_key/ == */./* ]] && invalid "--configure-key must not contain . or .. segments"
+[[ $configure_sha256 =~ ^[0-9a-f]{64}$ ]] || invalid "--configure-sha256 must be 64 lowercase hex characters"
+[[ $bundle_sha256 =~ ^[0-9a-f]{64}$ ]] || invalid "--bundle-sha256 must be 64 lowercase hex characters"
 [[ $health =~ ^https?://[^[:space:]]+$ ]] || invalid "--health must be an http(s) URL"
 [[ $keep =~ ^[1-9][0-9]?$ ]] || invalid "--keep must be 1 to 99"
 [[ $health_timeout =~ ^[1-9][0-9]{0,3}$ ]] || invalid "--health-timeout must be 1 to 9999 seconds"
@@ -145,7 +156,37 @@ find "$releases" -mindepth 1 -maxdepth 1 -name '.new-*' -exec rm -rf -- {} + 2>/
 
 find "$hooks" -mindepth 1 -maxdepth 1 -name '.new-*' -exec rm -f -- {} + 2>/dev/null
 
+# Entries not made by this script as root: before the first release the base may have been the app
+# user's, who could plant releases/<sha>, hooks/<sha>.sh and current/previous pointing at them, for
+# a rollback to configure as root. A release is kept only as a real directory owned by root; a hook
+# only as a regular root:root 0700 file. secure_dir made both directories root's, and we hold the
+# lock, so nothing can be added while we look.
+for e in "$releases"/* "$releases"/.[!.]* "$hooks"/* "$hooks"/.[!.]*; do
+  [ -e "$e" ] || [ -L "$e" ] || continue
+  st=$(stat -c '%F %u:%g %a' -- "$e") || finish 10 download-failed
+  case $e in
+    "$releases"/*) [ "${st% *}" = "directory 0:0" ] && continue ;;
+    *) [ "$st" = "regular file 0:0 700" ] && continue ;;
+  esac
+  say "removing $e (owned by $(stat -c '%U:%G' -- "$e"), $st): not made by this script"
+  rm -rf -- "$e" || finish 10 download-failed
+done
 target_of() { readlink -- "$1" 2>/dev/null; }
+# current and previous must be symlinks to releases/<hex sha>, a release kept above.
+for l in "$base/current" "$base/previous"; do
+  [ -e "$l" ] || [ -L "$l" ] || continue
+  t=$(target_of "$l")
+  if [ -L "$l" ] && [[ $t =~ ^$releases/[0-9a-f]{7,40}$ ]] && [ -d "$t" ] && [ ! -L "$t" ]; then continue; fi
+  # Whatever is not a symlink (a directory or file, whoever owns it) may hold the app's own data:
+  # never delete it, refuse instead.
+  if [ ! -L "$l" ]; then
+    say "$l is not a symlink; refusing to release over it"
+    finish 10 download-failed
+  fi
+  say "removing $l (pointing at ${t:-nothing}): not a release made by this script"
+  rm -rf -- "$l" || finish 10 download-failed
+done
+
 old_target=$(target_of "$base/current")
 prev_target=$(target_of "$base/previous")
 if [ -n "$old_target" ]; then
@@ -194,6 +235,11 @@ if ! aws s3 cp "s3://$bucket/$configure_key" "$hook_tmp" --region "$region" --on
   say "hook download failed"
   finish 10 download-failed
 fi
+got=$(sha256sum <"$hook_tmp" | cut -c1-64)
+if [ "$got" != "$configure_sha256" ]; then
+  say "the configure hook does not match its sha256 (got $got, expected $configure_sha256); refusing it"
+  finish 10 download-failed
+fi
 if ! { chown root:root -- "$hook_tmp" && chmod 700 -- "$hook_tmp" && mv -f -- "$hook_tmp" "$hook"; }; then
   finish 10 download-failed
 fi
@@ -202,6 +248,12 @@ hook_tmp=
 exec 8<"$hook" || finish 10 download-failed
 
 # --- download and unpack, unless this sha is the live release -----------------------------------
+# A bundle that cannot be used leaves nothing behind: its hook goes too, unless that hook belongs to
+# the live or the previous release (redeploying that sha).
+bundle_failed() {
+  [ "$new_dir" = "$old_target" ] || [ "$new_dir" = "$prev_target" ] || rm -f -- "$hook"
+  finish 10 download-failed
+}
 if [ "$old_target" = "$new_dir" ] && [ -d "$new_dir" ]; then
   say "$sha is already the live release; configuring and restarting it again"
   rerelease=1
@@ -212,19 +264,24 @@ else
   say "downloading s3://$bucket/$project/$app/$sha.tgz"
   if ! aws s3 cp "s3://$bucket/$project/$app/$sha.tgz" "$tgz" --region "$region" --only-show-errors 9>&-; then
     say "download failed"
-    finish 10 download-failed
+    bundle_failed
+  fi
+  got=$(sha256sum <"$tgz" | cut -c1-64)
+  if [ "$got" != "$bundle_sha256" ]; then
+    say "the bundle does not match its sha256 (got $got, expected $bundle_sha256); refusing it"
+    bundle_failed
   fi
   mkdir -m 755 -- "$staging" || finish 10 download-failed
   if ! tar -xzf "$tgz" -C "$staging" --no-same-owner --no-same-permissions; then
     say "unpack failed"
-    finish 10 download-failed
+    bundle_failed
   fi
   # Only regular files, directories and symlinks; no setuid, setgid or world-writable bits.
   # (chmod -R does not follow symlinks met while recursing.)
   odd=$(find "$staging" ! -type f ! -type d ! -type l -printf '%P\n' | head -n 5)
   if [ -n "$odd" ]; then
     say "the bundle holds entries that are not regular files, directories or symlinks: ${odd//$'\n'/ }"
-    finish 10 download-failed
+    bundle_failed
   fi
   chmod -R u-s,g-s,o-w -- "$staging" || finish 10 download-failed
   chmod 755 -- "$staging"
@@ -288,7 +345,7 @@ fi
 
 # --- roll back ---------------------------------------------------------------------------------
 if [ "$rerelease" = 1 ]; then rollback_to=$prev_target; else rollback_to=$old_target; fi
-if [ -z "$rollback_to" ] || [ ! -d "$rollback_to" ]; then
+if [ -z "$rollback_to" ] || [[ ! $rollback_to =~ ^$releases/[0-9a-f]{7,40}$ ]] || [ ! -d "$rollback_to" ] || [ -L "$rollback_to" ]; then
   say "no previous release to roll back to; manual attention needed"
   finish 13 rollback-unhealthy
 fi
@@ -297,16 +354,21 @@ say "rolling back to $rollback_sha"
 point "$base/current" "$rollback_to"
 if [ -n "$prev_target" ]; then point "$base/previous" "$prev_target"; else rm -f -- "$base/previous"; fi
 drop_new
-# Give the previous release its own settings and units back: re-run its kept hook (root-only, in
-# hooks/), again from an open file. If it is missing or fails, the health check still decides.
+# Give the previous release its own settings and units back: re-run its kept hook, again from an
+# open file, only when the release is a root:root directory not writable by group or others and
+# the hook is a regular root:root 0700 file. If it is missing, unusable or fails, the release is
+# restarted as it is and the health check still decides.
 rollback_hook=$hooks/$rollback_sha.sh
-if [ -f "$rollback_hook" ] && [ ! -L "$rollback_hook" ] && exec 7<"$rollback_hook"; then
+dir_st=$(stat -c '%F %u:%g %a' -- "$rollback_to" 2>/dev/null)
+hook_st=$(stat -c '%F %u:%g %a' -- "$rollback_hook" 2>/dev/null)
+if [ "${dir_st% *}" = "directory 0:0" ] && [ $((8#${dir_st##* } & 8#022)) -eq 0 ] \
+  && [ "$hook_st" = "regular file 0:0 700" ] && exec 7<"$rollback_hook"; then
   say "running the configure hook of $rollback_sha"
   if ! (cd -- "$rollback_to" && PROJECT=$project APP=$app SHA=$rollback_sha REGION=$region bash /dev/fd/7 "$rollback_to" </dev/null 2>&1 8<&- 9>&-); then
     say "the configure hook of $rollback_sha failed"
   fi
 else
-  say "no configure hook kept for $rollback_sha; restarting it as it is"
+  say "no usable configure hook kept for $rollback_sha; restarting it as it is"
 fi
 if restart_units && healthy "$rollback_sha"; then
   finish 12 rolled-back
