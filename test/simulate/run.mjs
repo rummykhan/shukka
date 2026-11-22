@@ -27,7 +27,9 @@ const d = synthFence({
   sesDomains: ['trendigle.com', 'mail.trendigle.com'],
 });
 const BOUNDARY = `arn:aws:iam::${A}:policy/trendigle-shukka-boundary`;
+const SSO_ADMIN = `arn:aws:iam::${A}:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_AdministratorAccess_*`;
 const boot = synthBootstrap({ project: 'trendigle', account: A, region: R });
+const bootAdmin = synthBootstrap({ project: 'trendigle', account: A, region: R, emergencyPrincipals: [SSO_ADMIN] });
 const EX = [d.executionA, d.executionB, d.executionC];
 const ALLOW_ALL = { Version: '2012-10-17', Statement: [{ Effect: 'Allow', Action: '*', Resource: '*' }] };
 const T = { 'aws:ResourceTag/Project': 'trendigle' };
@@ -203,9 +205,29 @@ const bootstrap = [
   ['publish', 'implicitDeny', 's3:PutObject', `arn:aws:s3:::cdk-orbitary-assets-${A}-${R}/abc.zip`, { 'aws:ResourceAccount': A }],
   ['publish', 'implicitDeny', 's3:DeleteObject', `arn:aws:s3:::cdk-trendigle-assets-${A}-${R}/abc.zip`, { 'aws:ResourceAccount': A }],
   ['publish', 'implicitDeny', 's3:PutBucketPolicy', `arn:aws:s3:::cdk-trendigle-assets-${A}-${R}`, { 'aws:ResourceAccount': A }],
+  // Review follow-up: the execution role reads Lambda code from its own asset bucket only.
+  ['exec', 'allowed', 's3:GetObject', `arn:aws:s3:::cdk-trendigle-assets-${A}-${R}/abc.zip`],
+  ['exec', 'allowed', 's3:GetObjectVersion', `arn:aws:s3:::cdk-trendigle-assets-${A}-${R}/abc.zip`],
+  ['exec', 'implicitDeny', 's3:GetObject', `arn:aws:s3:::cdk-hnb659fds-assets-${A}-${R}/abc.zip`],
+  ['exec', 'implicitDeny', 's3:GetObject', `arn:aws:s3:::cdk-orbitary-assets-${A}-${R}/abc.zip`],
+  ['exec', 'implicitDeny', 's3:GetObject', `arn:aws:s3:::cdk-trendiglex-assets-${A}-${R}/abc.zip`],
+  ['exec', 'implicitDeny', 's3:PutObject', `arn:aws:s3:::cdk-trendigle-assets-${A}-${R}/abc.zip`],
+  // Security access-3: who may assume the deploy and file-publishing roles (trust condition; see bootstrap.ts).
+  ['deployTrust', 'allowed', 'sts:AssumeRole', `arn:aws:iam::${A}:role/cdk-trendigle-deploy-role-${A}-${R}`, INFRA],
+  ['deployTrust', 'implicitDeny', 'sts:AssumeRole', `arn:aws:iam::${A}:role/cdk-trendigle-deploy-role-${A}-${R}`, SERVER],
+  ['deployTrust', 'implicitDeny', 'sts:AssumeRole', `arn:aws:iam::${A}:role/cdk-trendigle-deploy-role-${A}-${R}`, { 'aws:PrincipalArn': `arn:aws:iam::${A}:role/orbitary-shukka-infra` }],
+  ['deployTrust', 'implicitDeny', 'sts:AssumeRole', `arn:aws:iam::${A}:role/cdk-trendigle-deploy-role-${A}-${R}`, { 'aws:PrincipalArn': SSO_ADMIN.replace('*', 'abc123') }],
+  ['publishTrust', 'allowed', 'sts:AssumeRole', `arn:aws:iam::${A}:role/cdk-trendigle-file-publishing-role-${A}-${R}`, INFRA],
+  ['publishTrust', 'implicitDeny', 'sts:AssumeRole', `arn:aws:iam::${A}:role/cdk-trendigle-file-publishing-role-${A}-${R}`, SERVER],
+  ['deployTrustAdmin', 'allowed', 'sts:AssumeRole', `arn:aws:iam::${A}:role/cdk-trendigle-deploy-role-${A}-${R}`, { 'aws:PrincipalArn': SSO_ADMIN.replace('*', 'abc123') }],
+  ['deployTrustAdmin', 'allowed', 'sts:AssumeRole', `arn:aws:iam::${A}:role/cdk-trendigle-deploy-role-${A}-${R}`, INFRA],
+  ['deployTrustAdmin', 'implicitDeny', 'sts:AssumeRole', `arn:aws:iam::${A}:role/cdk-trendigle-deploy-role-${A}-${R}`, { 'aws:PrincipalArn': `arn:aws:iam::${A}:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_ReadOnly_x` }],
 ];
 
-const POLICIES = { exec: EX, bounded: [ALLOW_ALL], deploy: [boot.deploy], publish: [boot.filePublishing] };
+const POLICIES = {
+  exec: EX, bounded: [ALLOW_ALL], deploy: [boot.deploy], publish: [boot.filePublishing],
+  deployTrust: [boot.deployTrust], publishTrust: [boot.filePublishingTrust], deployTrustAdmin: [bootAdmin.deployTrust],
+};
 
 async function simulate([who, , action, resource, ctx]) {
   const policies = POLICIES[who];
@@ -242,7 +264,7 @@ async function report(title, list) {
   list.forEach(([who, want, action, resource], i) => {
     const pass = got[i] === want;
     if (pass) ok++; else failed++;
-    console.log(`${pass ? 'ok  ' : 'FAIL'} ${who.padEnd(7)} ${action.padEnd(38)} ${resource.split(':').pop().slice(0, 60).padEnd(60)} ${got[i]}${pass ? '' : ` (want ${want})`}`);
+    console.log(`${pass ? 'ok  ' : 'FAIL'} ${who.padEnd(16)} ${action.padEnd(38)} ${resource.split(':').pop().slice(0, 60).padEnd(60)} ${got[i]}${pass ? '' : ` (want ${want})`}`);
   });
   console.log(`${title}: ${ok} ok of ${list.length}\n`);
 }

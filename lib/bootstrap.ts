@@ -16,7 +16,7 @@
 //
 // Deploy it with CloudFormation as the stack named by bootstrapStackName(qualifier). It takes no parameters; the
 // stock template's parameters (trusted accounts, execution policies, KMS key) are fixed here on purpose.
-import { executionPolicyNames } from './boundary.js';
+import { executionPolicyNames, infraRoleName, validateProjectName } from './boundary.js';
 
 /**
  * The bootstrap version this template writes to `/cdk-bootstrap/<qualifier>/version`: that of the stock template its
@@ -25,7 +25,8 @@ import { executionPolicyNames } from './boundary.js';
  */
 export const SHUKKA_BOOTSTRAP_VERSION = 28;
 
-const PROJECT_RE = /^[a-z][a-z0-9-]{1,20}$/;
+// An IAM role or user ARN, literal or with `*` in the name; never a bare wildcard or another account form.
+const PRINCIPAL_RE = /^arn:aws[a-z-]*:iam::[0-9]{12}:(?:role|user)\/[A-Za-z0-9+=,.@_/-][A-Za-z0-9+=,.@_/*-]*$/;
 const QUALIFIER_RE = /^[a-z0-9]{1,10}$/;
 
 export interface BootstrapTemplateInputs {
@@ -33,6 +34,11 @@ export interface BootstrapTemplateInputs {
   readonly project: string;
   /** The project's CDK bootstrap qualifier, `^[a-z0-9]{1,10}$`. Default: the project name. */
   readonly qualifier?: string;
+  /**
+   * Who else may assume the deploy and file-publishing roles besides the project's infra role: ARN patterns of admin
+   * roles or users for `shukka deploy` from a laptop (`aws:PrincipalArn`, ArnLike). Default: none.
+   */
+  readonly emergencyPrincipals?: readonly string[];
 }
 
 /**
@@ -85,22 +91,30 @@ const sub = (s: string): Json => ({ 'Fn::Sub': s });
 export function bootstrapTemplate(inputs: BootstrapTemplateInputs): CloudFormationTemplate {
   const project = inputs.project;
   const qualifier = inputs.qualifier ?? project;
-  if (!PROJECT_RE.test(project)) throw new Error(`shukka: project name ${JSON.stringify(project)} must match ${PROJECT_RE}`);
+  validateProjectName(project);
   if (!QUALIFIER_RE.test(qualifier)) throw new Error(`shukka: qualifier ${JSON.stringify(qualifier)} must match ${QUALIFIER_RE}`);
+  const emergency = inputs.emergencyPrincipals ?? [];
+  for (const p of emergency) {
+    if (!PRINCIPAL_RE.test(p)) throw new Error(`shukka: emergency principal ${JSON.stringify(p)} must be an IAM role or user ARN (pattern)`);
+  }
 
   const Project = project.charAt(0).toUpperCase() + project.slice(1);
   const n = bootstrapNames(qualifier);
   const iamArn = (path: string) => `arn:\${AWS::Partition}:iam::\${AWS::AccountId}:${path}`;
   const execRoleArn = iamArn(`role/${n.executionRole}`);
   const bucketArn = `arn:\${AWS::Partition}:s3:::${n.assetBucket}`;
-  // The hyphen after the name keeps out a project whose name merely starts with this one.
+  // The project's stacks by name. The hyphen does not keep out every other project (`trendigle-x` is inside
+  // `trendigle-*`): the CLI refuses a project name that prefixes another in the account, and validateProjectName
+  // refuses names that would reach shukka's own stacks.
   const ownStacks = [project, Project].map((p) => sub(`arn:\${AWS::Partition}:cloudformation:\${AWS::Region}:\${AWS::AccountId}:stack/${p}-*/*`));
-  // Principals of this account that their own policy lets assume the role. Bounded roles may only if they are the
-  // project's infra role (boundary statement DeployThroughBootstrap); admins keep the emergency path (`shukka deploy`).
+  // Only the project's infra role, and the emergency principals named at bootstrap (`shukka deploy` from a laptop).
   const accountTrust: Json = {
     Version: '2012-10-17',
     Statement: [
-      { Effect: 'Allow', Action: ['sts:AssumeRole', 'sts:TagSession'], Principal: { AWS: { Ref: 'AWS::AccountId' } } },
+      {
+        Effect: 'Allow', Action: ['sts:AssumeRole', 'sts:TagSession'], Principal: { AWS: { Ref: 'AWS::AccountId' } },
+        Condition: { ArnLike: { 'aws:PrincipalArn': [sub(iamArn(`role/${infraRoleName(project)}`)), ...emergency] } },
+      },
     ],
   };
 

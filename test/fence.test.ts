@@ -67,7 +67,10 @@ const neutral = synthFence(NEUTRAL);
 const SPIKE_EXCEPTIONS: Record<'executionA' | 'executionB' | 'boundary', { changed: string[]; added: string[]; removed?: string[] }> = {
   executionA: {
     changed: ['LambdaEventSources'], // Create/Update/Delete fenced by lambda:FunctionArn
-    added: ['LambdaEventSourcesRead', 'LambdaEventSourcesList'], // Get by mapping ARN, List on * (no resource type)
+    added: [
+      'LambdaEventSourcesRead', 'LambdaEventSourcesList', // Get by mapping ARN, List on * (no resource type)
+      'AssetBucketRead', // shu-9bj.2: Lambda code from the project's own bootstrap asset bucket
+    ],
   },
   executionB: {
     changed: [

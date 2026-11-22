@@ -15,12 +15,15 @@ import {
   bootstrapTemplate,
   executionPolicyNames,
   inProjectPrefix,
+  fenceDocuments,
+  validateProjectName,
+  RESERVED_PROJECT_NAMES,
   shukkaSynthesizer,
   unboundedRoles,
   type RoleReader,
 } from '../lib/index.js';
 
-type Statement = { Sid?: string; Effect: string; Action: string | string[]; Resource: unknown; Condition?: Record<string, Record<string, unknown>> };
+type Statement = { Sid?: string; Effect: string; Action: string | string[]; Resource: unknown; Principal?: unknown; Condition?: Record<string, Record<string, unknown>> };
 type Resource = { Type: string; Properties: Record<string, unknown> };
 
 const tpl = bootstrapTemplate({ project: 'trendigle' });
@@ -168,14 +171,16 @@ test('shu-9bj.2: the template writes /cdk-bootstrap/<qualifier>/version at a ver
   }
 });
 
-function fakeIam(roles: { RoleName: string; boundary?: string; account?: string }[], pageSize = 2): RoleReader & { calls: string[] } {
+type FakeRole = { RoleName: string; path?: string; boundary?: string; account?: string };
+const arnOf = (r: FakeRole) => `arn:aws:iam::${r.account ?? '123456789012'}:role${r.path ?? '/'}${r.RoleName}`;
+function fakeIam(roles: FakeRole[], pageSize = 2): RoleReader & { calls: string[] } {
   const calls: string[] = [];
   return {
     calls,
     async listRoles({ Marker }) {
       calls.push(`list ${Marker ?? ''}`);
       const start = Marker ? Number(Marker) : 0;
-      const page = roles.slice(start, start + pageSize).map((r) => ({ RoleName: r.RoleName }));
+      const page = roles.slice(start, start + pageSize).map((r) => ({ RoleName: r.RoleName, Arn: arnOf(r) }));
       const next = start + pageSize;
       return next < roles.length ? { Roles: page, IsTruncated: true, Marker: String(next) } : { Roles: page, IsTruncated: false };
     },
@@ -185,7 +190,7 @@ function fakeIam(roles: { RoleName: string; boundary?: string; account?: string 
       return {
         Role: {
           RoleName,
-          Arn: `arn:aws:iam::${r.account ?? '123456789012'}:role/${RoleName}`,
+          Arn: arnOf(r),
           ...(r.boundary ? { PermissionsBoundary: { PermissionsBoundaryArn: r.boundary } } : {}),
         },
       };
@@ -214,4 +219,81 @@ test('shu-9bj.2: the unbounded-role check lists project-prefixed roles that lack
   assert.ok(!iam.calls.includes('get Orbitary-prod-Role'), 'reads only roles in the prefix');
   assert.deepEqual(await unboundedRoles(fakeIam([{ RoleName: 'trendigle-a', boundary: B }]), 'trendigle'), []);
   assert.ok(inProjectPrefix('trendigle', 'trendiglex') && inProjectPrefix('trendigle', 'Trendigle-x') && !inProjectPrefix('trendigle', 'xtrendigle'));
+});
+
+test('shu-9bj.2: the unbounded-role check matches the path and name after :role/, as the fence does', async () => {
+  const B = 'arn:aws:iam::123456789012:policy/trendigle-shukka-boundary';
+  const got = await unboundedRoles(fakeIam([
+    { RoleName: 'admin', path: '/trendigle-ops/' }, // role/trendigle-ops/admin is inside role/trendigle*
+    { RoleName: 'ops', path: '/Trendigle/', boundary: B },
+    { RoleName: 'trendigle-x', path: '/other/' }, // role/other/trendigle-x is outside the fence
+  ]), 'trendigle');
+  assert.deepEqual(got, [{ roleName: 'admin', arn: 'arn:aws:iam::123456789012:role/trendigle-ops/admin' }]);
+  assert.ok(inProjectPrefix('trendigle', 'arn:aws:iam::123456789012:role/trendigle-ops/admin'));
+  assert.ok(!inProjectPrefix('trendigle', 'arn:aws:iam::123456789012:role/other/trendigle-x'));
+});
+
+test('shu-9bj.2: reserved project names and names reaching shukka-owned stacks are refused by the template and the fence', () => {
+  const fence = (project: string) => fenceDocuments({
+    project, account: '123456789012', region: 'us-east-1', qualifier: 'q', hostedZoneId: 'ZEXAMPLE', sesDomains: ['example.com'],
+  });
+  for (const bad of ['shukka', 'cdk', 'cdktoolkit', 'aws', 'shukka-account', 'shukka-boundary', 'shukka-x', 'cdk-app', 'aws-x', 'shu', 'cdkt', 'sh']) {
+    assert.throws(() => bootstrapTemplate({ project: bad, qualifier: 'q' }), /project name/, `template refuses ${bad}`);
+    assert.throws(() => validateProjectName(bad), /project name/, `validateProjectName refuses ${bad}`);
+    assert.throws(() => fence(bad), /project name/, `fence refuses ${bad}`);
+  }
+  for (const ok of ['trendigle', 'shukkatest', 'orbitary', 'awsome']) {
+    assert.doesNotThrow(() => bootstrapTemplate({ project: ok, qualifier: 'q' }));
+    assert.doesNotThrow(() => fence(ok));
+  }
+  assert.deepEqual([...RESERVED_PROJECT_NAMES].sort(), ['aws', 'cdk', 'cdktoolkit', 'shukka']);
+});
+
+const trustOf = (t: ReturnType<typeof bootstrapTemplate>, id: string) =>
+  ((t.Resources as unknown as Record<string, Resource>)[id]!.Properties.AssumeRolePolicyDocument as { Statement: Statement[] }).Statement;
+const INFRA = 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/trendigle-shukka-infra';
+
+test('shu-9bj.2: the deploy and file-publishing roles trust only the infra role by default, plus named emergency principals', () => {
+  for (const id of ['DeploymentActionRole', 'FilePublishingRole']) {
+    const [st, ...rest] = trustOf(tpl, id);
+    assert.equal(rest.length, 0, `${id}: one trust statement`);
+    assert.deepEqual(st!.Condition, { ArnLike: { 'aws:PrincipalArn': [{ 'Fn::Sub': INFRA }] } }, `${id}: infra role only`);
+  }
+  const admin = 'arn:aws:iam::123456789012:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_Admin_*';
+  const withAdmin = bootstrapTemplate({ project: 'trendigle', emergencyPrincipals: [admin] });
+  for (const id of ['DeploymentActionRole', 'FilePublishingRole']) {
+    assert.deepEqual(trustOf(withAdmin, id)[0]!.Condition, { ArnLike: { 'aws:PrincipalArn': [{ 'Fn::Sub': INFRA }, admin] } });
+  }
+  for (const bad of ['*', 'arn:aws:iam::123456789012:*', 'arn:aws:iam::*:role/x', 'arn:aws:iam::123456789012:role/*', 'arn:aws:sts::123456789012:assumed-role/x/y']) {
+    assert.throws(() => bootstrapTemplate({ project: 'trendigle', emergencyPrincipals: [bad] }), /emergency principal/, bad);
+  }
+  // The execution role is for CloudFormation only.
+  assert.deepEqual(trustOf(tpl, 'CloudFormationExecutionRole')[0]!.Principal, { Service: 'cloudformation.amazonaws.com' });
+});
+
+test('shu-9bj.2: shukkaSynthesizer uses the project deploy role as its lookup role (there is no lookup role)', () => {
+  const app = new App();
+  const stack = new Stack(app, 'Trendigle-prod', { synthesizer: shukkaSynthesizer('trendigle'), env: { account: '123456789012', region: 'us-east-1' } });
+  new s3assets.Asset(stack, 'File', { path: new URL('./bootstrap.test.ts', import.meta.url).pathname });
+  const art = app.synth().getStackByName('Trendigle-prod');
+  assert.equal(art.lookupRole?.arn, 'arn:${AWS::Partition}:iam::123456789012:role/cdk-trendigle-deploy-role-123456789012-us-east-1');
+  assert.equal(art.lookupRole?.arn, art.assumeRoleArn, 'the role cdk diff reads templates with is the deploy role');
+  assert.equal(art.lookupRole?.bootstrapStackVersionSsmParameter, '/cdk-bootstrap/trendigle/version');
+  assert.ok(SHUKKA_BOOTSTRAP_VERSION >= (art.lookupRole?.requiresBootstrapStackVersion ?? 0));
+  // The deploy role can read what cdk diff reads.
+  const allow = statementsOf('DeploymentActionRole').find((s) => s.Sid === 'OwnStacksOnly')!;
+  for (const a of ['cloudformation:DescribeStacks', 'cloudformation:GetTemplate']) assert.ok(list(allow.Action).includes(a));
+});
+
+test('shu-9bj.2: the execution policy reads Lambda code from the project asset bucket only', () => {
+  const docs = fenceDocuments({
+    project: 'trendigle', account: '123456789012', region: 'us-east-1', qualifier: 'trendigle', hostedZoneId: 'ZEXAMPLE', sesDomains: ['example.com'],
+  });
+  const st = docs.executionA.Statement.find((s) => s.Sid === 'AssetBucketRead');
+  assert.ok(st);
+  assert.deepEqual(st, {
+    Sid: 'AssetBucketRead', Effect: 'Allow', Action: ['s3:GetObject', 's3:GetObjectVersion'],
+    Resource: 'arn:aws:s3:::cdk-trendigle-assets-123456789012-us-east-1/*',
+  });
+  assert.ok(!docs.boundary.Statement.some((s) => s.Sid === 'AssetBucketRead'), 'not in the boundary');
 });
