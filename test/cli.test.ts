@@ -4,7 +4,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any -- SDK commands and fakes are loosely typed on purpose */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -734,15 +734,50 @@ test('shu-5ix: deploy builds from a fresh worktree of origin/main: skip-worktree
   assert.match(untracked.err, /cannot read .*local\/shukka\.json/);
 }));
 
-test('shu-5ix: temporary directories are removed when a command ends', withTmp(async (tmp) => {
+test('shu-5ix, shu-9bj.11: temporary directories are removed when a command ends, even while another process creates shukka-* entries in the system tmpdir', withTmp(async (tmp) => {
   const { dir } = consumer(tmp);
-  const before = new Set(readdirSync(tmpdir()).filter((n) => n.startsWith('shukka-')));
-  const r = await cli(['deploy', '--dry-run'], { cwd: dir, keepTemp: false });
-  assert.equal(r.code, 0, r.err);
-  const b = await cli(projectArgs(), { cwd: dir, keepTemp: false });
-  assert.equal(b.code, 0, b.err);
-  const left = readdirSync(tmpdir()).filter((n) => n.startsWith('shukka-') && !before.has(n));
-  assert.deepEqual(left, []);
+  // Another process (a sibling gate, another test file) making shukka-* entries in the shared system tmpdir
+  // throughout the commands: the check must not see them.
+  const system = tmpdir();
+  const noise = spawn(process.execPath, ['-e', `
+    const { mkdirSync } = require('node:fs');
+    const { join } = require('node:path');
+    let i = 0;
+    const make = () => mkdirSync(join(${JSON.stringify(system)}, 'shukka-noise-' + process.pid + '-' + i++));
+    make();
+    process.stdout.write('ready\\n');
+    setInterval(make, 5);
+  `], { stdio: ['ignore', 'pipe', 'inherit'] });
+  const own = join(tmp, 'tmpdir');
+  mkdirSync(own);
+  const savedTmp = process.env.TMPDIR;
+  let noiseMade = 0;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      noise.stdout!.once('data', () => resolve());
+      noise.once('exit', (code) => reject(new Error(`noise process exited (${code}) before it started`)));
+    });
+    // The commands' temp directories go to a tmpdir only they use (os.tmpdir() reads TMPDIR on every call).
+    process.env.TMPDIR = own;
+    assert.equal(tmpdir(), own);
+    const r = await cli(['deploy', '--dry-run'], { cwd: dir, keepTemp: false });
+    assert.equal(r.code, 0, r.err);
+    const b = await cli(projectArgs(), { cwd: dir, keepTemp: false });
+    assert.equal(b.code, 0, b.err);
+    assert.deepEqual(readdirSync(own).filter((n) => n.startsWith('shukka-')), []);
+  } finally {
+    if (savedTmp === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = savedTmp;
+    const exited = new Promise((resolve) => noise.once('exit', resolve));
+    noise.kill();
+    if (noise.exitCode === null && noise.signalCode === null) await exited;
+    for (const n of readdirSync(system)) {
+      if (!n.startsWith(`shukka-noise-${noise.pid}-`)) continue;
+      noiseMade++;
+      rmSync(join(system, n), { recursive: true, force: true });
+    }
+  }
+  assert.ok(noiseMade > 1, 'the other process kept making shukka-* entries while the commands ran');
 }));
 
 // ---------- security: what the cdk child, the fence and the project list may read ----------
