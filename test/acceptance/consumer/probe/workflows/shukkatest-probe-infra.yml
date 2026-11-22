@@ -1,0 +1,17 @@
+# Copied into .github/workflows/ by the acceptance suite on the probe branch only, then removed.
+# Calls shukka's own infra.yml in deploy mode from a branch push, a tag push and a pull request: the
+# workflow condition (job_workflow_ref = infra.yml at a v1 tag) is met, so a refusal proves the
+# subject condition (main only). The job must fail at "assume role" with AccessDenied, before any
+# cdk deploy. infra.yml's input names are not in the design; asked on shu-9zr's mailbox.
+name: shukkatest-probe-infra
+on:
+  push:
+    branches: ['shukkatest-probe-**']
+    tags: ['shukkatest-probe-**']
+  pull_request:
+jobs:
+  infra:
+    uses: rummykhan/shukka/.github/workflows/infra.yml@__SHUKKA_REF__
+    permissions: { contents: read, id-token: write, pull-requests: write }
+    with:
+      __INFRA_MODE_INPUT__: deploy
