@@ -88,12 +88,31 @@ const HANDLED = new Set([
   'AWS::S3::Bucket', 'Custom::S3BucketNotifications', 'AWS::SQS::Queue', 'AWS::SNS::Topic', 'AWS::SNS::Subscription',
   'AWS::Logs::SubscriptionFilter', 'AWS::CloudFormation::Stack',
 ]);
-// Services CDK itself grants without a source condition (EventBridge to a topic or key, a load balancer or Secrets
-// Manager rotation to a function, CloudTrail and log delivery to a bucket). They pass without one; a source
-// condition that names anything but the project still stops. Every other service needs the condition.
-const UNCONDITIONED_SERVICES = new Set([
-  'events.amazonaws.com', 'elasticloadbalancing.amazonaws.com', 'secretsmanager.amazonaws.com', 'cloudtrail.amazonaws.com', 'delivery.logs.amazonaws.com',
+// Grants CDK itself makes without a source condition, by service and where: EventBridge to a topic (aws-events-targets
+// SnsTopic; its SqsQueue sets aws:SourceArn, so queues need one), a load balancer or Secrets Manager rotation to a
+// function, CloudTrail and log delivery to a bucket. They pass there without one; a source condition that names
+// anything but the project still stops. Every other service, or place, needs the condition.
+/** @type {Record<string, string[]>} */
+const UNCONDITIONED = {
+  'events.amazonaws.com': ['AWS::SNS::TopicPolicy', 'AWS::SNS::TopicInlinePolicy'],
+  'elasticloadbalancing.amazonaws.com': ['AWS::Lambda::Permission'],
+  'secretsmanager.amazonaws.com': ['AWS::Lambda::Permission'],
+  'cloudtrail.amazonaws.com': ['AWS::S3::BucketPolicy'],
+  'delivery.logs.amazonaws.com': ['AWS::S3::BucketPolicy'],
+};
+const unconditioned = (/** @type {string} */ service, /** @type {string} */ where) => (UNCONDITIONED[service] ?? []).includes(where);
+// Resource types whose identifiers (Ref, and attributes ending in Arn or listed in OWN_ATTRIBUTES) AWS assigns inside
+// the account when the template creates them: a Ref or Fn::GetAtt of one is the project's own. Anything else (a
+// custom resource, whose physical id and data its handler chooses, or any other type) cannot be worked out.
+const OWN_TYPES = new Set([
+  'AWS::SQS::Queue', 'AWS::SNS::Topic', 'AWS::Lambda::Function', 'AWS::Lambda::Alias', 'AWS::Lambda::Version', 'AWS::S3::Bucket',
+  'AWS::Logs::LogGroup', 'AWS::Logs::Destination', 'AWS::Kinesis::Stream', 'AWS::KinesisFirehose::DeliveryStream', 'AWS::DynamoDB::Table',
+  'AWS::DynamoDB::GlobalTable', 'AWS::IAM::Role', 'AWS::Events::Rule', 'AWS::Events::EventBus', 'AWS::StepFunctions::StateMachine',
+  'AWS::CloudFront::Distribution', 'AWS::ApiGateway::RestApi', 'AWS::ApiGateway::Stage', 'AWS::ApiGatewayV2::Api', 'AWS::ApiGatewayV2::Stage', 'AWS::Cognito::UserPool', 'AWS::CloudWatch::Alarm',
+  'AWS::SecretsManager::Secret', 'AWS::KMS::Key', 'AWS::ElasticLoadBalancingV2::LoadBalancer', 'AWS::ElasticLoadBalancingV2::TargetGroup',
+  'AWS::SES::ReceiptRuleSet', 'AWS::SES::ReceiptRule',
 ]);
+const OWN_ATTRIBUTES = new Set(['QueueUrl', 'QueueName', 'TopicName', 'RootResourceId', 'ApiId', 'Id', 'Name']);
 // Key policies grant a service only the key's use, inside requests that already name one of the project's resources:
 // no source condition is needed there (CDK grants s3 and events on keys without one).
 const NO_SOURCE_NEEDED = new Set(['AWS::KMS::Key']);
@@ -118,7 +137,7 @@ const BUCKET_SAFE = new Set([
  * @typedef {'safe' | 'stopped' | 'allowed' | 'unreadable'} Verdict
  * @typedef {{ verdict: Verdict, code: 0 | 1, found: string[], templates: number }} PolicyResult
  * @typedef {{ account: string, repos?: string[], mailDomains?: string[] }} PolicyOptions
- * @typedef {{ file: string, template: any }} Template
+ * @typedef {{ file: string, template: any, parent?: { t: Template, params: any }, children?: Map<string, Template> }} Template
  * @typedef {{ account: string, t: Template, exports: Map<string, { value: any, t: Template }>, depth: number, mailDomains?: Set<string> }} Ctx
  * @typedef {import('./assembly.mjs').FileAsset} Asset
  */
@@ -192,13 +211,20 @@ function ref(name, ctx) {
     // Regions only appear in service principals and resource ARNs here; any one will do.
     case 'AWS::Region': return 'aws-region';
     case 'AWS::NoValue': return NO_VALUE;
-    default: return isObject(ctx.t.template?.Resources?.[name]) ? `<Ref ${name}>` : new Unknown(`Ref ${name}`);
+    default: {
+      const resource = ctx.t.template?.Resources?.[name];
+      if (isObject(resource)) return OWN_TYPES.has(resource.Type) ? `<Ref ${name}>` : new Unknown(`Ref ${name}`);
+      // A nested stack's parameter is what its parent stack passes.
+      const passed = ctx.t.parent?.params;
+      if (isObject(ctx.t.template?.Parameters?.[name]) && isObject(passed) && name in passed) return resolve(passed[name], { ...ctx, t: /** @type {any} */ (ctx.t.parent).t });
+      return new Unknown(`Ref ${name}`);
+    }
   }
 }
 
 /**
- * Fn::GetAtt: a role's Arn is a role of the account; a CloudFront origin access identity's canonical user; any other
- * attribute of the template's own resources is the project's.
+ * Fn::GetAtt: a role's Arn is a role of the account; a CloudFront origin access identity's canonical user; a nested
+ * stack's output; an ARN or identifier of a type on OWN_TYPES is the project's; anything else cannot be worked out.
  * @param {string} id
  * @param {string} attr
  * @param {Ctx} ctx
@@ -209,7 +235,14 @@ function getAtt(id, attr, ctx) {
   if (!isObject(resource)) return new Unknown(`Fn::GetAtt ${id}.${attr}`);
   if (resource.Type === 'AWS::IAM::Role' && attr === 'Arn') return `arn:aws:iam::${ctx.account}:role/${id}`;
   if (resource.Type === 'AWS::CloudFront::CloudFrontOriginAccessIdentity' && attr === 'S3CanonicalUserId') return new Oai(id);
-  return `<Fn::GetAtt ${id}.${attr}>`;
+  if (resource.Type === 'AWS::CloudFormation::Stack' && attr.startsWith('Outputs.')) {
+    // A nested stack's output is its template's Output value, worked out in that template.
+    const child = ctx.t.children?.get(id);
+    const output = child?.template?.Outputs?.[attr.slice('Outputs.'.length)];
+    return child && isObject(output) ? resolve(output.Value, { ...ctx, t: child }) : new Unknown(`Fn::GetAtt ${id}.${attr}`);
+  }
+  if (OWN_TYPES.has(resource.Type) && (attr.endsWith('Arn') || OWN_ATTRIBUTES.has(attr))) return `<Fn::GetAtt ${id}.${attr}>`;
+  return new Unknown(`Fn::GetAtt ${id}.${attr}`);
 }
 
 /**
@@ -520,7 +553,7 @@ function sourceOf(condition, account) {
 function resourcePrincipalProblem(type, value, condition, account, resourceType) {
   if (type === 'Service' && typeof value === 'string' && SERVICE.test(value)) {
     const source = sourceOf(condition, account);
-    if (source === 'pinned' || (source === 'none' && (NO_SOURCE_NEEDED.has(resourceType) || UNCONDITIONED_SERVICES.has(value)))) return null;
+    if (source === 'pinned' || (source === 'none' && (NO_SOURCE_NEEDED.has(resourceType) || unconditioned(value, resourceType)))) return null;
     return source === 'other'
       ? `allows Service ${value} with a source condition that is not pinned to account ${account} or the project's resources`
       : `allows Service ${value} without aws:SourceAccount or aws:SourceArn pinned to account ${account} or the project's resources`;
@@ -588,7 +621,7 @@ function lambdaPermissionProblems(props, type, account) {
       const arnOk = sourceArn.length === 0 || sourceArn.every((v) => ownResource(v, account));
       const given = sourceAccount.length > 0 || sourceArn.length > 0;
       if (!accountOk || !arnOk) problems.push(`allows Service ${value} with a SourceAccount or SourceArn that is not account ${account} or the project's`);
-      else if (!given && !UNCONDITIONED_SERVICES.has(value)) problems.push(`allows Service ${value} without SourceAccount ${account} or a SourceArn of the project's`);
+      else if (!given && !unconditioned(value, type)) problems.push(`allows Service ${value} without SourceAccount ${account} or a SourceArn of the project's`);
     } else if (value !== account && parseArn(value)?.account !== account) {
       problems.push(`allows ${value}, outside account ${account}`);
     }
@@ -884,6 +917,8 @@ export function checkPolicies(dir, options) {
       if (!nested) {
         problems.push(`policy-guard: ${t.file}: ${id} (AWS::CloudFormation::Stack): the nested stack's template (${show(url)}) is not a JSON template in the assembly; it cannot be checked`);
       } else if (!templates.has(nested.file)) {
+        (t.children ??= new Map()).set(id, nested);
+        nested.parent = { t, params: resource.Properties?.Parameters };
         templates.set(nested.file, nested);
         others.delete(nested.file);
         queue.push(nested);

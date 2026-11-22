@@ -222,6 +222,8 @@ const extra = [
   ['bounded', 'explicitDeny', 'dynamodb:PutResourcePolicy', `arn:aws:dynamodb:${R}:${A}:table/trendigle_prod_posts`],
   ['bounded', 'explicitDeny', 'logs:PutSubscriptionFilter', `arn:aws:logs:${R}:${A}:log-group:/trendigle/prod/app`],
   ['bounded', 'explicitDeny', 'logs:PutDestinationPolicy', `arn:aws:logs:${R}:${A}:destination:trendigle-x`],
+  ['bounded', 'explicitDeny', 'ssm:PutResourcePolicy', `arn:aws:ssm:${R}:${A}:parameter/trendigle/prod/x`],
+  ['bounded', 'explicitDeny', 'ssm:DeleteResourcePolicy', `arn:aws:ssm:${R}:${A}:parameter/trendigle/prod/x`],
   ['bounded', 'allowed', 's3:PutObject', `arn:aws:s3:::trendigle-prod-media-${A}/u/x.png`],
   ['bounded', 'allowed', 'sqs:SendMessage', `arn:aws:sqs:${R}:${A}:trendigle-prod-events`],
   ['bounded', 'allowed', 'sns:Publish', `arn:aws:sns:${R}:${A}:trendigle-prod-alerts`],

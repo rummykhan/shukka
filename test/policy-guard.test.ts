@@ -12,6 +12,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse } from 'yaml';
 import { App, Duration, NestedStack, RemovalPolicy, Stack } from 'aws-cdk-lib';
+import * as apigw from 'aws-cdk-lib/aws-apigateway';
 import * as cloudfront from 'aws-cdk-lib/aws-cloudfront';
 import * as origins from 'aws-cdk-lib/aws-cloudfront-origins';
 import * as iam from 'aws-cdk-lib/aws-iam';
@@ -244,6 +245,10 @@ const resourceCases: Array<[string, Loose, RegExp | null]> = [
   ['CDK\'s bucket notifications to another account\'s function stop', { Type: 'Custom::S3BucketNotifications', Properties: { ServiceToken: 'x', BucketName: { Ref: 'Own' }, NotificationConfiguration: { LambdaFunctionConfigurations: [{ Events: ['s3:ObjectCreated:*'], LambdaFunctionArn: `arn:aws:lambda:us-east-1:${OUTSIDER}:function:f` }] } } }, /notification to arn:aws:lambda:us-east-1:999999999999:function:f/],
   ['a KMS key policy for a service without a source condition passes (the key is only used through the project\'s resources)', { Type: 'AWS::KMS::Key', Properties: { KeyPolicy: { Statement: [{ Effect: 'Allow', Principal: { Service: 's3.amazonaws.com' }, Action: ['kms:Decrypt', 'kms:GenerateDataKey*'], Resource: '*' }] } } }, null],
   ['a topic policy for EventBridge without a condition passes (CDK grants it so)', policy('AWS::SNS::TopicPolicy', { Service: 'events.amazonaws.com' }), null],
+  ['a queue policy for EventBridge without a source condition stops (CDK pins queues with aws:SourceArn)', policy('AWS::SQS::QueuePolicy', { Service: 'events.amazonaws.com' }), /allows Service events\.amazonaws\.com without aws:SourceAccount/],
+  ['a queue policy for EventBridge pinned to the project\'s rule passes', policy('AWS::SQS::QueuePolicy', { Service: 'events.amazonaws.com' }, 'Allow', { ArnEquals: { 'aws:SourceArn': { 'Fn::GetAtt': ['Rule', 'Arn'] } } }), null],
+  ['a bucket policy for EventBridge without a source condition stops (only topics are exempt)', policy('AWS::S3::BucketPolicy', { Service: 'events.amazonaws.com' }), /allows Service events\.amazonaws\.com without/],
+  ['a Lambda permission for CloudTrail without a source stops (that exemption is for buckets only)', permission('cloudtrail.amazonaws.com'), /allows Service cloudtrail\.amazonaws\.com without SourceAccount/],
   ['a topic policy for EventBridge with another account\'s source stops', policy('AWS::SNS::TopicPolicy', { Service: 'events.amazonaws.com' }, 'Allow', { ArnEquals: { 'aws:SourceArn': `arn:aws:events:us-east-1:${OUTSIDER}:rule/r` } }), /with a source condition that is not pinned/],
   ['a log bucket policy for the region\'s Elastic Load Balancing account passes', policy('AWS::S3::BucketPolicy', { AWS: 'arn:aws:iam::127311923021:root' }), null],
   ['a queue policy for the Elastic Load Balancing account stops (only log buckets)', policy('AWS::SQS::QueuePolicy', { AWS: 'arn:aws:iam::127311923021:root' }), /outside account/],
@@ -277,7 +282,7 @@ const resourceCases: Array<[string, Loose, RegExp | null]> = [
 for (const [name, resource, expected] of resourceCases) {
   test(`shu-9bj.6: resource policy: ${name}`, () => {
     // Own: a resource of the project's that values can name (Ref Own, Fn::GetAtt Own.Arn).
-    const r = check(assembly({ Stack: one({ P: resource, Own: { Type: 'AWS::SQS::Queue' } }) }));
+    const r = check(assembly({ Stack: one({ P: resource, Own: { Type: 'AWS::SQS::Queue' }, Rule: { Type: 'AWS::Events::Rule' } }) }));
     if (expected === null) {
       assert.deepEqual(r.found, []);
     } else {
@@ -358,6 +363,7 @@ test('shu-9bj.6: a clean CDK app passes: Lambda, logRetention, BucketDeployment,
   const legacy = new s3.Bucket(data, 'Legacy');
   new cloudfront.Distribution(data, 'LegacyCdn', { defaultBehavior: { origin: origins.S3BucketOrigin.withOriginAccessIdentity(legacy) } });
   const worker = new lambda.Function(data, 'Worker', { runtime: lambda.Runtime.NODEJS_22_X, handler: 'index.handler', code: lambda.Code.fromInline('exports.handler = async () => {}'), logRetention: logs.RetentionDays.ONE_WEEK, timeout: Duration.seconds(10) });
+  new apigw.LambdaRestApi(data, 'Api', { handler: worker });
   const topic = new sns.Topic(data, 'Events');
   topic.addSubscription(new subs.SqsSubscription(new sqs.Queue(data, 'Queue', { enforceSSL: true })));
   topic.addSubscription(new subs.LambdaSubscription(worker));
@@ -588,9 +594,9 @@ test('shu-9bj.6: executionC denies re-trusting, deleting or adding policies to <
   const writes = d.boundary.Statement.find((s) => s.Sid === 'NoPolicyWrites');
   assert.ok(writes && writes.Effect === 'Deny' && writes.Resource === '*');
   assert.deepEqual(writes.Action, [
-    's3:*BucketPolicy', 's3:Put*Acl', 's3:*PublicAccessBlock', 's3:PutBucketOwnership*', 'sqs:AddPermission', 'sqs:Set*',
-    'sns:AddPermission', 'sns:SetTopicAttributes', 'sns:Subscribe', 'lambda:Add*Permission', 'lambda:*FunctionUrlConfig',
-    'dynamodb:PutResource*', 'logs:PutSubscriptionFilter', 'logs:PutDestination*',
+    's3:*BucketPolicy', 's3:Put*Acl', 's3:*PublicAccessBlock', 's3:PutBucketOwn*', 'sqs:AddPermission', 'sqs:Set*',
+    'sns:AddPermission', 'sns:SetTopicAttr*', 'sns:Subscribe', 'lambda:Add*Permission', 'lambda:*FunctionUrlConfig',
+    'dynamodb:PutResource*', 'logs:PutSubscriptionFilter', 'logs:PutDestination*', 'ssm:*ResourcePolicy',
   ]);
   for (const doc of [d.executionA, d.executionB, d.executionC]) assert.ok(!doc.Statement.some((s) => s.Sid === 'NoPolicyWrites'), 'the execution role still applies template policies');
   assert.match(readFileSync(join(root, 'test', 'simulate', 'run.mjs'), 'utf8'), /'bounded', 'explicitDeny', 's3:PutBucketPolicy'/);
@@ -705,4 +711,45 @@ test('shu-9bj.6: the workflow steps pass the fence\'s mail domains to the policy
   assert.equal(none.code, 1, none.out);
   const diff = await runStep('diff', STEP, asm, { 'steps.config.outputs.account': ACCOUNT, 'steps.config.outputs.mail_domains': 'trendigle.com' });
   assert.equal(readFileSync(join(diff.temp, 'shukka-pr-diff', 'policy-guard-status'), 'utf8').trim(), '0', diff.out);
+});
+
+test('shu-9bj.6: review I: a custom resource\'s physical id or attributes are never the project\'s own; a nested stack\'s output and parameter are followed', () => {
+  const r = check(join(root, 'test', 'fixtures', 'policy', 'I'));
+  assert.equal(r.code, 1);
+  const found = r.found.join('\n');
+  assert.match(found, /F \(AWS::Logs::SubscriptionFilter\): log events go to <Ref Cr> is not one of the project's resources/);
+  assert.match(found, /Sub \(AWS::SNS::Subscription\): sqs subscription to <Fn::GetAtt Cr\.Endpoint> is not one of the project's resources/);
+  assert.match(found, /P \(AWS::Lambda::Permission\): allows Service s3\.amazonaws\.com with a SourceAccount or SourceArn that is not account/);
+  // Any type off the list, and any attribute that is not an ARN or identifier, is unknown too.
+  const other = check(assembly({ S: one({
+    Param: { Type: 'AWS::SSM::Parameter', Properties: { Type: 'String', Value: `arn:aws:sqs:us-east-1:${OUTSIDER}:q` } },
+    Q: { Type: 'AWS::SQS::Queue' },
+    A: { Type: 'AWS::SNS::Subscription', Properties: { TopicArn: 't', Protocol: 'sqs', Endpoint: { 'Fn::GetAtt': ['Param', 'Value'] } } },
+    B: { Type: 'AWS::SNS::Subscription', Properties: { TopicArn: 't', Protocol: 'sqs', Endpoint: { 'Fn::GetAtt': ['Q', 'Arn'] } } },
+  }) }));
+  assert.match(other.found.join('\n'), /A \(AWS::SNS::Subscription\): sqs subscription to <Fn::GetAtt Param\.Value>/);
+  assert.doesNotMatch(other.found.join('\n'), /B \(AWS::SNS::Subscription\)/);
+
+  // A nested stack: the parent passes its queue's ARN as a parameter, and reads the nested queue's ARN as an output.
+  const nestedUrl = { 'Fn::Join': ['', ['https://s3.', { Ref: 'AWS::Region' }, '.', { Ref: 'AWS::URLSuffix' }, '/', { 'Fn::Sub': 'cdk-trendigle-assets-${AWS::AccountId}-${AWS::Region}' }, '/n.json']] };
+  const parent = one({
+    PQ: { Type: 'AWS::SQS::Queue' },
+    Child: { Type: 'AWS::CloudFormation::Stack', Properties: { TemplateURL: nestedUrl, Parameters: { Target: { 'Fn::GetAtt': ['PQ', 'Arn'] }, Outside: `arn:aws:sqs:us-east-1:${OUTSIDER}:q` } } },
+    FromChild: { Type: 'AWS::SNS::Subscription', Properties: { TopicArn: 't', Protocol: 'sqs', Endpoint: { 'Fn::GetAtt': ['Child', 'Outputs.QueueArn'] } } },
+  });
+  const child = {
+    Parameters: { Target: { Type: 'String' }, Outside: { Type: 'String' } },
+    Resources: {
+      CQ: { Type: 'AWS::SQS::Queue' },
+      ToParent: { Type: 'AWS::SNS::Subscription', Properties: { TopicArn: 't', Protocol: 'sqs', Endpoint: { Ref: 'Target' } } },
+      ToOutside: { Type: 'AWS::SNS::Subscription', Properties: { TopicArn: 't', Protocol: 'sqs', Endpoint: { Ref: 'Outside' } } },
+    },
+    Outputs: { QueueArn: { Value: { 'Fn::GetAtt': ['CQ', 'Arn'] } } },
+  };
+  const dir = assembly({ Parent: parent }, { 'Parent.assets': { type: 'cdk:asset-manifest', properties: { file: 'Parent.assets.json' } } });
+  writeFileSync(join(dir, 'Child.nested.template.json'), JSON.stringify(child));
+  writeFileSync(join(dir, 'Parent.assets.json'), JSON.stringify({ version: '48.0.0', files: { n: { source: { path: 'Child.nested.template.json', packaging: 'file' }, destinations: { d: { bucketName: 'cdk-trendigle-assets-${AWS::AccountId}-${AWS::Region}', objectKey: 'n.json' } } } } }));
+  const nested = check(dir).found.join('\n');
+  assert.doesNotMatch(nested, /FromChild|ToParent/, nested);
+  assert.match(nested, /ToOutside \(AWS::SNS::Subscription\): sqs subscription to arn:aws:sqs:us-east-1:999999999999:q/);
 });

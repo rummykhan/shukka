@@ -422,11 +422,13 @@ export function fenceDocuments(inputs: FenceInputs): FenceDocuments {
     {
       Sid: 'NoPolicyWrites', Effect: 'Deny', Resource: '*',
       Action: [
-        // Wildcards keep the boundary under 6,144 characters: sqs:Set* is SetQueueAttributes, logs:PutDestination* also
-        // denies creating a destination for another account, lambda:*FunctionUrlConfig also its Get and Delete.
-        's3:*BucketPolicy', 's3:Put*Acl', 's3:*PublicAccessBlock', 's3:PutBucketOwnership*', 'sqs:AddPermission', 'sqs:Set*',
-        'sns:AddPermission', 'sns:SetTopicAttributes', 'sns:Subscribe', 'lambda:Add*Permission', 'lambda:*FunctionUrlConfig',
-        'dynamodb:PutResource*', 'logs:PutSubscriptionFilter', 'logs:PutDestination*',
+        // Wildcards keep the boundary under 6,144 characters: sqs:Set* is SetQueueAttributes, s3:PutBucketOwn* is
+        // PutBucketOwnershipControls, sns:SetTopicAttr* is SetTopicAttributes, logs:PutDestination* also denies creating a
+        // destination for another account, lambda:*FunctionUrlConfig also its Get and Delete, ssm:*ResourcePolicy is Put,
+        // Delete and GetResourcePolicies (parameter sharing).
+        's3:*BucketPolicy', 's3:Put*Acl', 's3:*PublicAccessBlock', 's3:PutBucketOwn*', 'sqs:AddPermission', 'sqs:Set*',
+        'sns:AddPermission', 'sns:SetTopicAttr*', 'sns:Subscribe', 'lambda:Add*Permission', 'lambda:*FunctionUrlConfig',
+        'dynamodb:PutResource*', 'logs:PutSubscriptionFilter', 'logs:PutDestination*', 'ssm:*ResourcePolicy',
       ],
     },
   ];
