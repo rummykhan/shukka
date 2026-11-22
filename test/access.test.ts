@@ -109,11 +109,14 @@ for (const [kind, r] of Object.entries(ROLES)) {
     assert.deepEqual(Object.keys((st.Condition as Json).StringEquals as Json).sort(), [AUD, SUB].sort());
   });
 
-  test(`shu-7nw: ${kind} role trust requires job_workflow_ref StringLike ${r.file}@refs/tags/v1*`, () => {
+  test(`shu-7nw: ${kind} role trust requires job_workflow_ref StringLike ${r.file}@refs/tags/v1 or v1.*`, () => {
     const st = trust(synth().template, r.name);
     const like = (st.Condition as Json).StringLike as Json;
     assert.deepEqual(Object.keys(like), [WF]);
-    assert.equal(like[WF], `rummykhan/shukka/.github/workflows/${r.file}@refs/tags/v1*`);
+    assert.deepEqual(like[WF], [
+      `rummykhan/shukka/.github/workflows/${r.file}@refs/tags/v1`,
+      `rummykhan/shukka/.github/workflows/${r.file}@refs/tags/v1.*`,
+    ]);
   });
 
   test(`shu-7nw: ${kind} role trusts the imported provider as its only principal`, () => {
@@ -122,12 +125,39 @@ for (const [kind, r] of Object.entries(ROLES)) {
   });
 }
 
-test('shu-7nw: shukkaVersions narrows the job_workflow_ref tag pattern', () => {
-  const { template } = synth({ shukkaVersions: 'v1.2*' });
+// IAM StringLike: '*' any run of characters, '?' one character, everything else literal.
+function like(pattern: string, value: string): boolean {
+  const re = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.');
+  return new RegExp(`^${re}$`).test(value);
+}
+const likeAny = (patterns: unknown, value: string) => ([patterns].flat() as string[]).some((p) => like(p, value));
+
+test('shu-7nw: the default version patterns match v1 and its releases, not v10 or v1foo', () => {
+  const { template } = synth();
   for (const r of Object.values(ROLES)) {
-    const like = (trust(template, r.name).Condition as Json).StringLike as Json;
-    assert.equal(like[WF], `rummykhan/shukka/.github/workflows/${r.file}@refs/tags/v1.2*`);
+    const pats = ((trust(template, r.name).Condition as Json).StringLike as Json)[WF];
+    const ref = (tag: string) => `rummykhan/shukka/.github/workflows/${r.file}@refs/tags/${tag}`;
+    for (const ok of ['v1', 'v1.0.0', 'v1.4.2', 'v1.0.0-rc.3']) assert.ok(likeAny(pats, ref(ok)), `${r.name} trusts ${ok}`);
+    for (const no of ['v10', 'v10.0.0', 'v1foo', 'v1-rc', 'v2', 'v2.0.0', 'v']) assert.ok(!likeAny(pats, ref(no)), `${r.name} refuses ${no}`);
+    const other = r.file === 'infra.yml' ? 'ec2.yml' : 'infra.yml';
+    assert.ok(!likeAny(pats, `rummykhan/shukka/.github/workflows/${other}@refs/tags/v1`), `${r.name} refuses ${other}`);
+    assert.ok(!likeAny(pats, `rummykhan/shukka/.github/workflows/${r.file}@refs/heads/main`), `${r.name} refuses branches`);
   }
+});
+
+test('shu-7nw: shukkaVersions selects another release line and builds both patterns', () => {
+  const { template } = synth({ shukkaVersions: 'v2' });
+  for (const r of Object.values(ROLES)) {
+    const pats = ((trust(template, r.name).Condition as Json).StringLike as Json)[WF];
+    assert.deepEqual(pats, [
+      `rummykhan/shukka/.github/workflows/${r.file}@refs/tags/v2`,
+      `rummykhan/shukka/.github/workflows/${r.file}@refs/tags/v2.*`,
+    ]);
+    assert.ok(!likeAny(pats, `rummykhan/shukka/.github/workflows/${r.file}@refs/tags/v1.0.0`));
+  }
+  const narrow = ((trust(synth({ shukkaVersions: 'v1.2' }).template, 'demo-shukka-infra').Condition as Json).StringLike as Json)[WF];
+  assert.ok(likeAny(narrow, 'rummykhan/shukka/.github/workflows/infra.yml@refs/tags/v1.2.3'));
+  assert.ok(!likeAny(narrow, 'rummykhan/shukka/.github/workflows/infra.yml@refs/tags/v1.20.0'));
 });
 
 test('shu-7nw: allowBranch is off by default and, when set, adds exactly one branch ref', () => {
@@ -135,7 +165,8 @@ test('shu-7nw: allowBranch is off by default and, when set, adds exactly one bra
   for (const r of Object.values(ROLES)) {
     const like = (trust(template, r.name).Condition as Json).StringLike as Json;
     assert.deepEqual(like[WF], [
-      `rummykhan/shukka/.github/workflows/${r.file}@refs/tags/v1*`,
+      `rummykhan/shukka/.github/workflows/${r.file}@refs/tags/v1`,
+      `rummykhan/shukka/.github/workflows/${r.file}@refs/tags/v1.*`,
       `rummykhan/shukka/.github/workflows/${r.file}@refs/heads/rc-test`,
     ]);
   }
@@ -154,8 +185,10 @@ test('shu-7nw: no trust pattern starts with * or contains a wildcard outside the
         assert.ok(!v.startsWith('?'), `${v} must not start with ?`);
       }
     }
-    const like = cond.StringLike as Record<string, string>;
-    assert.equal((like[WF] as string).indexOf('*'), (like[WF] as string).length - 1);
+    for (const p of (cond.StringLike as Record<string, string[]>)[WF] as string[]) {
+      assert.ok(p.indexOf('*') === -1 || p.indexOf('*') === p.length - 1, `${p}: only a trailing wildcard`);
+      assert.ok(!p.includes('?'), `${p}: no ? wildcard`);
+    }
   }
 });
 
@@ -189,7 +222,7 @@ test('shu-7nw: githubRepo is refused when malformed or wildcarded', () => {
 });
 
 test('shu-7nw: shukkaVersions, allowBranch and project are validated', () => {
-  for (const bad of ['*', '*v1', '?1', 'v1/../x', 'v 1', '']) {
+  for (const bad of ['*', '*v1', '?1', 'v1*', 'v1.*', 'v1?', 'v1/../x', 'v 1', '', '1', 'v1.', 'v1.0.0-rc.*']) {
     assert.throws(() => synth({ shukkaVersions: bad }), /shukkaVersions/, `refused: ${JSON.stringify(bad)}`);
   }
   for (const bad of ['*', 'rc-*', 'rc?', '', 'a b', '-rc']) {
@@ -209,10 +242,21 @@ test('shu-7nw: infra role may only sts:AssumeRole the project-qualifier bootstra
       Resource: [
         `arn:aws:iam::${ACCOUNT}:role/cdk-demo-deploy-role-*`,
         `arn:aws:iam::${ACCOUNT}:role/cdk-demo-file-publishing-role-*`,
-        `arn:aws:iam::${ACCOUNT}:role/cdk-demo-lookup-role-*`,
       ],
     },
   ]));
+});
+
+test('shu-7nw: no infra role statement names the lookup role', () => {
+  for (const props of [{}, { project: 'my-proj', qualifier: 'myproj' }]) {
+    const { template } = synth(props);
+    const name = `${(props as { project?: string }).project ?? 'demo'}-shukka-infra`;
+    const json = JSON.stringify(flat(permissions(template, name)));
+    assert.ok(!/lookup/i.test(json), `${name} statements must not name lookup: ${json}`);
+    for (const st of normalise(permissions(template, name))) {
+      for (const res of st.Resource as string[]) assert.ok(!like(res, `arn:aws:iam::${ACCOUNT}:role/cdk-demo-lookup-role-${ACCOUNT}-${REGION}`) && !like(res, `arn:aws:iam::${ACCOUNT}:role/cdk-myproj-lookup-role-${ACCOUNT}-${REGION}`), `${res} reaches a lookup role`);
+    }
+  }
 });
 
 test('shu-7nw: infra role uses the qualifier when it differs from the project', () => {
@@ -221,7 +265,6 @@ test('shu-7nw: infra role uses the qualifier when it differs from the project', 
   assert.deepEqual(st?.Resource, [
     `arn:aws:iam::${ACCOUNT}:role/cdk-myproj-deploy-role-*`,
     `arn:aws:iam::${ACCOUNT}:role/cdk-myproj-file-publishing-role-*`,
-    `arn:aws:iam::${ACCOUNT}:role/cdk-myproj-lookup-role-*`,
   ]);
   assert.throws(() => synth({ project: 'my-proj' }), /qualifier/, 'a project name that is not a valid qualifier needs one');
   assert.throws(() => synth({ qualifier: 'Bad-Q' }), /qualifier/);
@@ -261,8 +304,8 @@ test('shu-7nw: diff role may only read templates and stacks of the project and t
       Effect: 'Allow',
       Action: ['cloudformation:DescribeStacks', 'cloudformation:GetTemplate'],
       Resource: [
-        `arn:aws:cloudformation:${REGION}:${ACCOUNT}:stack/demo*/*`,
-        `arn:aws:cloudformation:${REGION}:${ACCOUNT}:stack/Demo*/*`,
+        `arn:aws:cloudformation:${REGION}:${ACCOUNT}:stack/demo-*/*`,
+        `arn:aws:cloudformation:${REGION}:${ACCOUNT}:stack/Demo-*/*`,
       ],
     },
     { Effect: 'Allow', Action: 'ssm:GetParameter', Resource: `arn:aws:ssm:${REGION}:${ACCOUNT}:parameter/cdk-bootstrap/demo/version` },
@@ -270,6 +313,18 @@ test('shu-7nw: diff role may only read templates and stacks of the project and t
   const json = JSON.stringify(template.toJSON());
   assert.ok(!/lookup-role/.test(JSON.stringify(permissions(template, 'demo-shukka-diff'))), 'diff role never reaches the lookup role');
   assert.ok(json.includes('demo-shukka-diff'));
+});
+
+test('shu-7nw: diff role stack resources do not reach a project whose name starts with this one', () => {
+  const { template } = synth();
+  const resources = normalise(permissions(template, 'demo-shukka-diff')).flatMap((s) =>
+    (s.Action as string[]).includes('cloudformation:GetTemplate') ? (s.Resource as string[]) : [],
+  );
+  const stack = (name: string) => `arn:aws:cloudformation:${REGION}:${ACCOUNT}:stack/${name}/0a1b2c3d-1111-2222-3333-444455556666`;
+  for (const ok of ['Demo-prod-Dns', 'Demo-prod-Box', 'demo-ci']) assert.ok(likeAny(resources, stack(ok)), `reads ${ok}`);
+  for (const no of ['Demopro-prod-Dns', 'demopro-ci', 'DemoX', 'Demo', 'CDKToolkit', 'CDKToolkit-demo', 'Other-prod-Dns']) {
+    assert.ok(!likeAny(resources, stack(no)), `refuses ${no}`);
+  }
 });
 
 test('shu-7nw: no permission statement has a wildcard action or Resource * except actions without a resource type', () => {

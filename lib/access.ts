@@ -8,7 +8,10 @@ export interface ShukkaAccessProps {
   readonly project: string;
   /** Subject repo segment: `owner/repo` or the immutable `owner@id/repo@id`. */
   readonly githubRepo: string;
-  /** Tag pattern the shukka workflow ref must match. Default `v1*`. */
+  /**
+   * shukka release line to trust: a literal tag such as `v1` (default) or `v1.2`. The workflow ref must be that tag or
+   * a release under it (`<tag>` or `<tag>.*`, so `v1.0.0-rc.1` matches and `v10` does not).
+   */
   readonly shukkaVersions?: string;
   /** ARN of the account's GitHub OIDC provider (output of the Shukka-Account stack). Default: that provider's ARN in this account. Never created here. */
   readonly oidcProviderArn?: string;
@@ -35,8 +38,8 @@ const QUALIFIER_RE = /^[a-z0-9]{1,10}$/;
 const OWNER = '[A-Za-z0-9][A-Za-z0-9-]{0,38}';
 const REPO = '[A-Za-z0-9._-]{1,100}';
 const GITHUB_REPO_RE = new RegExp(`^(?:${OWNER}/${REPO}|${OWNER}@[0-9]+/${REPO}@[0-9]+)$`);
-// A tag pattern: starts with a literal character; '*' allowed after that, '?' never.
-const VERSIONS_RE = /^[A-Za-z0-9][A-Za-z0-9._*-]*$/;
+// A literal release line: v<major>[.<minor>...]; no wildcards (the construct adds `.*` itself).
+const VERSIONS_RE = /^v[0-9]+(?:\.[0-9]+)*$/;
 // A branch name, literal (no wildcards).
 const BRANCH_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
 const SSM_PATH_RE = /^(?:\/[A-Za-z0-9._-]+)+$/;
@@ -59,7 +62,7 @@ export class ShukkaAccess extends Construct {
   constructor(scope: Construct, id: string, props: ShukkaAccessProps) {
     super(scope, id);
     const { project, githubRepo } = props;
-    const versions = props.shukkaVersions ?? 'v1*';
+    const versions = props.shukkaVersions ?? 'v1';
     const qualifier = props.qualifier ?? project;
     const ssmPath = props.ssmPath ?? `/${project}/prod`;
     const tag = props.instanceTag ?? { key: 'Project', value: project };
@@ -67,7 +70,7 @@ export class ShukkaAccess extends Construct {
     check(PROJECT_RE.test(project), `project must match ${PROJECT_RE}, got ${JSON.stringify(project)}`);
     check(GITHUB_REPO_RE.test(githubRepo) && !githubRepo.split(/[/@]/).some((s) => s === '.' || s === '..'),
       `githubRepo must be owner/repo or owner@id/repo@id, got ${JSON.stringify(githubRepo)}`);
-    check(VERSIONS_RE.test(versions), `shukkaVersions must start with a literal character and use only [A-Za-z0-9._*-], got ${JSON.stringify(versions)}`);
+    check(VERSIONS_RE.test(versions), `shukkaVersions must be a literal release line such as v1 or v1.2 (no wildcards), got ${JSON.stringify(versions)}`);
     check(QUALIFIER_RE.test(qualifier), `qualifier must match ${QUALIFIER_RE} (pass one when the project name is not a valid qualifier), got ${JSON.stringify(qualifier)}`);
     check(SSM_PATH_RE.test(ssmPath), `ssmPath must be an absolute literal parameter path such as /project/prod, got ${JSON.stringify(ssmPath)}`);
     check(/^[A-Za-z0-9._:/=+@-]{1,128}$/.test(tag.key) && /^[A-Za-z0-9._:/=+@ -]{1,256}$/.test(tag.value),
@@ -87,14 +90,14 @@ export class ShukkaAccess extends Construct {
     const provider = iam.OpenIdConnectProvider.fromOpenIdConnectProviderArn(this, 'GitHubProvider', providerArn);
 
     const principal = (subject: 'main' | 'pull_request', file: 'infra.yml' | 'ec2.yml'): iam.IPrincipal => {
-      const refs = [`${SHUKKA_WORKFLOWS}/${file}@refs/tags/${versions}`];
+      const refs = [`${SHUKKA_WORKFLOWS}/${file}@refs/tags/${versions}`, `${SHUKKA_WORKFLOWS}/${file}@refs/tags/${versions}.*`];
       if (props.allowBranch !== undefined) refs.push(`${SHUKKA_WORKFLOWS}/${file}@refs/heads/${props.allowBranch}`);
       return new iam.WebIdentityPrincipal(provider.openIdConnectProviderArn, {
         StringEquals: {
           [`${PROVIDER_HOST}:aud`]: 'sts.amazonaws.com',
           [`${PROVIDER_HOST}:sub`]: subject === 'main' ? `repo:${githubRepo}:ref:refs/heads/main` : `repo:${githubRepo}:pull_request`,
         },
-        StringLike: { [`${PROVIDER_HOST}:job_workflow_ref`]: refs.length === 1 ? refs[0] : refs },
+        StringLike: { [`${PROVIDER_HOST}:job_workflow_ref`]: refs },
       });
     };
 
@@ -109,9 +112,11 @@ export class ShukkaAccess extends Construct {
         deploy: new iam.PolicyDocument({
           statements: [
             // cdk deploys through the project's own bootstrap roles; the fence lives on their execution role.
+            // Never the lookup role: it carries ReadOnlyAccess over the whole shared account, and cdk.context.json is
+            // committed, so a deploy needs no live lookup.
             new iam.PolicyStatement({
               actions: ['sts:AssumeRole'],
-              resources: ['deploy', 'file-publishing', 'lookup'].map((r) => arn('iam', 'role', `cdk-${qualifier}-${r}-role-*`, { region: '' })),
+              resources: ['deploy', 'file-publishing'].map((r) => arn('iam', 'role', `cdk-${qualifier}-${r}-role-*`, { region: '' })),
             }),
           ],
         }),
@@ -152,10 +157,11 @@ export class ShukkaAccess extends Construct {
       inlinePolicies: {
         diff: new iam.PolicyDocument({
           statements: [
-            // Templates and stack status of the project's stacks only. Never the CDK lookup role (D10).
+            // Templates and stack status of the project's stacks only (`<project>-…`, `<Project>-…`; the hyphen keeps
+            // out a project whose name merely starts with this one). Never the CDK lookup role (D10).
             new iam.PolicyStatement({
               actions: ['cloudformation:GetTemplate', 'cloudformation:DescribeStacks'],
-              resources: [project, Project].map((n) => arn('cloudformation', 'stack', `${n}*/*`)),
+              resources: [project, Project].map((n) => arn('cloudformation', 'stack', `${n}-*/*`)),
             }),
             new iam.PolicyStatement({ actions: ['ssm:GetParameter'], resources: [arn('ssm', 'parameter', `cdk-bootstrap/${qualifier}/version`)] }),
           ],
