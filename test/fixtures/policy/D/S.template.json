@@ -1,0 +1,1 @@
+{"Resources": {"P": {"Type": "AWS::Lambda::Permission", "Properties": {"FunctionName": "trendigle-fn", "Action": "lambda:InvokeFunction", "Principal": "s3.amazonaws.com"}}}}

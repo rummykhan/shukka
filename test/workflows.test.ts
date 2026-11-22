@@ -259,7 +259,7 @@ test('shu-9zr: project code runs only in jobs that cannot obtain credentials; cr
       const run = String(s.run ?? '').replace(/cd \.shukka\n\s*npm ci --ignore-scripts --no-audit --no-fund/, '');
       assert.doesNotMatch(run, /\b(npm|npx|yarn|pnpm|bun)\b|cd "?project/, where);
       // node runs only shukka's scripts and the inline scripts here.
-      for (const m of run.matchAll(/\bnode (\S+)/g)) assert.match(m[1] as string, /^(\.shukka\/scripts\/[a-z]+\.mjs|--input-type=module)$/, where);
+      for (const m of run.matchAll(/\bnode (\S+)/g)) assert.match(m[1] as string, /^(\.shukka\/scripts\/[a-z][a-z-]*\.mjs|--input-type=module)$/, where);
       // cdk is shukka's own CLI, on the synthesized assembly.
       if (/\$CDK\b/.test(run)) {
         assert.equal(s.env?.CDK, '.shukka/node_modules/.bin/cdk', where);

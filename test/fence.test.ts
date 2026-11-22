@@ -90,6 +90,7 @@ const SPIKE_EXCEPTIONS: Record<'executionA' | 'executionB' | 'boundary', { chang
       'EC2DescribeOwnInstancesOnly', // no DescribeInstanceAttribute (user data) on other projects' instances
       'EC2NoSpotRequests', // spot request descriptions carry user data and cannot be fenced
       'EC2RunInstancesInterfaces', // existing network interfaces only the project's
+      'NoChangeToCiRoles', // shu-9bj.6: the pipeline's own roles cannot be re-trusted or given more power by a deploy
     ],
   },
   boundary: {
@@ -104,6 +105,7 @@ const SPIKE_EXCEPTIONS: Record<'executionA' | 'executionB' | 'boundary', { chang
       'AgentAssociations', // DescribeAssociation on the account's associations
       'RunOnOwnServersDocument', // SendCommand's document by ARN (finding 4)
       'AppRoleAgentStatus', // DescribeInstanceInformation for the app role only (shu-9zr)
+      'NoPolicyWrites', // shu-9bj.6: bounded roles cannot write resource policies or send data out of the account
       'AppRoleReleaseReads', // DescribeInstances and GetCommandInvocation for the app role only (shu-9bj.9)
       'DiffRoleReads', // the diff role's template, stack and bootstrap-version reads, for that role only (shu-9bj.9)
     ],

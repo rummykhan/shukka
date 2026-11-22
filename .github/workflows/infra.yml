@@ -18,15 +18,17 @@
 #   changes  deploy mode: under the infra role (chained into the project's CDK deploy role, which can
 #            read stacks) decide with changed.mjs --part infra over the assembly's stacks
 #   deploy   deploy mode, when changed, one at a time per project: refuse an assembly whose assets run
-#            commands, build Docker images or reach outside it (assembly.mjs check); skip when the
+#            commands, build Docker images or reach outside it (assembly.mjs check); stop on a trust
+#            or resource policy that lets a principal outside the project in (policy-guard.mjs, before
+#            any role is assumed; allow_replacement on a run by hand goes ahead); skip when the
 #            stacks are already at a later commit; cdk diff, ### Infrastructure changes and ### Guard
 #            in the step summary, guard.mjs, cdk deploy tagged shukka:revision=<sha>
 #   diff     diff mode (pull requests): the same diff under the read-only diff role with
-#            --method=template; the diff and the guard's verdict go to the artifact shukka-diff; a
-#            destructive diff never fails it. Skipped with a notice when GitHub gives the job no
+#            --method=template; the diff, the guard's and policy-guard.mjs's verdicts go to the
+#            artifact shukka-diff; a destructive diff or policy never fails it. Skipped with a notice when GitHub gives the job no
 #            OIDC token (pull requests from forks, Dependabot)
 #   comment  diff mode: posts shukka-diff as one PR comment marked <!-- shukka:diff -->, updated in
-#            place, saying the merge will stop when the guard refuses
+#            place, saying the merge will stop when the guard or the policy guard refuses
 #
 # Artifacts are tied to the job that produced them: synth and diff output the sha256 of what they
 # upload, and every consumer refuses a download whose digest differs.
@@ -239,7 +241,7 @@ jobs:
           node --input-type=module - "$RUNNER_TEMP/shukka-config.json" <<'JS'
           import { appendFileSync, readFileSync } from 'node:fs';
           const c = JSON.parse(readFileSync(process.argv[2], 'utf8'));
-          const out = { project: c.project, qualifier: c.qualifier, account: c.aws.account, region: c.aws.region };
+          const out = { project: c.project, qualifier: c.qualifier, account: c.aws.account, region: c.aws.region, mail_domains: c.fence.mailDomains.join(',') };
           appendFileSync(process.env.GITHUB_OUTPUT, Object.entries(out).map(([k, v]) => `${k}=${v}\n`).join(''));
           JS
 
@@ -406,7 +408,7 @@ jobs:
           node --input-type=module - "$RUNNER_TEMP/shukka-config.json" <<'JS'
           import { appendFileSync, readFileSync } from 'node:fs';
           const c = JSON.parse(readFileSync(process.argv[2], 'utf8'));
-          const out = { project: c.project, qualifier: c.qualifier, account: c.aws.account, region: c.aws.region };
+          const out = { project: c.project, qualifier: c.qualifier, account: c.aws.account, region: c.aws.region, mail_domains: c.fence.mailDomains.join(',') };
           appendFileSync(process.env.GITHUB_OUTPUT, Object.entries(out).map(([k, v]) => `${k}=${v}\n`).join(''));
           JS
 
@@ -447,6 +449,34 @@ jobs:
           node .shukka/scripts/assembly.mjs check "$RUNNER_TEMP/cdk.out"
           stacks=$(node .shukka/scripts/assembly.mjs stacks "$RUNNER_TEMP/cdk.out")
           echo "stacks=$stacks" >>"$GITHUB_OUTPUT"
+
+      # The execution role may create and re-trust the project's roles and write bucket, queue, topic and
+      # function policies: nothing in the assembly may let a principal outside the project in (another
+      # account, "*", a GitHub trust not pinned to this repository and shukka's workflows). GITHUB_REPOSITORY
+      # is the calling project's repository.
+      - name: Check trust and resource policies
+        env:
+          ACCOUNT: ${{ steps.config.outputs.account }}
+          MAIL_DOMAINS: ${{ steps.config.outputs.mail_domains }}
+          ALLOW_REPLACEMENT: ${{ inputs.allow_replacement }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          allow=()
+          if [[ "$ALLOW_REPLACEMENT" == true ]]; then
+            if [[ "$EVENT_NAME" == workflow_dispatch ]]; then
+              allow=(--allow)
+            else
+              echo "::warning::shukka: allow_replacement is honoured only when the workflow is run by hand; ignoring it"
+            fi
+          fi
+          # The fence's mail domains (shukka.json, checked by config.mjs): email subscriptions to them may stay.
+          IFS=, read -ra domains <<<"$MAIL_DOMAINS"
+          for d in ${domains[@]+"${domains[@]}"}; do allow+=(--mail-domain "$d"); done
+          if ! node .shukka/scripts/policy-guard.mjs "$RUNNER_TEMP/cdk.out" --account "$ACCOUNT" --repo "$GITHUB_REPOSITORY" ${allow[@]+"${allow[@]}"} --summary "$GITHUB_STEP_SUMMARY"; then
+            echo "::error::shukka: the policy guard stopped the infrastructure deploy"
+            exit 1
+          fi
 
       - name: Assume the infra role
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
@@ -683,7 +713,7 @@ jobs:
           node --input-type=module - "$RUNNER_TEMP/shukka-config.json" <<'JS'
           import { appendFileSync, readFileSync } from 'node:fs';
           const c = JSON.parse(readFileSync(process.argv[2], 'utf8'));
-          const out = { project: c.project, qualifier: c.qualifier, account: c.aws.account, region: c.aws.region };
+          const out = { project: c.project, qualifier: c.qualifier, account: c.aws.account, region: c.aws.region, mail_domains: c.fence.mailDomains.join(',') };
           appendFileSync(process.env.GITHUB_OUTPUT, Object.entries(out).map(([k, v]) => `${k}=${v}\n`).join(''));
           JS
 
@@ -722,6 +752,27 @@ jobs:
           mkdir -p -- "$RUNNER_TEMP/cdk.out"
           tar -xzf "$RUNNER_TEMP/shukka-assembly/cdk.out.tgz" -C "$RUNNER_TEMP/cdk.out" --no-same-owner --no-same-permissions
           node .shukka/scripts/assembly.mjs check "$RUNNER_TEMP/cdk.out"
+
+      # The same policy check as deploy, before the diff role; its verdict goes to the comment and never
+      # fails the job.
+      - name: Check trust and resource policies
+        if: steps.token.outputs.available == 'true'
+        env:
+          ACCOUNT: ${{ steps.config.outputs.account }}
+          MAIL_DOMAINS: ${{ steps.config.outputs.mail_domains }}
+        run: |
+          set +e -uo pipefail
+          out="$RUNNER_TEMP/shukka-pr-diff"
+          mkdir -p "$out"
+          domains=()
+          IFS=, read -ra list <<<"$MAIL_DOMAINS"
+          for d in ${list[@]+"${list[@]}"}; do domains+=(--mail-domain "$d"); done
+          node .shukka/scripts/policy-guard.mjs "$RUNNER_TEMP/cdk.out" --account "$ACCOUNT" --repo "$GITHUB_REPOSITORY" ${domains[@]+"${domains[@]}"} --summary "$GITHUB_STEP_SUMMARY" | tee "$out/policy-guard.txt"
+          policy_status=${PIPESTATUS[0]}
+          echo "$policy_status" >"$out/policy-guard-status"
+          if [[ $policy_status -ne 0 ]]; then
+            echo "::warning::shukka: this merge will stop at the policy guard unless it is rerun by hand with allow_replacement"
+          fi
 
       - name: Assume the diff role
         if: steps.token.outputs.available == 'true'
@@ -835,7 +886,7 @@ jobs:
             exit 0
           fi
           node --input-type=module - "$RUNNER_TEMP/shukka-pr-diff" <<'JS'
-          import { readFileSync } from 'node:fs';
+          import { existsSync, readFileSync } from 'node:fs';
           import { join } from 'node:path';
           const MARKER = '<!-- shukka:diff -->';
           const dir = process.argv[2];
@@ -847,10 +898,18 @@ jobs:
           if (diff.length > 55_000) diff = `${diff.slice(0, 55_000)}\n... (cut; the whole diff is in the run's summary)`;
           const guard = readFileSync(join(dir, 'guard.txt'), 'utf8').slice(0, 5_000);
           const stops = readFileSync(join(dir, 'guard-status'), 'utf8').trim() !== '0';
-          const verdict = stops
-            ? '**This merge will stop** at the guard: it deletes or replaces a resource, or the diff is incomplete. If that is intended, run the workflow by hand on `main` with `allow_replacement` ticked after merging.'
+          const hasPolicy = existsSync(join(dir, 'policy-guard-status'));
+          const policyStops = hasPolicy && readFileSync(join(dir, 'policy-guard-status'), 'utf8').trim() !== '0';
+          const policy = hasPolicy && existsSync(join(dir, 'policy-guard.txt')) ? readFileSync(join(dir, 'policy-guard.txt'), 'utf8').slice(0, 5_000) : '';
+          const verdict = [
+            stops ? '**This merge will stop** at the guard: it deletes or replaces a resource, or the diff is incomplete.' : '',
+            policyStops ? '**This merge will stop** at the policy guard: a trust or resource policy lets a principal outside the project in, or cannot be checked.' : '',
+          ].filter(Boolean).join('\n\n');
+          const text = verdict
+            ? `${verdict} If that is intended, run the workflow by hand on \`main\` with \`allow_replacement\` ticked after merging.`
             : 'Nothing is deleted or replaced; the merge will deploy these changes.';
-          const body = `${MARKER}\n### Infrastructure changes\n\n${verdict}\n\n${fenced(diff)}\n\n### Guard\n\n${fenced(guard)}\n`;
+          const policySection = hasPolicy ? `\n### Trust and resource policies\n\n${fenced(policy)}\n` : '';
+          const body = `${MARKER}\n### Infrastructure changes\n\n${text}\n\n${fenced(diff)}\n\n### Guard\n\n${fenced(guard)}\n${policySection}`;
           const api = `${process.env.GITHUB_API_URL}/repos/${process.env.GITHUB_REPOSITORY}`;
           const headers = { Authorization: `Bearer ${process.env.GITHUB_TOKEN}`, Accept: 'application/vnd.github+json', 'Content-Type': 'application/json' };
           let existing;

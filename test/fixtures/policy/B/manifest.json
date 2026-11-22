@@ -1,0 +1,1 @@
+{"version": "48.0.0", "artifacts": {"S": {"type": "aws:cloudformation:stack", "environment": "aws://818221194501/us-east-1", "properties": {"templateFile": "S.template.json"}}}}

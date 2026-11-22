@@ -157,7 +157,7 @@ const INFRA_SIDS = new Set([
   'EC2TagOnCreate', 'EC2ChangeOwn', 'EC2ProjectTagIsFixed', 'EC2AssociateToOwnInstance',
 ]);
 
-const IAM_SIDS = new Set(['IAMOwnRoles', 'IAMBoundedWrites', 'IAMPassOwnRoles', 'IAMInstanceProfiles', 'IAMReadOIDC', 'NoEscapeFromBoundary']);
+const IAM_SIDS = new Set(['IAMOwnRoles', 'IAMBoundedWrites', 'IAMPassOwnRoles', 'IAMInstanceProfiles', 'IAMReadOIDC', 'NoEscapeFromBoundary', 'NoChangeToCiRoles']);
 
 const DATA_SIDS = new Set(['DynamoDB', 'S3', 'Lambda', 'SQS', 'SNS', 'Alarms', 'Logs', 'Parameters']);
 
@@ -314,6 +314,14 @@ export function fenceDocuments(inputs: FenceInputs): FenceDocuments {
       Action: ['iam:DeleteRolePermissionsBoundary', 'iam:CreatePolicyVersion', 'iam:DeletePolicy', 'iam:DeletePolicyVersion', 'iam:SetDefaultPolicyVersion'],
       Resource: [boundaryArn, ...execArns, ...arns((n) => `arn:aws:iam::${account}:role/${n}`)],
     },
+    // Spike hole: the pipeline's own roles (ShukkaAccess: <project>-shukka-infra, -app, -diff) are inside <project>*, so without
+    // this a changed assembly could re-trust them to someone else or give them more power through a deploy. Changing
+    // them takes an admin deploy.
+    {
+      Sid: 'NoChangeToCiRoles', Effect: 'Deny',
+      Action: ['iam:UpdateAssumeRolePolicy', 'iam:DeleteRole', 'iam:PutRolePolicy', 'iam:AttachRolePolicy', 'iam:DetachRolePolicy', 'iam:DeleteRolePolicy'],
+      Resource: [`arn:aws:iam::${account}:role/${P}-shukka-*`, `arn:aws:iam::${account}:role/${Pc}-shukka-*`],
+    },
   ];
 
   // What roles the project creates (servers, Lambdas, its CI roles) may ever do: use the project's own data and services.
@@ -404,6 +412,24 @@ export function fenceDocuments(inputs: FenceInputs): FenceDocuments {
         `arn:aws:ssm:${region}:${account}:parameter/cdk-bootstrap/${qualifier}/version`,
       ],
       Condition: { ArnEquals: { 'aws:PrincipalArn': `arn:aws:iam::${account}:role/${diffRoleName(P)}` } },
+    },
+    // Spike hole (shu-9bj.6): the data statements give bounded roles s3:*, sqs:*, sns:*, lambda:* and dynamodb:* on the
+    // project's resources, so a custom resource (Custom::AWS) or a server could write a bucket, queue, topic, function
+    // or table policy that lets another account in, or send the project's logs or messages out, after the policy guard
+    // read the templates. Policies come only from templates, which CloudFormation applies with the execution role.
+    // Of CDK's own handlers only autoDeleteObjects writes a bucket policy (a deny-new-objects statement before it
+    // empties a bucket being deleted); it logs and carries on when refused. Resource "*": a deny only takes away.
+    {
+      Sid: 'NoPolicyWrites', Effect: 'Deny', Resource: '*',
+      Action: [
+        // Wildcards keep the boundary under 6,144 characters: sqs:Set* is SetQueueAttributes, s3:PutBucketOwn* is
+        // PutBucketOwnershipControls, sns:SetTopicAttr* is SetTopicAttributes, logs:PutDestination* also denies creating a
+        // destination for another account, lambda:*FunctionUrlConfig also its Get and Delete, ssm:*ResourcePolicy is Put,
+        // Delete and GetResourcePolicies (parameter sharing).
+        's3:*BucketPolicy', 's3:Put*Acl', 's3:*PublicAccessBlock', 's3:PutBucketOwn*', 'sqs:AddPermission', 'sqs:Set*',
+        'sns:AddPermission', 'sns:SetTopicAttr*', 'sns:Subscribe', 'lambda:Add*Permission', 'lambda:*FunctionUrlConfig',
+        'dynamodb:PutResource*', 'logs:PutSubscriptionFilter', 'logs:PutDestination*', 'ssm:*ResourcePolicy',
+      ],
     },
   ];
 

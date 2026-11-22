@@ -473,6 +473,7 @@ test('shu-5ix: deploy dry run prints the workflow steps in order: checks, build,
     /^npm ci$/,
     /^npx --no-install cdk synth --quiet --output \S+$/,
     /^node scripts\/assembly\.mjs check \S+$/,
+    new RegExp(`^node scripts/policy-guard\\.mjs \\S+ --account ${ACCOUNT} --mail-domain example\\.com$`),
     new RegExp(`^assume arn:aws:iam::${ACCOUNT}:role/cdk-shukkatest-deploy-role-${ACCOUNT}-us-east-1 as shukka-emergency; cdk gets only that session$`),
     new RegExp(`^${reEscape(CDK)} diff --app \\S+ --no-color$`),
     /^node scripts\/guard\.mjs < the diff$/,
@@ -1045,4 +1046,48 @@ test('shu-9bj.5: deploy passes each tag as one --tags=k=v token; the pinned cdk 
   const out = offlineCdk(tmp, demo.args);
   assert.match(out, /Synthesis time/, out);
   assert.ok(!existsSync(join(assembly, 'MARKER')), `the planted plugin ran:\n${out}`);
+}));
+
+// ---------- shu-9bj.6: the policy guard ----------
+
+test('shu-9bj.6: shukka deploy runs the policy guard after the assembly check and before cdk gets a session; --allow-replacement goes ahead', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  const backdoor = {
+    Resources: {
+      Backdoor: {
+        Type: 'AWS::IAM::Role',
+        Properties: { RoleName: 'shukkatest-backdoor', AssumeRolePolicyDocument: { Statement: [{ Effect: 'Allow', Action: 'sts:AssumeRole', Principal: { AWS: 'arn:aws:iam::999999999999:root' } }] } },
+      },
+    },
+  };
+  const synthSpawn = () => recordingSpawn(({ cmd, args }) => {
+    if (cmd === 'npx' && args.includes('synth')) {
+      const out = args[args.indexOf('--output') + 1]!;
+      write(join(out, 'manifest.json'), JSON.stringify({ artifacts: { 'shukkatest-App': { type: 'aws:cloudformation:stack', properties: { templateFile: 'shukkatest-App.template.json', tags: { Project: 'shukkatest' } } } } }));
+      write(join(out, 'shukkatest-App.template.json'), JSON.stringify(backdoor));
+      return { status: 0, stdout: '' };
+    }
+    if (cmd === process.execPath && args[1] === 'diff') return { status: 0, stdout: CLEAN_DIFF };
+    if (cmd === 'bash' && args[0]?.endsWith('bundle.sh')) return { status: 0, stdout: `${bundleDir(tmp)}\n` };
+    return { status: 0, stdout: '' };
+  });
+  let s = synthSpawn();
+  let assumed: string[] = [];
+  let c = releaseClients();
+  const aws = () => awsWith(c, { assumeRole: async (a: string) => { assumed.push(a); return { accessKeyId: 'ASIAFENCED', secretAccessKey: 's', sessionToken: 't' }; } }).aws;
+  let r = await cli(['deploy', '--skip-checks'], { cwd: dir, spawn: s.spawn, aws: aws(), checkAssembly: NO_ASSETS });
+  assert.equal(r.code, 1);
+  assert.match(r.out, /policy-guard: shukkatest-App\.template\.json: Backdoor \(AWS::IAM::Role\): trusts AWS arn:aws:iam::999999999999:root/);
+  assert.match(r.err, /the policy guard stopped the deploy: .*--allow-replacement/);
+  assert.deepEqual(assumed, [], 'no session was made');
+  assert.ok(!s.calls.some((x) => isCdk(x, 'diff') || isCdk(x, 'deploy')));
+  assert.equal(c.s3.calls.length, 0);
+
+  s = synthSpawn();
+  assumed = [];
+  c = releaseClients();
+  r = await cli(['deploy', '--skip-checks', '--allow-replacement'], { cwd: dir, spawn: s.spawn, aws: aws(), checkAssembly: NO_ASSETS });
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /^policy-guard: allowed by the person who started this run \(--allow\)$/m);
+  assert.ok(s.calls.some((x) => isCdk(x, 'deploy')));
 }));

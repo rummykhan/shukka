@@ -6,7 +6,7 @@
 //
 // `deploy` takes the steps the workflows take, in the same order:
 //   checks (pipeline.yml "check", skippable with --skip-checks) -> build and bundle (pipeline.yml "build") ->
-//   synth, cdk diff, guard, cdk deploy with the shukka:revision tag (infra.yml "deploy") ->
+//   synth, assembly and policy checks, cdk diff, guard, cdk deploy with the shukka:revision tag (infra.yml "deploy") ->
 //   upload and release each app (ec2.yml "release": scripts/upload.mjs, scripts/release.mjs) -> smoke.
 // Credentials, as in CI: the project's own code (checks, build, npm ci, synth, smoke) runs with no AWS credentials
 // (projectEnv). cdk diff and deploy run with shukka's pinned cdk and only a session of the project's bootstrap
@@ -20,6 +20,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:pat
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from '../config.mjs';
 import { guard, report } from '../guard.mjs';
+import { githubRepoFromUrl, policyGuard, report as policyReport } from '../policy-guard.mjs';
 import { release } from '../release.mjs';
 import { upload } from '../upload.mjs';
 import { CliError, NPM_SAFE, cdkBin, cdkPlace, mustRun, projectEnv, refuseSymlink, tempDir } from './exec.mjs';
@@ -239,6 +240,35 @@ async function checkAssemblySafe(io, assembly, check) {
 }
 
 /**
+ * Stop, as the workflows do (scripts/policy-guard.mjs), when a trust or resource policy in the assembly lets a
+ * principal outside the project in; --allow-replacement goes ahead. The project's repository, which a GitHub trust
+ * must name, is origin's.
+ * @param {Io} io
+ * @param {string} root
+ * @param {string} assembly
+ * @param {Config} config
+ * @param {boolean} allow
+ */
+function checkPoliciesSafe(io, root, assembly, config, allow) {
+  const remote = io.run('git', ['remote', 'get-url', 'origin'], { cwd: root, mutates: false, capture: 'stdout' });
+  const repo = remote.status === 0 ? githubRepoFromUrl(remote.stdout) : null;
+  const mailDomains = config.fence.mailDomains;
+  const args = ['--account', config.aws.account, ...(repo ? ['--repo', repo] : []), ...mailDomains.flatMap((d) => ['--mail-domain', d]), ...(allow ? ['--allow'] : [])];
+  if (io.dryRun) {
+    io.out(`+ node scripts/policy-guard.mjs ${assembly} ${args.join(' ')}   [dry run: not run]\n`);
+    return;
+  }
+  if (!repo) io.warn('origin is not a GitHub repository, so a GitHub trust in the assembly cannot be checked against it and stops the deploy');
+  const result = policyGuard(assembly, { account: config.aws.account, repos: repo ? [repo] : [], mailDomains, allow });
+  io.out(policyReport(result));
+  if (result.code !== 0) {
+    throw new CliError(result.verdict === 'unreadable'
+      ? 'the policy guard stopped the deploy: the assembly cannot be read'
+      : 'the policy guard stopped the deploy: a trust or resource policy lets a principal outside the project in, or cannot be checked; run again with --allow-replacement if that is intended');
+  }
+}
+
+/**
  * cdk diff of the assembly, then the guard. Returns the guard's result; prints the diff and the verdict.
  * @param {Io} io
  * @param {Config} config
@@ -454,6 +484,7 @@ export async function deployCommand(options) {
 
     const assembly = synth(io, tree, config);
     await checkAssemblySafe(io, assembly, options.checkAssembly);
+    checkPoliciesSafe(io, root, assembly, config, options.allowReplacement ?? false);
     const session = await fencedSession(io, aws, config);
     const { result, diffStatus } = diffAndGuard(io, config, session, assembly, options.allowReplacement ?? false);
     if (result.code !== 0) {

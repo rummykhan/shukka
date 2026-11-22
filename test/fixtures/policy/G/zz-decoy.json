@@ -1,0 +1,1 @@
+{"Resources": {}, "Outputs": {"O": {"Value": "arn:aws:iam::818221194501:role/trendigle-app", "Export": {"Name": "trendigle-trusted"}}}}
