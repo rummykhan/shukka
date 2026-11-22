@@ -8,6 +8,11 @@ import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as cr from 'aws-cdk-lib/custom-resources';
 import {
   ShukkaAccountStack,
+  ShukkaBoundary,
+  boundaryPolicyName,
+  executionPolicyNames,
+  fenceDocuments,
+  infraRoleName,
   applyBoundary,
   shukkaSynthesizer,
   type PolicyDocumentJson,
@@ -55,18 +60,64 @@ const docs = (f: SynthesizedFence) => [f.executionA, f.executionB, f.boundary];
 const trendigle = synthFence(TRENDIGLE);
 const neutral = synthFence(NEUTRAL);
 
-test('shu-i1b: the execution policies have exactly the statements of spike S2 for the Trendigle inputs', () => {
-  assert.ok(spikeAccount, 'account found in the spike output');
-  assert.deepEqual(normaliseDoc(trendigle.executionA), normaliseDoc(spike.execution_a));
-  assert.deepEqual(normaliseDoc(trendigle.executionB), normaliseDoc(spike.execution_b));
-});
+// Where the construct differs from spike S2, and why. Each difference closes a hole the spike left; each has its
+// own test below and a case in test/simulate/run.mjs. Every other statement must equal the spike's.
+const SPIKE_EXCEPTIONS: Record<'executionA' | 'executionB' | 'boundary', { changed: string[]; added: string[]; removed?: string[] }> = {
+  executionA: {
+    changed: ['LambdaEventSources'], // Create/Update/Delete fenced by lambda:FunctionArn
+    added: ['LambdaEventSourcesRead', 'LambdaEventSourcesList'], // Get by mapping ARN, List on * (no resource type)
+  },
+  executionB: {
+    changed: [
+      'EC2Read', // no ec2:Get* (GetPasswordData, GetConsoleOutput, GetConsoleScreenshot)
+      'EC2CreateTagged', // each create on the resource type it creates, not "*"
+      'EC2RunInstancesSupporting', // image and security-group moved out to fenced statements
+      'EC2AssociateToOwnInstance', // elastic IPs and network interfaces need the Project tag
+      'NoEscapeFromBoundary', // also protects the second execution policy
+    ],
+    added: [
+      'EC2LaunchTagged', // RunInstances on instance/* with the request tag
+      'EC2RunInstancesImages', // AMIs by ec2:Owner (default amazon)
+      'EC2UseOwnTagged', // security groups and snapshots an instance or volume uses need the Project tag
+      'EC2ProjectTagIsFixed', // the Project tag cannot be set to another project or removed
+    ],
+  },
+  boundary: {
+    changed: [
+      'RuntimeAgents', // only actions with no resource type; no logs writes outside the project's log groups
+      'DeployThroughBootstrap', // only the infra role, only deploy and file-publishing roles
+      'RunOnOwnServers', // instances with StringEquals on the Project tag (finding 4)
+    ],
+    added: [
+      'AgentOnOwnInstance', // instance-scoped agent calls need the Project tag
+      'AgentDocuments', // document-scoped agent calls name the documents
+      'AgentAssociations', // DescribeAssociation on the account's associations
+      'RunOnOwnServersDocument', // SendCommand's document by ARN (finding 4)
+    ],
+  },
+};
 
-test('shu-i1b: the boundary has exactly the statements of spike S2, with only RunOnOwnServers split', () => {
-  const ours = normaliseDoc(trendigle.boundary);
-  const theirs = normaliseDoc(spike.boundary);
-  const split = new Set(['RunOnOwnServers', 'RunOnOwnServersDocument']);
-  assert.deepEqual(ours.filter((s) => !split.has(s.Sid)), theirs.filter((s) => s.Sid !== 'RunOnOwnServers'));
-  assert.deepEqual(ours.filter((s) => split.has(s.Sid)).map((s) => s.Sid).sort(), ['RunOnOwnServers', 'RunOnOwnServersDocument']);
+const spikeOf = { executionA: spike.execution_a, executionB: spike.execution_b, boundary: spike.boundary };
+
+test('shu-i1b: the fence has exactly the statements of spike S2 for the Trendigle inputs, except the listed holes', () => {
+  assert.ok(spikeAccount, 'account found in the spike output');
+  for (const key of ['executionA', 'executionB', 'boundary'] as const) {
+    const { changed, added } = SPIKE_EXCEPTIONS[key];
+    const ours = normaliseDoc(trendigle[key]);
+    const theirs = normaliseDoc(spikeOf[key]);
+    const skip = new Set([...changed, ...added]);
+    assert.deepEqual(ours.filter((s) => !skip.has(s.Sid)), theirs.filter((s) => !skip.has(s.Sid)), `${key}: unchanged statements`);
+    for (const sid of changed) {
+      const a = ours.find((s) => s.Sid === sid);
+      const b = theirs.find((s) => s.Sid === sid);
+      assert.ok(a && b, `${key}: ${sid} is in both`);
+      assert.notDeepEqual(a, b, `${key}: ${sid} is listed as changed but equals the spike`);
+    }
+    for (const sid of added) {
+      assert.ok(ours.some((s) => s.Sid === sid), `${key}: ${sid} added`);
+      assert.ok(!theirs.some((s) => s.Sid === sid), `${key}: ${sid} is new`);
+    }
+  }
 });
 
 test('shu-i1b: each managed policy is under 6,144 characters without whitespace for the Trendigle inputs', () => {
@@ -75,6 +126,25 @@ test('shu-i1b: each managed policy is under 6,144 characters without whitespace 
     assert.ok(size < 6144, `${name} is ${size} characters`);
   }
 });
+
+test('shu-i1b: each managed policy stays under 6,144 characters for the longest project name and a long region', () => {
+  const longest = fenceDocuments({
+    project: 'a2345678901234567890b', account: '123456789012', region: 'ap-southeast-2', qualifier: 'a234567890',
+    hostedZoneId: 'Z0123456789ABCDEFGHIJ', sesDomains: ['example.com', 'mail.example.com'],
+  });
+  for (const [name, doc] of Object.entries(longest)) {
+    const size = JSON.stringify(doc).length;
+    assert.ok(size < 6144, `${name} is ${size} characters`);
+  }
+});
+
+const stmt = (doc: PolicyDocumentJson, sid: string) => {
+  const s = doc.Statement.find((x) => x.Sid === sid);
+  assert.ok(s, `statement ${sid}`);
+  return s;
+};
+const grants = (doc: PolicyDocumentJson, action: string) =>
+  doc.Statement.filter((s) => s.Effect === 'Allow' && list(s.Action).some((a) => new RegExp(`^${a.replace(/\*/g, '.*')}$`).test(action)));
 
 test('shu-i1b: ssm:SendCommand in the boundary is split: the document by ARN, instances with StringEquals on the Project tag', () => {
   for (const [fence, inputs] of [[trendigle, TRENDIGLE], [neutral, NEUTRAL]] as const) {
@@ -90,30 +160,144 @@ test('shu-i1b: ssm:SendCommand in the boundary is split: the document by ARN, in
   }
 });
 
-// Every action that may appear in a statement with Resource "*", and why. `condition` names the condition key
-// that must fence the statement when the action does have a resource type.
-const STAR_ALLOWED: Record<string, { condition?: string }> = {
-  // Lambda event source mappings: Create and List have no resource type; the mapping ARN of the others is a
-  // UUID with no project name.
-  'lambda:CreateEventSourceMapping': {},
-  'lambda:ListEventSourceMappings': {},
-  'lambda:GetEventSourceMapping': {},
-  'lambda:UpdateEventSourceMapping': {},
-  'lambda:DeleteEventSourceMapping': {},
-  // EC2 reads: Describe* have no resource type; Get* read the account's EC2 state, nothing secret.
-  'ec2:Describe*': {},
-  'ec2:Get*': {},
-  'ec2:DescribeInstances': {},
-  'ec2:DescribeTags': {},
-  // EC2 creates: the resource does not exist yet; fenced by the Project tag on the request.
-  'ec2:RunInstances': { condition: 'aws:RequestTag/Project' },
-  'ec2:CreateSecurityGroup': { condition: 'aws:RequestTag/Project' },
-  'ec2:CreateLaunchTemplate': { condition: 'aws:RequestTag/Project' },
-  'ec2:AllocateAddress': { condition: 'aws:RequestTag/Project' },
-  'ec2:CreateVolume': { condition: 'aws:RequestTag/Project' },
-  // EC2 changes: ids carry no project name; fenced by the Project tag on the resource (CreateTags also by
-  // ec2:CreateAction when tagging on create; each statement is checked for its own key below).
-  'ec2:CreateTags': { condition: 'aws:ResourceTag/Project|ec2:CreateAction' },
+test('shu-i1b: only the infra role may assume the bootstrap deploy and file-publishing roles, never the lookup role', () => {
+  const s = stmt(neutral.boundary, 'DeployThroughBootstrap');
+  assert.deepEqual(list(s.Action), ['sts:AssumeRole']);
+  assert.deepEqual(list(s.Resource), [
+    'arn:aws:iam::123456789012:role/cdk-shukkatest-deploy-role-*',
+    'arn:aws:iam::123456789012:role/cdk-shukkatest-file-publishing-role-*',
+  ]);
+  assert.deepEqual(s.Condition, { ArnEquals: { 'aws:PrincipalArn': `arn:aws:iam::123456789012:role/${infraRoleName('shukkatest')}` } });
+  assert.equal(infraRoleName('shukkatest'), 'shukkatest-shukka-infra');
+  assert.equal(grants(neutral.boundary, 'sts:AssumeRole').length, 1, 'no other statement grants sts:AssumeRole');
+});
+
+test('shu-i1b: the boundary grants logs writes only on project log groups and SSM agent calls only on own instances and named documents', () => {
+  const b = neutral.boundary;
+  for (const a of ['logs:CreateLogGroup', 'logs:CreateLogStream', 'logs:PutLogEvents', 'logs:DescribeLogStreams']) {
+    assert.deepEqual(grants(b, a).map((s) => s.Sid), ['Logs'], `${a} only through Logs`);
+  }
+  // Parameters grants ssm:* on the project's parameter ARNs only; leave it out when asking who grants agent calls.
+  const ssmGrants = (a: string) => grants(b, a).map((s) => s.Sid).filter((sid) => sid !== 'Parameters');
+  const inst = stmt(b, 'AgentOnOwnInstance');
+  assert.deepEqual(list(inst.Resource), ['arn:aws:ec2:eu-west-1:123456789012:instance/*']);
+  assert.deepEqual(inst.Condition, { StringEquals: { 'aws:ResourceTag/Project': 'shukkatest' } });
+  for (const a of ['ssm:UpdateInstanceInformation', 'ssm:ListInstanceAssociations', 'ssm:PutComplianceItems', 'ssm:UpdateInstanceAssociationStatus']) {
+    assert.deepEqual(ssmGrants(a), ['AgentOnOwnInstance'], a);
+  }
+  const docsSt = stmt(b, 'AgentDocuments');
+  assert.deepEqual(list(docsSt.Resource), [
+    'arn:aws:ssm:eu-west-1:123456789012:document/Shukkatest*',
+    'arn:aws:ssm:eu-west-1:123456789012:document/shukkatest*',
+    'arn:aws:ssm:eu-west-1::document/*',
+  ]);
+  for (const a of ['ssm:GetDocument', 'ssm:DescribeDocumentParameters']) assert.deepEqual(ssmGrants(a), ['AgentDocuments'], a);
+  assert.deepEqual(ssmGrants('ssm:UpdateAssociationStatus'), ['AgentOnOwnInstance', 'AgentDocuments']);
+  assert.deepEqual(ssmGrants('ssm:DescribeAssociation'), ['AgentAssociations']);
+  assert.deepEqual(list(stmt(b, 'AgentAssociations').Resource), ['arn:aws:ssm:eu-west-1:123456789012:association/*']);
+});
+
+test('shu-i1b: event source mappings are created, changed and deleted only for the project functions', () => {
+  const s = stmt(neutral.executionA, 'LambdaEventSources');
+  assert.deepEqual(list(s.Action), ['lambda:CreateEventSourceMapping', 'lambda:DeleteEventSourceMapping', 'lambda:UpdateEventSourceMapping']);
+  assert.deepEqual(s.Condition, {
+    ArnLike: {
+      'lambda:FunctionArn': [
+        'arn:aws:lambda:eu-west-1:123456789012:function:shukkatest*', 'arn:aws:lambda:eu-west-1:123456789012:function:Shukkatest*',
+        'arn:aws:lambda:eu-west-1:123456789012:function:shukkatest*:*', 'arn:aws:lambda:eu-west-1:123456789012:function:Shukkatest*:*',
+      ],
+    },
+  });
+  assert.deepEqual(stmt(neutral.executionA, 'LambdaEventSourcesRead').Resource, 'arn:aws:lambda:eu-west-1:123456789012:event-source-mapping:*');
+  assert.deepEqual(stmt(neutral.executionA, 'LambdaEventSourcesList').Action, 'lambda:ListEventSourceMappings');
+});
+
+test('shu-i1b: the execution policy grants no ec2:Get action (passwords, console output, screenshots)', () => {
+  for (const a of ['ec2:GetPasswordData', 'ec2:GetConsoleOutput', 'ec2:GetConsoleScreenshot', 'ec2:GetLaunchTemplateData']) {
+    assert.deepEqual(grants(neutral.executionA, a).concat(grants(neutral.executionB, a)), [], a);
+  }
+  assert.deepEqual(stmt(neutral.executionB, 'EC2Read').Action, 'ec2:Describe*');
+});
+
+test('shu-i1b: elastic IPs and network interfaces are associated only when they carry the project tag', () => {
+  const s = stmt(neutral.executionB, 'EC2AssociateToOwnInstance');
+  assert.deepEqual(list(s.Resource), ['arn:aws:ec2:eu-west-1:123456789012:elastic-ip/*', 'arn:aws:ec2:eu-west-1:123456789012:network-interface/*']);
+  assert.deepEqual(s.Condition, { StringEquals: { 'aws:ResourceTag/Project': 'shukkatest' } });
+});
+
+test('shu-i1b: instances launch only from allowed AMI owners, own security groups and own snapshots', () => {
+  const b = neutral.executionB;
+  const img = stmt(b, 'EC2RunInstancesImages');
+  assert.deepEqual(img.Resource, 'arn:aws:ec2:eu-west-1::image/*');
+  assert.deepEqual(img.Condition, { StringEquals: { 'ec2:Owner': ['amazon'] } });
+  const own = stmt(b, 'EC2UseOwnTagged');
+  assert.deepEqual(list(own.Action), ['ec2:CreateVolume', 'ec2:RunInstances']);
+  assert.deepEqual(list(own.Resource), ['arn:aws:ec2:eu-west-1:123456789012:security-group/*', 'arn:aws:ec2:eu-west-1::snapshot/*']);
+  assert.deepEqual(own.Condition, { StringEquals: { 'aws:ResourceTag/Project': 'shukkatest' } });
+  // No other statement lets RunInstances or CreateVolume reach images, security groups or snapshots.
+  for (const st of b.Statement.filter((s) => s.Effect === 'Allow' && s.Sid !== 'EC2UseOwnTagged' && s.Sid !== 'EC2RunInstancesImages')) {
+    if (!list(st.Action).some((a) => a === 'ec2:RunInstances' || a === 'ec2:CreateVolume')) continue;
+    for (const r of list(st.Resource)) {
+      assert.ok(r !== '*' && !/:(image|snapshot)\//.test(r), `${st.Sid}: ${r}`);
+      if (list(st.Action).includes('ec2:RunInstances')) assert.ok(!r.includes(':security-group/'), `${st.Sid}: RunInstances on ${r}`);
+    }
+  }
+  const custom = fenceDocuments({ ...NEUTRAL, qualifier: 'shukkatest', amiOwners: ['amazon', '123456789012'] });
+  assert.deepEqual(stmt(custom.executionB, 'EC2RunInstancesImages').Condition, { StringEquals: { 'ec2:Owner': ['amazon', '123456789012'] } });
+});
+
+test('shu-i1b: the Project tag can only be set to the project, never to another project or removed', () => {
+  const s = stmt(neutral.executionB, 'EC2ProjectTagIsFixed');
+  assert.equal(s.Effect, 'Deny');
+  assert.deepEqual(list(s.Action), ['ec2:CreateTags', 'ec2:DeleteTags']);
+  assert.deepEqual(s.Resource, '*');
+  assert.deepEqual(s.Condition, {
+    'ForAnyValue:StringEquals': { 'aws:TagKeys': ['Project'] },
+    StringNotEquals: { 'aws:RequestTag/Project': 'shukkatest' },
+  });
+});
+
+test('shu-i1b: NoEscapeFromBoundary protects the boundary and both execution policies', () => {
+  const r = list(stmt(neutral.executionB, 'NoEscapeFromBoundary').Resource);
+  for (const name of [boundaryPolicyName('shukkatest'), ...executionPolicyNames('shukkatest')]) {
+    assert.ok(r.includes(`arn:aws:iam::123456789012:policy/${name}`), name);
+  }
+});
+
+test('shu-i1b: ShukkaBoundary refuses invalid project names, qualifiers, mail domains and AMI owners', () => {
+  const make = (over: Record<string, unknown>) => () => {
+    const stack = new Stack(new App(), 'S', { env: { account: '123456789012', region: 'us-east-1' } });
+    new ShukkaBoundary(stack, 'B', { project: 'shukkatest', hostedZoneId: 'ZX', sesDomains: ['example.com'], ...over });
+  };
+  assert.doesNotThrow(make({}));
+  for (const project of ['Trendigle', 'a', '1abc', 'ab*', 'a_b', 'a2345678901234567890bc', 'ab cd']) {
+    assert.throws(make({ project, qualifier: 'ok' }), /project name/, project);
+  }
+  for (const qualifier of ['', 'a234567890b', 'Trend', 'a-b', 'a*']) assert.throws(make({ qualifier }), /qualifier/, qualifier);
+  assert.throws(make({ project: 'a234567890b' }), /qualifier/, 'default qualifier is the project name and must fit');
+  for (const d of ['*.example.com', '*', 'example', 'exa*mple.com', '-x.example.com', 'example.com/']) {
+    assert.throws(make({ sesDomains: [d] }), /mail domain/, d);
+  }
+  assert.throws(make({ amiOwners: ['*'] }), /AMI owner/);
+  assert.doesNotThrow(make({ amiOwners: ['aws-marketplace', '123456789012'] }));
+});
+
+// Every action that may appear in an Allow statement with Resource "*", and why:
+// - 'none': the action has no resource type in the service authorization reference, so "*" is the only resource;
+// - 'read': Describe* reads of configuration (most have no resource type; none returns data or secrets);
+// - { condition }: the action has a resource type, but the resource does not exist yet or its ARN carries no
+//   project name; the statement must carry this condition key, which fences it instead.
+type StarReason = 'none' | 'read' | { condition: string };
+const STAR_ALLOWED: Record<string, StarReason> = {
+  // Lambda: CreateEventSourceMapping has no resource type, Update/Delete name a mapping by UUID; fenced by function.
+  'lambda:CreateEventSourceMapping': { condition: 'lambda:FunctionArn' },
+  'lambda:UpdateEventSourceMapping': { condition: 'lambda:FunctionArn' },
+  'lambda:DeleteEventSourceMapping': { condition: 'lambda:FunctionArn' },
+  'lambda:ListEventSourceMappings': 'none',
+  'ec2:Describe*': 'read',
+  // Tagging a resource while it is created; fenced by ec2:CreateAction.
+  'ec2:CreateTags': { condition: 'ec2:CreateAction|aws:ResourceTag/Project' },
+  // Changing an EC2 resource: ids carry no project name; fenced by the Project tag on the resource.
   ...Object.fromEntries(
     [
       'DeleteTags', 'ModifyInstanceAttribute', 'TerminateInstances', 'StopInstances', 'StartInstances', 'RebootInstances',
@@ -124,17 +308,23 @@ const STAR_ALLOWED: Record<string, { condition?: string }> = {
       'DisassociateIamInstanceProfile', 'AttachVolume', 'DetachVolume', 'DeleteVolume', 'ModifyInstanceMetadataOptions',
     ].map((a) => [`ec2:${a}`, { condition: 'aws:ResourceTag/Project' }]),
   ),
-  // Agents on the server (SSM agent, Session Manager, CloudWatch agent): no resource type, or the calling
-  // instance and AWS-owned documents and associations.
-  ...Object.fromEntries(
-    [
-      'ssm:UpdateInstanceInformation', 'ssm:ListInstanceAssociations', 'ssm:DescribeInstanceProperties', 'ssm:DescribeDocumentParameters',
-      'ssm:GetDocument', 'ssm:DescribeAssociation', 'ssm:GetDeployablePatchSnapshotForInstance', 'ssm:GetManifest', 'ssm:ListAssociations',
-      'ssm:PutInventory', 'ssm:PutComplianceItems', 'ssm:PutConfigurePackageResult', 'ssm:UpdateAssociationStatus',
-      'ssm:UpdateInstanceAssociationStatus', 'ssmmessages:*', 'ec2messages:*', 'cloudwatch:PutMetricData', 'logs:CreateLogGroup',
-      'logs:CreateLogStream', 'logs:PutLogEvents', 'logs:DescribeLogStreams', 'sts:GetCallerIdentity', 'ssm:GetCommandInvocation',
-    ].map((a) => [a, {}]),
-  ),
+  // Agents on the server. No resource type in the Systems Manager reference: DescribeInstanceProperties,
+  // GetDeployablePatchSnapshotForInstance, ListAssociations, PutInventory, GetCommandInvocation; GetManifest and
+  // PutConfigurePackageResult are internal agent calls the reference does not list at all.
+  'ssm:DescribeInstanceProperties': 'none',
+  'ssm:GetDeployablePatchSnapshotForInstance': 'none',
+  'ssm:GetManifest': 'none',
+  'ssm:ListAssociations': 'none',
+  'ssm:PutInventory': 'none',
+  'ssm:PutConfigurePackageResult': 'none',
+  'ssm:GetCommandInvocation': 'none',
+  // Session Manager and the agent's message channels have no resource types.
+  'ssmmessages:*': 'none',
+  'ec2messages:*': 'none',
+  'cloudwatch:PutMetricData': 'none',
+  'sts:GetCallerIdentity': 'none',
+  'ec2:DescribeInstances': 'none',
+  'ec2:DescribeTags': 'none',
   // The key behind SecureString parameters; fenced to decryption through SSM.
   'kms:Decrypt': { condition: 'kms:ViaService' },
   // SES authorises against the identity used; fenced by the From address.
@@ -148,13 +338,13 @@ test('shu-i1b: no statement has Resource * except allow-listed actions, each fen
     for (const doc of docs(fence)) {
       for (const st of doc.Statement) {
         if (!list(st.Resource).includes('*')) continue;
-        assert.equal(st.Effect, 'Allow', `${st.Sid}: a Deny on * is not expected`);
+        if (st.Effect === 'Deny') continue; // a deny on "*" only takes away
         const keys = Object.values(st.Condition ?? {}).flatMap((kv) => Object.keys(kv));
         for (const action of list(st.Action)) {
           const entry = STAR_ALLOWED[action];
           assert.ok(entry, `${st.Sid}: ${action} on Resource * is not in the allow-list`);
           used.add(action);
-          if (entry.condition) {
+          if (typeof entry === 'object') {
             const wanted = entry.condition.split('|');
             assert.ok(keys.some((k) => wanted.includes(k)), `${st.Sid}: ${action} on * must be fenced by ${entry.condition}`);
           }
@@ -169,7 +359,7 @@ test('shu-i1b: the construct uses the stack account and region and the project q
   const all = JSON.stringify(neutral);
   assert.ok(all.includes('arn:aws:iam::123456789012:policy/shukkatest-shukka-boundary'));
   assert.ok(all.includes('arn:aws:ssm:eu-west-1:123456789012:parameter/cdk-bootstrap/shukkatest/version'));
-  assert.ok(all.includes('arn:aws:iam::123456789012:role/cdk-shukkatest-*'));
+  assert.ok(all.includes('arn:aws:iam::123456789012:role/cdk-shukkatest-deploy-role-*'));
   assert.ok(!all.includes(spikeAccount));
 });
 

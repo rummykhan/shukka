@@ -1,30 +1,34 @@
 // The per-project fence (design D5, spike S2): a permissions boundary for every role the project's stacks create,
 // and the execution policy of the project's CloudFormation execution role, split in two managed policies because
-// a managed policy holds at most 6,144 characters. A port of docs/factory/v1/spikes/s2/policy.py; the statements
-// are the spike's, except that ssm:SendCommand in the boundary is split (spike S2, finding 4).
+// a managed policy holds at most 6,144 characters. A port of docs/factory/v1/spikes/s2/policy.py. Where the spike
+// left a hole, the statement differs from the spike and says so ("Spike hole:"); test/fence.test.ts lists each
+// difference and test/simulate/run.mjs has a case proving the hole is closed.
 //
 // The fence is a name prefix: resources must be named `<project>*` or `<Project>*`. Project names in one account
 // must therefore not be prefixes of one another.
 //
-// Statements with Resource "*" are of two kinds, and each says which in a comment:
+// Statements with Resource "*" are of three kinds, and each says which in a comment:
 // - actions with no resource type (nothing narrower than "*" can be written);
 // - actions whose resource does not exist yet or has no project name, fenced instead by a condition on a tag, the
-//   calling service or the From address.
+//   function, the calling service or the From address;
+// - denies, which only take away.
 import { Aspects, Aws, CfnResource, Stack } from 'aws-cdk-lib';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import { Construct, type IConstruct } from 'constructs';
 
 export interface FenceInputs {
-  /** The project name from shukka.json; lower case, and not a prefix of another project in the account. */
+  /** The project name from shukka.json: `^[a-z][a-z0-9-]{1,20}$`, not a prefix of another project in the account. */
   readonly project: string;
   readonly account: string;
   readonly region: string;
-  /** The project's CDK bootstrap qualifier. */
+  /** The project's CDK bootstrap qualifier: `^[a-z0-9]{1,10}$`. */
   readonly qualifier: string;
   /** The Route 53 hosted zone the project may change, by id. */
   readonly hostedZoneId: string;
-  /** SES identities (domains) the project owns and may send mail from. */
+  /** SES identities (domains) the project owns and may send mail from. No wildcards. */
   readonly sesDomains: readonly string[];
+  /** Owners whose AMIs the project's instances may launch from (`ec2:Owner`). Default `['amazon']`. */
+  readonly amiOwners?: readonly string[];
 }
 
 export interface PolicyStatementJson {
@@ -59,42 +63,77 @@ export function executionPolicyNames(project: string): [string, string] {
   return [`${project}-shukka-execution`, `${project}-shukka-execution-infra`];
 }
 
+/**
+ * Name of the pipeline's infra role (ShukkaAccess creates it). Only this role may assume the project's bootstrap
+ * deploy and file-publishing roles.
+ */
+export function infraRoleName(project: string): string {
+  return `${project}-shukka-infra`;
+}
+
+const PROJECT_RE = /^[a-z][a-z0-9-]{1,20}$/;
+const QUALIFIER_RE = /^[a-z0-9]{1,10}$/;
+const DOMAIN_RE = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$/i;
+const AMI_OWNER_RE = /^(?:amazon|aws-marketplace|\d{12})$/;
+
+/** Throws when an input would widen or break the fence (a wildcard, a name that is not a plain prefix). */
+export function validateFenceInputs(inputs: Pick<FenceInputs, 'project' | 'qualifier' | 'sesDomains' | 'amiOwners'>): void {
+  if (!PROJECT_RE.test(inputs.project)) {
+    throw new Error(`shukka: project name ${JSON.stringify(inputs.project)} must match ${PROJECT_RE}`);
+  }
+  if (!QUALIFIER_RE.test(inputs.qualifier)) {
+    throw new Error(`shukka: qualifier ${JSON.stringify(inputs.qualifier)} must match ${QUALIFIER_RE}`);
+  }
+  for (const d of inputs.sesDomains) {
+    if (!DOMAIN_RE.test(d)) throw new Error(`shukka: mail domain ${JSON.stringify(d)} must be a plain domain name, no wildcards`);
+  }
+  for (const o of inputs.amiOwners ?? []) {
+    if (!AMI_OWNER_RE.test(o)) throw new Error(`shukka: AMI owner ${JSON.stringify(o)} must be amazon, aws-marketplace or an account id`);
+  }
+}
+
 const INFRA_SIDS = new Set([
-  'EC2Read', 'EC2CreateTagged', 'EC2RunInstancesSupporting', 'EC2TagOnCreate', 'EC2ChangeOwn',
-  'EC2AssociateToOwnInstance', 'IAMOwnRoles', 'IAMBoundedWrites', 'IAMPassOwnRoles', 'IAMInstanceProfiles',
-  'IAMReadOIDC', 'NoEscapeFromBoundary',
+  'EC2Read', 'EC2LaunchTagged', 'EC2CreateTagged', 'EC2RunInstancesSupporting', 'EC2RunInstancesImages', 'EC2UseOwnTagged',
+  'EC2TagOnCreate', 'EC2ChangeOwn', 'EC2ProjectTagIsFixed', 'EC2AssociateToOwnInstance', 'IAMOwnRoles', 'IAMBoundedWrites',
+  'IAMPassOwnRoles', 'IAMInstanceProfiles', 'IAMReadOIDC', 'NoEscapeFromBoundary',
 ]);
 
 const DATA_SIDS = new Set(['DynamoDB', 'S3', 'Lambda', 'SQS', 'SNS', 'Alarms', 'Logs', 'Parameters']);
 
-/** The fence documents for one project, as plain IAM JSON. */
+/** The fence documents for one project, as plain IAM JSON. Throws on invalid inputs (see validateFenceInputs). */
 export function fenceDocuments(inputs: FenceInputs): FenceDocuments {
   const { project: P, account, region, qualifier, hostedZoneId: zone, sesDomains: ses } = inputs;
+  const amiOwners = inputs.amiOwners ?? ['amazon'];
+  validateFenceInputs({ ...inputs, amiOwners });
   // CDK's generated names start with the stack name, which is capitalised.
   const Pc = P.slice(0, 1).toUpperCase() + P.slice(1);
   const names = [`${P}*`, `${Pc}*`];
   const arns = (fmt: (n: string) => string) => names.map(fmt);
   const boundaryArn = `arn:aws:iam::${account}:policy/${boundaryPolicyName(P)}`;
-  const execArn = `arn:aws:iam::${account}:policy/${executionPolicyNames(P)[0]}`;
+  const execArns = executionPolicyNames(P).map((n) => `arn:aws:iam::${account}:policy/${n}`);
+  const ec2 = (type: string) => `arn:aws:ec2:${region}:${account}:${type}/*`;
+  const ownTag = { StringEquals: { 'aws:ResourceTag/Project': P } };
 
   const tbl = arns((n) => `arn:aws:dynamodb:${region}:${account}:table/${n}`);
+  const functions = [...arns((n) => `arn:aws:lambda:${region}:${account}:function:${n}`), ...arns((n) => `arn:aws:lambda:${region}:${account}:function:${n}:*`)];
   const ec2CreateActions = ['RunInstances', 'CreateSecurityGroup', 'CreateLaunchTemplate', 'AllocateAddress', 'CreateVolume'];
 
   // Everything a project's own resources may have done to them (shared by the execution policy and the boundary).
   const resourceStatements: PolicyStatementJson[] = [
     { Sid: 'DynamoDB', Effect: 'Allow', Action: 'dynamodb:*', Resource: [...tbl, ...tbl.map((t) => `${t}/*`)] },
     { Sid: 'S3', Effect: 'Allow', Action: 's3:*', Resource: [...arns((n) => `arn:aws:s3:::${n}`), ...arns((n) => `arn:aws:s3:::${n}/*`)] },
-    {
-      Sid: 'Lambda', Effect: 'Allow', Action: 'lambda:*',
-      Resource: [...arns((n) => `arn:aws:lambda:${region}:${account}:function:${n}`), ...arns((n) => `arn:aws:lambda:${region}:${account}:function:${n}:*`)],
-    },
-    // Resource "*": CreateEventSourceMapping and ListEventSourceMappings have no resource type; the mapping ARN
-    // (a UUID) of Get/Update/DeleteEventSourceMapping carries no project name.
+    { Sid: 'Lambda', Effect: 'Allow', Action: 'lambda:*', Resource: functions },
+    // Spike hole: the spike allowed all five event-source-mapping actions on "*", so a mapping could point any
+    // project's queue at any function. Resource "*": CreateEventSourceMapping has no resource type, and the mapping
+    // ARN of Update/Delete is a UUID; fenced by lambda:FunctionArn to the project's functions.
     {
       Sid: 'LambdaEventSources', Effect: 'Allow',
-      Action: ['lambda:CreateEventSourceMapping', 'lambda:UpdateEventSourceMapping', 'lambda:DeleteEventSourceMapping', 'lambda:GetEventSourceMapping', 'lambda:ListEventSourceMappings'],
-      Resource: '*',
+      Action: ['lambda:CreateEventSourceMapping', 'lambda:UpdateEventSourceMapping', 'lambda:DeleteEventSourceMapping'],
+      Resource: '*', Condition: { ArnLike: { 'lambda:FunctionArn': functions } },
     },
+    { Sid: 'LambdaEventSourcesRead', Effect: 'Allow', Action: 'lambda:GetEventSourceMapping', Resource: `arn:aws:lambda:${region}:${account}:event-source-mapping:*` },
+    // Resource "*": ListEventSourceMappings has no resource type.
+    { Sid: 'LambdaEventSourcesList', Effect: 'Allow', Action: 'lambda:ListEventSourceMappings', Resource: '*' },
     { Sid: 'SQS', Effect: 'Allow', Action: 'sqs:*', Resource: arns((n) => `arn:aws:sqs:${region}:${account}:${n}`) },
     { Sid: 'SNS', Effect: 'Allow', Action: 'sns:*', Resource: arns((n) => `arn:aws:sns:${region}:${account}:${n}`) },
     { Sid: 'Alarms', Effect: 'Allow', Action: 'cloudwatch:*', Resource: arns((n) => `arn:aws:cloudwatch:${region}:${account}:alarm:${n}`) },
@@ -120,22 +159,28 @@ export function fenceDocuments(inputs: FenceInputs): FenceDocuments {
     },
     // EC2 is fenced by tag. Reads are free; creating needs the project tag on the request; changing needs it on
     // the resource.
-    // Resource "*": Describe* have no resource type; the readable Get* are reads of the account's own EC2 state.
-    { Sid: 'EC2Read', Effect: 'Allow', Action: ['ec2:Describe*', 'ec2:Get*'], Resource: '*' },
-    // Resource "*": the resource does not exist yet; fenced by the Project tag on the request.
+    // Spike hole: the spike also granted ec2:Get*, which includes GetPasswordData, GetConsoleOutput and
+    // GetConsoleScreenshot on any instance. CloudFormation's handlers for the EC2 resources shukka supports
+    // (instance, launch template, EIP, security group, volume) call no ec2:Get action, so none is granted.
+    // Resource "*": Describe* are reads of configuration; most have no resource type.
+    { Sid: 'EC2Read', Effect: 'Allow', Action: 'ec2:Describe*', Resource: '*' },
+    // Spike hole: the spike allowed these creates on "*" with the request tag, which for RunInstances also matched
+    // another project's security groups and any AMI or snapshot. Each create is now limited to the resource type it
+    // creates; what an instance uses is granted in the statements after.
+    { Sid: 'EC2LaunchTagged', Effect: 'Allow', Action: 'ec2:RunInstances', Resource: ec2('instance'), Condition: { StringEquals: { 'aws:RequestTag/Project': P } } },
     {
-      Sid: 'EC2CreateTagged', Effect: 'Allow', Action: ['ec2:RunInstances', 'ec2:CreateSecurityGroup', 'ec2:CreateLaunchTemplate', 'ec2:AllocateAddress', 'ec2:CreateVolume'],
-      Resource: '*', Condition: { StringEquals: { 'aws:RequestTag/Project': P } },
+      Sid: 'EC2CreateTagged', Effect: 'Allow', Action: ['ec2:CreateSecurityGroup', 'ec2:CreateLaunchTemplate', 'ec2:AllocateAddress', 'ec2:CreateVolume'],
+      Resource: [ec2('security-group'), ec2('launch-template'), ec2('elastic-ip'), ec2('volume')],
+      Condition: { StringEquals: { 'aws:RequestTag/Project': P } },
     },
     {
       Sid: 'EC2RunInstancesSupporting', Effect: 'Allow', Action: ['ec2:RunInstances', 'ec2:CreateSecurityGroup'],
-      Resource: [
-        `arn:aws:ec2:${region}::image/*`, `arn:aws:ec2:${region}:${account}:subnet/*`, `arn:aws:ec2:${region}:${account}:vpc/*`,
-        `arn:aws:ec2:${region}:${account}:network-interface/*`, `arn:aws:ec2:${region}:${account}:volume/*`,
-        `arn:aws:ec2:${region}:${account}:security-group/*`, `arn:aws:ec2:${region}:${account}:launch-template/*`,
-        `arn:aws:ec2:${region}:${account}:key-pair/*`,
-      ],
+      Resource: [ec2('subnet'), ec2('vpc'), ec2('network-interface'), ec2('volume'), ec2('launch-template'), ec2('key-pair')],
     },
+    // Spike hole: image/* was open to any owner's AMI.
+    { Sid: 'EC2RunInstancesImages', Effect: 'Allow', Action: 'ec2:RunInstances', Resource: `arn:aws:ec2:${region}::image/*`, Condition: { StringEquals: { 'ec2:Owner': [...amiOwners] } } },
+    // Spike hole: security-group/* for RunInstances was open to every project's groups; snapshots were open too.
+    { Sid: 'EC2UseOwnTagged', Effect: 'Allow', Action: ['ec2:RunInstances', 'ec2:CreateVolume'], Resource: [ec2('security-group'), `arn:aws:ec2:${region}::snapshot/*`], Condition: ownTag },
     // Resource "*": tags on a resource being created; fenced by ec2:CreateAction to the creates allowed above.
     { Sid: 'EC2TagOnCreate', Effect: 'Allow', Action: 'ec2:CreateTags', Resource: '*', Condition: { StringEquals: { 'ec2:CreateAction': ec2CreateActions } } },
     // Resource "*": EC2 ids carry no project name; fenced by the Project tag on the resource.
@@ -150,11 +195,19 @@ export function fenceDocuments(inputs: FenceInputs): FenceDocuments {
         'ec2:AssociateIamInstanceProfile', 'ec2:ReplaceIamInstanceProfileAssociation', 'ec2:DisassociateIamInstanceProfile', 'ec2:AttachVolume',
         'ec2:DetachVolume', 'ec2:DeleteVolume', 'ec2:ModifyInstanceMetadataOptions',
       ],
-      Resource: '*', Condition: { StringEquals: { 'aws:ResourceTag/Project': P } },
+      Resource: '*', Condition: ownTag,
     },
+    // Spike hole: with the tag on the resource as the only fence, CreateTags could retag another project's resource
+    // to this project (or this project's to another). Deny: the Project tag can only ever be set to this project,
+    // and never removed. Resource "*": a deny only takes away.
+    {
+      Sid: 'EC2ProjectTagIsFixed', Effect: 'Deny', Action: ['ec2:CreateTags', 'ec2:DeleteTags'], Resource: '*',
+      Condition: { 'ForAnyValue:StringEquals': { 'aws:TagKeys': ['Project'] }, StringNotEquals: { 'aws:RequestTag/Project': P } },
+    },
+    // Spike hole: elastic IPs and network interfaces were not fenced by tag.
     {
       Sid: 'EC2AssociateToOwnInstance', Effect: 'Allow', Action: ['ec2:AssociateAddress', 'ec2:AssociateIamInstanceProfile', 'ec2:ReplaceIamInstanceProfileAssociation'],
-      Resource: [`arn:aws:ec2:${region}:${account}:elastic-ip/*`, `arn:aws:ec2:${region}:${account}:network-interface/*`],
+      Resource: [ec2('elastic-ip'), ec2('network-interface')], Condition: ownTag,
     },
     // IAM: own roles and instance profiles; new or changed roles must carry the boundary.
     {
@@ -180,10 +233,11 @@ export function fenceDocuments(inputs: FenceInputs): FenceDocuments {
       Resource: arns((n) => `arn:aws:iam::${account}:instance-profile/${n}`),
     },
     { Sid: 'IAMReadOIDC', Effect: 'Allow', Action: ['iam:GetOpenIDConnectProvider'], Resource: `arn:aws:iam::${account}:oidc-provider/token.actions.githubusercontent.com` },
+    // Spike hole: the spike protected only the first execution policy.
     {
       Sid: 'NoEscapeFromBoundary', Effect: 'Deny',
       Action: ['iam:DeleteRolePermissionsBoundary', 'iam:CreatePolicyVersion', 'iam:DeletePolicy', 'iam:DeletePolicyVersion', 'iam:SetDefaultPolicyVersion'],
-      Resource: [boundaryArn, execArn, ...arns((n) => `arn:aws:iam::${account}:role/${n}`)],
+      Resource: [boundaryArn, ...execArns, ...arns((n) => `arn:aws:iam::${account}:role/${n}`)],
     },
   ];
 
@@ -199,21 +253,32 @@ export function fenceDocuments(inputs: FenceInputs): FenceDocuments {
   // reach another project.
   const boundary: PolicyStatementJson[] = [
     ...dataStatements,
-    // Resource "*": the SSM agent, Session Manager and CloudWatch agent calls a server makes about itself. Most have
-    // no resource type (ssmmessages, ec2messages, PutMetricData, GetCallerIdentity, DescribeInstances, DescribeTags,
-    // GetCommandInvocation); the rest act on the calling instance or AWS-owned documents and associations.
+    // Spike hole: RuntimeAgents had every agent call on "*", including instance- and document-scoped SSM calls and
+    // logs writes to any log group. Logs now come only from the Logs statement (the project's log groups);
+    // instance-scoped calls need the project's tag on the instance; document-scoped calls name the documents.
+    // Resource "*": what is left has no resource type (Systems Manager's service authorization reference lists
+    // none for DescribeInstanceProperties, GetDeployablePatchSnapshotForInstance, ListAssociations, PutInventory,
+    // GetCommandInvocation, and none at all for GetManifest and PutConfigurePackageResult).
     {
       Sid: 'RuntimeAgents', Effect: 'Allow',
       Action: [
-        'ssm:UpdateInstanceInformation', 'ssm:ListInstanceAssociations', 'ssm:DescribeInstanceProperties', 'ssm:DescribeDocumentParameters',
-        'ssm:GetDocument', 'ssm:DescribeAssociation', 'ssm:GetDeployablePatchSnapshotForInstance', 'ssm:GetManifest', 'ssm:ListAssociations',
-        'ssm:PutInventory', 'ssm:PutComplianceItems', 'ssm:PutConfigurePackageResult', 'ssm:UpdateAssociationStatus',
-        'ssm:UpdateInstanceAssociationStatus', 'ssmmessages:*', 'ec2messages:*', 'cloudwatch:PutMetricData', 'logs:CreateLogGroup',
-        'logs:CreateLogStream', 'logs:PutLogEvents', 'logs:DescribeLogStreams', 'sts:GetCallerIdentity', 'ec2:DescribeInstances',
-        'ec2:DescribeTags', 'ssm:GetCommandInvocation',
+        'ssm:DescribeInstanceProperties', 'ssm:GetDeployablePatchSnapshotForInstance', 'ssm:GetManifest', 'ssm:ListAssociations', 'ssm:PutInventory',
+        'ssm:PutConfigurePackageResult', 'ssm:GetCommandInvocation', 'ssmmessages:*', 'ec2messages:*', 'cloudwatch:PutMetricData',
+        'sts:GetCallerIdentity', 'ec2:DescribeInstances', 'ec2:DescribeTags',
       ],
       Resource: '*',
     },
+    {
+      Sid: 'AgentOnOwnInstance', Effect: 'Allow',
+      Action: ['ssm:UpdateInstanceInformation', 'ssm:ListInstanceAssociations', 'ssm:PutComplianceItems', 'ssm:UpdateInstanceAssociationStatus', 'ssm:UpdateAssociationStatus'],
+      Resource: ec2('instance'), Condition: ownTag,
+    },
+    {
+      Sid: 'AgentDocuments', Effect: 'Allow', Action: ['ssm:GetDocument', 'ssm:DescribeDocumentParameters', 'ssm:UpdateAssociationStatus'],
+      Resource: [`arn:aws:ssm:${region}::document/*`, ...arns((n) => `arn:aws:ssm:${region}:${account}:document/${n}`)],
+    },
+    // Association ids carry no project name; this is the account's associations in the region.
+    { Sid: 'AgentAssociations', Effect: 'Allow', Action: 'ssm:DescribeAssociation', Resource: `arn:aws:ssm:${region}:${account}:association/*` },
     // Resource "*": the key behind SecureString parameters (often the AWS-managed aws/ssm key); fenced by
     // kms:ViaService to decryption through SSM, whose parameters are themselves fenced above.
     { Sid: 'DecryptViaSSM', Effect: 'Allow', Action: 'kms:Decrypt', Resource: '*', Condition: { StringEquals: { 'kms:ViaService': `ssm.${region}.amazonaws.com` } } },
@@ -223,15 +288,18 @@ export function fenceDocuments(inputs: FenceInputs): FenceDocuments {
       Sid: 'SendMail', Effect: 'Allow', Action: ['ses:SendEmail', 'ses:SendRawEmail'], Resource: '*',
       Condition: { StringLike: { 'ses:FromAddress': ses.map((d) => `*@${d}`) } },
     },
-    { Sid: 'DeployThroughBootstrap', Effect: 'Allow', Action: 'sts:AssumeRole', Resource: `arn:aws:iam::${account}:role/cdk-${qualifier}-*` },
-    // ssm:SendCommand is authorised against both the document and each target instance. The spike allowed it on
-    // "*" with StringEqualsIfExists on the instance tag, which let through an instance with no Project tag
-    // (finding 4). Split: the document by ARN, instances only with the project's tag.
-    { Sid: 'RunOnOwnServersDocument', Effect: 'Allow', Action: 'ssm:SendCommand', Resource: `arn:aws:ssm:${region}::document/AWS-RunShellScript` },
+    // Spike hole: every bounded role (servers, Lambdas) could assume the bootstrap roles, including the lookup role.
+    // Only the pipeline's infra role may, and only the deploy and file-publishing roles.
     {
-      Sid: 'RunOnOwnServers', Effect: 'Allow', Action: 'ssm:SendCommand', Resource: `arn:aws:ec2:${region}:${account}:instance/*`,
-      Condition: { StringEquals: { 'aws:ResourceTag/Project': P } },
+      Sid: 'DeployThroughBootstrap', Effect: 'Allow', Action: 'sts:AssumeRole',
+      Resource: [`arn:aws:iam::${account}:role/cdk-${qualifier}-deploy-role-*`, `arn:aws:iam::${account}:role/cdk-${qualifier}-file-publishing-role-*`],
+      Condition: { ArnEquals: { 'aws:PrincipalArn': `arn:aws:iam::${account}:role/${infraRoleName(P)}` } },
     },
+    // Spike hole (finding 4): ssm:SendCommand is authorised against both the document and each target instance. The
+    // spike allowed it on "*" with StringEqualsIfExists on the instance tag, which let through an instance with no
+    // Project tag. Split: the document by ARN, instances only with the project's tag.
+    { Sid: 'RunOnOwnServersDocument', Effect: 'Allow', Action: 'ssm:SendCommand', Resource: `arn:aws:ssm:${region}::document/AWS-RunShellScript` },
+    { Sid: 'RunOnOwnServers', Effect: 'Allow', Action: 'ssm:SendCommand', Resource: ec2('instance'), Condition: ownTag },
   ];
 
   return {
@@ -242,20 +310,22 @@ export function fenceDocuments(inputs: FenceInputs): FenceDocuments {
 }
 
 export interface ShukkaBoundaryProps {
-  /** The project name from shukka.json. */
+  /** The project name from shukka.json: `^[a-z][a-z0-9-]{1,20}$`. */
   readonly project: string;
-  /** The project's CDK bootstrap qualifier. Default: the project name. */
+  /** The project's CDK bootstrap qualifier, `^[a-z0-9]{1,10}$`. Default: the project name. */
   readonly qualifier?: string;
   /** The Route 53 hosted zone the project may change, by id. */
   readonly hostedZoneId: string;
-  /** SES identities (domains) the project owns and may send mail from. */
+  /** SES identities (domains) the project owns and may send mail from. No wildcards. */
   readonly sesDomains: readonly string[];
+  /** Owners whose AMIs the project's instances may launch from (`ec2:Owner`). Default `['amazon']`. */
+  readonly amiOwners?: readonly string[];
 }
 
 /**
  * The project's permissions boundary and the two managed policies of its CloudFormation execution role, in the
  * stack's account and region. `shukka bootstrap` deploys this, then runs `cdk bootstrap` with the execution
- * policies.
+ * policies. Throws on an invalid project name, qualifier, mail domain or AMI owner.
  */
 export class ShukkaBoundary extends Construct {
   readonly boundaryPolicy: iam.ManagedPolicy;
@@ -272,6 +342,7 @@ export class ShukkaBoundary extends Construct {
       qualifier: props.qualifier ?? props.project,
       hostedZoneId: props.hostedZoneId,
       sesDomains: props.sesDomains,
+      amiOwners: props.amiOwners,
     });
     const [execA, execB] = executionPolicyNames(props.project);
     const policy = (cid: string, name: string, doc: PolicyDocumentJson) =>

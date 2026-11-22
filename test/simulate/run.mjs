@@ -1,5 +1,6 @@
 // Runs spike S2's 58 cases (docs/factory/v1/spikes/s2/simulate.py) through the IAM policy simulator against the
-// documents ShukkaBoundary synthesizes, plus the cases for the SendCommand loophole the construct closes (finding 4).
+// documents ShukkaBoundary synthesizes, plus cases for each hole in the spike the construct closes. Two spike cases
+// are changed (marked) because the call they model now needs a tag or a principal the spike did not check.
 // Needs AWS credentials; the only call is `iam simulate-custom-policy`, which is read-only. Not part of the gate.
 //
 //   AWS_PROFILE=stelking node test/simulate/run.mjs
@@ -27,6 +28,8 @@ const EX = [d.executionA, d.executionB];
 const ALLOW_ALL = { Version: '2012-10-17', Statement: [{ Effect: 'Allow', Action: '*', Resource: '*' }] };
 const T = { 'aws:ResourceTag/Project': 'trendigle' };
 const O = { 'aws:ResourceTag/Project': 'orbitary' };
+const INFRA = { 'aws:PrincipalArn': `arn:aws:iam::${A}:role/trendigle-shukka-infra` };
+const SERVER = { 'aws:PrincipalArn': `arn:aws:iam::${A}:role/Trendigle-prod-Instance-Role1ABCC5F0-5uGLbHErVSKT` };
 
 // [who, expected, action, resource, context]
 const cases = [
@@ -73,11 +76,13 @@ const cases = [
   ['bounded', 'allowed', 'ssm:GetParameter', `arn:aws:ssm:${R}:${A}:parameter/trendigle/prod/SESSION_SECRET`],
   ['bounded', 'allowed', 'kms:Decrypt', `arn:aws:kms:${R}:${A}:key/abc`, { 'kms:ViaService': `ssm.${R}.amazonaws.com` }],
   ['bounded', 'allowed', 'ssmmessages:CreateControlChannel', '*'],
-  ['bounded', 'allowed', 'ssm:UpdateInstanceInformation', `arn:aws:ec2:${R}:${A}:instance/i-07c0a9b38ff703056`],
+  // Changed from the spike: the instance carries the Project tag (instance-scoped agent calls now need it).
+  ['bounded', 'allowed', 'ssm:UpdateInstanceInformation', `arn:aws:ec2:${R}:${A}:instance/i-07c0a9b38ff703056`, T],
   ['bounded', 'allowed', 'ec2messages:GetMessages', '*'],
   ['bounded', 'allowed', 'ssm:SendCommand', `arn:aws:ssm:${R}::document/AWS-RunShellScript`],
   ['bounded', 'allowed', 'ssm:SendCommand', `arn:aws:ec2:${R}:${A}:instance/i-07c0a9b38ff703056`, T],
-  ['bounded', 'allowed', 'sts:AssumeRole', `arn:aws:iam::${A}:role/cdk-trendigle-deploy-role-${A}-${R}`],
+  // Changed from the spike: the caller is the pipeline's infra role (only it may assume bootstrap roles now).
+  ['bounded', 'allowed', 'sts:AssumeRole', `arn:aws:iam::${A}:role/cdk-trendigle-deploy-role-${A}-${R}`, INFRA],
   ['bounded', 'allowed', 'ses:SendRawEmail', `arn:aws:ses:${R}:${A}:identity/mail.trendigle.com`, { 'ses:FromAddress': 'no-reply@mail.trendigle.com' }],
   ['bounded', 'allowed', 'sqs:SendMessage', `arn:aws:sqs:${R}:${A}:trendigle-prod-events`],
   ['bounded', 'implicitDeny', 'dynamodb:Scan', `arn:aws:dynamodb:${R}:${A}:table/orbitary-prod-entities`],
@@ -91,10 +96,51 @@ const cases = [
   ['bounded', 'implicitDeny', 'iam:CreateOpenIDConnectProvider', `arn:aws:iam::${A}:oidc-provider/token.actions.githubusercontent.com`],
   ['bounded', 'implicitDeny', 'ses:SendRawEmail', `arn:aws:ses:${R}:${A}:identity/mail.trendigle.com`, { 'ses:FromAddress': 'x@evil.example' }],
 ];
-// Spike S2 finding 4: an instance without a Project tag, and another document, are now refused.
+// Holes the spike left, each closed by the construct (the spike's documents allow or mis-scope every one of these).
 const extra = [
+  // Finding 4: an instance without a Project tag, and another document.
   ['bounded', 'implicitDeny', 'ssm:SendCommand', `arn:aws:ec2:${R}:${A}:instance/i-0untagged`],
   ['bounded', 'implicitDeny', 'ssm:SendCommand', `arn:aws:ssm:${R}::document/AWS-RunPowerShellScript`],
+  // 1. Bootstrap roles: only the infra role, only deploy and file-publishing.
+  ['bounded', 'allowed', 'sts:AssumeRole', `arn:aws:iam::${A}:role/cdk-trendigle-file-publishing-role-${A}-${R}`, INFRA],
+  ['bounded', 'implicitDeny', 'sts:AssumeRole', `arn:aws:iam::${A}:role/cdk-trendigle-deploy-role-${A}-${R}`, SERVER],
+  ['bounded', 'implicitDeny', 'sts:AssumeRole', `arn:aws:iam::${A}:role/cdk-trendigle-deploy-role-${A}-${R}`],
+  ['bounded', 'implicitDeny', 'sts:AssumeRole', `arn:aws:iam::${A}:role/cdk-trendigle-lookup-role-${A}-${R}`, INFRA],
+  // 2. Agent calls: logs only to project log groups; instance calls only on own instances; named documents.
+  ['bounded', 'allowed', 'logs:PutLogEvents', `arn:aws:logs:${R}:${A}:log-group:trendigle-app:log-stream:x`],
+  ['bounded', 'implicitDeny', 'logs:PutLogEvents', `arn:aws:logs:${R}:${A}:log-group:orbitary-app:log-stream:x`],
+  ['bounded', 'implicitDeny', 'logs:CreateLogGroup', `arn:aws:logs:${R}:${A}:log-group:orbitary-app`],
+  ['bounded', 'implicitDeny', 'ssm:UpdateInstanceInformation', `arn:aws:ec2:${R}:${A}:instance/i-0orbitary`, O],
+  ['bounded', 'implicitDeny', 'ssm:PutComplianceItems', `arn:aws:ec2:${R}:${A}:instance/i-0untagged`],
+  ['bounded', 'allowed', 'ssm:GetDocument', `arn:aws:ssm:${R}::document/AWS-RunShellScript`],
+  ['bounded', 'implicitDeny', 'ssm:GetDocument', `arn:aws:ssm:${R}:${A}:document/orbitary-setup`],
+  // 3. Event source mappings only for the project's functions.
+  ['exec', 'allowed', 'lambda:CreateEventSourceMapping', '*', { 'lambda:FunctionArn': `arn:aws:lambda:${R}:${A}:function:Trendigle-prod-Notify-Worker` }],
+  ['exec', 'implicitDeny', 'lambda:CreateEventSourceMapping', '*', { 'lambda:FunctionArn': `arn:aws:lambda:${R}:${A}:function:orbitary-worker` }],
+  ['exec', 'implicitDeny', 'lambda:DeleteEventSourceMapping', `arn:aws:lambda:${R}:${A}:event-source-mapping:0b4c9a2e-1111-2222-3333-444455556666`, { 'lambda:FunctionArn': `arn:aws:lambda:${R}:${A}:function:orbitary-worker` }],
+  // 4. No secrets out of other projects' instances.
+  ['exec', 'implicitDeny', 'ec2:GetPasswordData', `arn:aws:ec2:${R}:${A}:instance/i-0orbitary`, O],
+  ['exec', 'implicitDeny', 'ec2:GetConsoleOutput', `arn:aws:ec2:${R}:${A}:instance/i-0orbitary`, O],
+  ['exec', 'implicitDeny', 'ec2:GetConsoleScreenshot', `arn:aws:ec2:${R}:${A}:instance/i-0orbitary`, O],
+  // 5. Elastic IPs and network interfaces need the Project tag.
+  ['exec', 'implicitDeny', 'ec2:AssociateAddress', `arn:aws:ec2:${R}:${A}:elastic-ip/eipalloc-0untagged`],
+  ['exec', 'implicitDeny', 'ec2:AssociateAddress', `arn:aws:ec2:${R}:${A}:network-interface/eni-0orbitary`, O],
+  ['exec', 'allowed', 'ec2:AssociateAddress', `arn:aws:ec2:${R}:${A}:elastic-ip/eipalloc-0trendigle`, T],
+  // 6. AMIs by owner; security groups and snapshots only the project's.
+  ['exec', 'allowed', 'ec2:RunInstances', `arn:aws:ec2:${R}::image/ami-0abc`, { 'ec2:Owner': 'amazon' }],
+  ['exec', 'implicitDeny', 'ec2:RunInstances', `arn:aws:ec2:${R}::image/ami-0abc`, { 'ec2:Owner': '210987654321' }],
+  ['exec', 'allowed', 'ec2:RunInstances', `arn:aws:ec2:${R}:${A}:security-group/sg-0trendigle`, T],
+  ['exec', 'implicitDeny', 'ec2:RunInstances', `arn:aws:ec2:${R}:${A}:security-group/sg-0orbitary`, { ...O, 'aws:RequestTag/Project': 'trendigle' }],
+  ['exec', 'implicitDeny', 'ec2:CreateVolume', `arn:aws:ec2:${R}::snapshot/snap-0orbitary`, { ...O, 'aws:RequestTag/Project': 'trendigle' }],
+  ['exec', 'allowed', 'ec2:CreateVolume', `arn:aws:ec2:${R}::snapshot/snap-0trendigle`, T],
+  ['exec', 'allowed', 'ec2:CreateSecurityGroup', `arn:aws:ec2:${R}:${A}:vpc/vpc-0abc`],
+  // 7. The Project tag can only be the project's, and cannot be removed.
+  ['exec', 'explicitDeny', 'ec2:CreateTags', `arn:aws:ec2:${R}:${A}:instance/i-07c0a9b38ff703056`, { ...T, 'aws:TagKeys': ['Project'], 'aws:RequestTag/Project': 'orbitary' }],
+  ['exec', 'explicitDeny', 'ec2:DeleteTags', `arn:aws:ec2:${R}:${A}:instance/i-07c0a9b38ff703056`, { ...T, 'aws:TagKeys': ['Project'] }],
+  ['exec', 'allowed', 'ec2:CreateTags', `arn:aws:ec2:${R}:${A}:instance/i-07c0a9b38ff703056`, { ...T, 'aws:TagKeys': ['Project'], 'aws:RequestTag/Project': 'trendigle' }],
+  ['exec', 'allowed', 'ec2:CreateTags', `arn:aws:ec2:${R}:${A}:instance/i-07c0a9b38ff703056`, { ...T, 'aws:TagKeys': ['Name'], 'aws:RequestTag/Name': 'box' }],
+  // 8. The second execution policy cannot be rewritten.
+  ['exec', 'explicitDeny', 'iam:CreatePolicyVersion', `arn:aws:iam::${A}:policy/trendigle-shukka-execution-infra`],
 ];
 
 async function simulate([who, , action, resource, ctx]) {
@@ -103,7 +149,10 @@ async function simulate([who, , action, resource, ctx]) {
     '--action-names', action, '--resource-arns', resource, '--output', 'json'];
   if (who === 'bounded') args.push('--permissions-boundary-policy-input-list', JSON.stringify(d.boundary));
   if (ctx) {
-    args.push('--context-entries', JSON.stringify(Object.entries(ctx).map(([k, v]) => ({ ContextKeyName: k, ContextKeyValues: [v], ContextKeyType: 'string' }))));
+    const entries = Object.entries(ctx).map(([k, v]) => Array.isArray(v)
+      ? { ContextKeyName: k, ContextKeyValues: v, ContextKeyType: 'stringList' }
+      : { ContextKeyName: k, ContextKeyValues: [v], ContextKeyType: 'string' });
+    args.push('--context-entries', JSON.stringify(entries));
   }
   const { stdout } = await run('aws', args, { maxBuffer: 16 * 1024 * 1024 });
   return JSON.parse(stdout).EvaluationResults[0].EvalDecision;
@@ -135,5 +184,5 @@ async function report(title, list) {
 }
 
 await report('spike S2 cases', cases);
-await report('finding 4 (SendCommand split)', extra);
+await report('spike holes closed', extra);
 process.exit(failed ? 1 : 0);
