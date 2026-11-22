@@ -74,6 +74,16 @@ const cases = [
   ['exec', 'implicitDeny', 'route53:ChangeResourceRecordSets', 'arn:aws:route53:::hostedzone/ZOTHERZONE'],
   ['exec', 'implicitDeny', 'iam:CreateOpenIDConnectProvider', `arn:aws:iam::${A}:oidc-provider/token.actions.githubusercontent.com`],
   ['exec', 'implicitDeny', 'iam:AttachRolePolicy', `arn:aws:iam::${A}:role/trendigle-x`],
+  // shu-9bj.6: the pipeline's own roles cannot be re-trusted or given more power through a deploy; other project
+  // roles still can be (inside the boundary).
+  ['exec', 'explicitDeny', 'iam:UpdateAssumeRolePolicy', `arn:aws:iam::${A}:role/trendigle-shukka-infra`],
+  ['exec', 'explicitDeny', 'iam:UpdateAssumeRolePolicy', `arn:aws:iam::${A}:role/trendigle-shukka-app`],
+  ['exec', 'explicitDeny', 'iam:DeleteRole', `arn:aws:iam::${A}:role/trendigle-shukka-diff`],
+  ['exec', 'explicitDeny', 'iam:PutRolePolicy', `arn:aws:iam::${A}:role/trendigle-shukka-infra`, { 'iam:PermissionsBoundary': BOUNDARY }],
+  ['exec', 'explicitDeny', 'iam:AttachRolePolicy', `arn:aws:iam::${A}:role/trendigle-shukka-app`, { 'iam:PermissionsBoundary': BOUNDARY }],
+  ['exec', 'explicitDeny', 'iam:DetachRolePolicy', `arn:aws:iam::${A}:role/trendigle-shukka-infra`],
+  ['exec', 'explicitDeny', 'iam:DeleteRolePolicy', `arn:aws:iam::${A}:role/Trendigle-shukka-infra`],
+  ['exec', 'allowed', 'iam:UpdateAssumeRolePolicy', `arn:aws:iam::${A}:role/Trendigle-prod-Instance-Role1ABCC5F0-5uGLbHErVSKT`],
   ['exec', 'implicitDeny', 'cloudformation:DeleteStack', `arn:aws:cloudformation:${R}:${A}:stack/Orbitary-prod-Data/x`],
   // What today's Trendigle roles do, which the boundary must still allow (identity policy allows everything, so
   // only the boundary decides).

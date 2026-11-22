@@ -157,7 +157,7 @@ const INFRA_SIDS = new Set([
   'EC2TagOnCreate', 'EC2ChangeOwn', 'EC2ProjectTagIsFixed', 'EC2AssociateToOwnInstance',
 ]);
 
-const IAM_SIDS = new Set(['IAMOwnRoles', 'IAMBoundedWrites', 'IAMPassOwnRoles', 'IAMInstanceProfiles', 'IAMReadOIDC', 'NoEscapeFromBoundary']);
+const IAM_SIDS = new Set(['IAMOwnRoles', 'IAMBoundedWrites', 'IAMPassOwnRoles', 'IAMInstanceProfiles', 'IAMReadOIDC', 'NoEscapeFromBoundary', 'NoChangeToCiRoles']);
 
 const DATA_SIDS = new Set(['DynamoDB', 'S3', 'Lambda', 'SQS', 'SNS', 'Alarms', 'Logs', 'Parameters']);
 
@@ -313,6 +313,14 @@ export function fenceDocuments(inputs: FenceInputs): FenceDocuments {
       Sid: 'NoEscapeFromBoundary', Effect: 'Deny',
       Action: ['iam:DeleteRolePermissionsBoundary', 'iam:CreatePolicyVersion', 'iam:DeletePolicy', 'iam:DeletePolicyVersion', 'iam:SetDefaultPolicyVersion'],
       Resource: [boundaryArn, ...execArns, ...arns((n) => `arn:aws:iam::${account}:role/${n}`)],
+    },
+    // Spike hole: the pipeline's own roles (ShukkaAccess: <project>-shukka-infra, -app, -diff) are inside <project>*, so without
+    // this a changed assembly could re-trust them to someone else or give them more power through a deploy. Changing
+    // them takes an admin deploy.
+    {
+      Sid: 'NoChangeToCiRoles', Effect: 'Deny',
+      Action: ['iam:UpdateAssumeRolePolicy', 'iam:DeleteRole', 'iam:PutRolePolicy', 'iam:AttachRolePolicy', 'iam:DetachRolePolicy', 'iam:DeleteRolePolicy'],
+      Resource: [`arn:aws:iam::${account}:role/${P}-shukka-*`, `arn:aws:iam::${account}:role/${Pc}-shukka-*`],
     },
   ];
 

@@ -90,6 +90,7 @@ const SPIKE_EXCEPTIONS: Record<'executionA' | 'executionB' | 'boundary', { chang
       'EC2DescribeOwnInstancesOnly', // no DescribeInstanceAttribute (user data) on other projects' instances
       'EC2NoSpotRequests', // spot request descriptions carry user data and cannot be fenced
       'EC2RunInstancesInterfaces', // existing network interfaces only the project's
+      'NoChangeToCiRoles', // shu-9bj.6: the pipeline's own roles cannot be re-trusted or given more power by a deploy
     ],
   },
   boundary: {
