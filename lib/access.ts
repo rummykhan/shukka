@@ -160,8 +160,9 @@ export class ShukkaAccess extends Construct {
       inlinePolicies: {
         diff: new iam.PolicyDocument({
           statements: [
-            // Templates and stack status of the project's stacks only (`<project>-…`, `<Project>-…`; the hyphen keeps
-            // out a project whose name merely starts with this one). Never the CDK lookup role (D10).
+            // Templates and stack status of the project's stacks only (`<project>-…`, `<Project>-…`). The hyphen does
+            // not keep out every other project (`trendigle-x-…` is inside `trendigle-*`): `shukka bootstrap` refuses a
+            // project name that prefixes, or is prefixed by, another project in the account. Never the CDK lookup role (D10).
             new iam.PolicyStatement({
               actions: ['cloudformation:GetTemplate', 'cloudformation:DescribeStacks'],
               resources: [project, Project].map((n) => arn('cloudformation', 'stack', `${n}-*/*`)),

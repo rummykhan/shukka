@@ -84,6 +84,9 @@ const DOMAIN_RE = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-
 const HOSTED_ZONE_RE = /^Z[A-Z0-9]{1,32}$/;
 const AMI_OWNER_RE = /^(?:amazon|aws-marketplace|\d{12})$/;
 
+/** CDK's default bootstrap qualifier (the account's stock CDKToolkit stack). A project never uses it. */
+export const DEFAULT_CDK_QUALIFIER = 'hnb659fds';
+
 /** Project names shukka refuses outright: they name shukka's own stacks, CDK's, or AWS's. */
 export const RESERVED_PROJECT_NAMES: readonly string[] = ['shukka', 'cdk', 'cdktoolkit', 'aws'];
 
@@ -101,7 +104,10 @@ export function validateProjectName(project: string): void {
     throw new Error(`shukka: project name ${JSON.stringify(project)} must match ${PROJECT_RE}`);
   }
   for (const r of RESERVED_PROJECT_NAMES) {
-    if (project === r || project.startsWith(`${r}-`)) throw new Error(`shukka: project name ${JSON.stringify(project)} is reserved (${r})`);
+    // A name that is a prefix of a reserved name is refused too (`aw` would fence `aw*`, which holds `aws*`).
+    if (project === r || project.startsWith(`${r}-`) || r.startsWith(project)) {
+      throw new Error(`shukka: project name ${JSON.stringify(project)} is reserved (${r})`);
+    }
   }
   for (const owned of SHUKKA_OWNED_STACKS) {
     if (owned.toLowerCase().startsWith(project)) {
@@ -117,6 +123,10 @@ export function validateFenceInputs(
   validateProjectName(inputs.project);
   if (!QUALIFIER_RE.test(inputs.qualifier)) {
     throw new Error(`shukka: qualifier ${JSON.stringify(inputs.qualifier)} must match ${QUALIFIER_RE}`);
+  }
+  // CDK's default qualifier names the account's shared admin bootstrap (security re-check of shu-9bj.2, access-7).
+  if (inputs.qualifier === DEFAULT_CDK_QUALIFIER) {
+    throw new Error(`shukka: qualifier ${DEFAULT_CDK_QUALIFIER} is CDK's default bootstrap; choose the project's own`);
   }
   if (!HOSTED_ZONE_RE.test(inputs.hostedZoneId)) {
     throw new Error(`shukka: hosted zone id ${JSON.stringify(inputs.hostedZoneId)} must match ${HOSTED_ZONE_RE}`);

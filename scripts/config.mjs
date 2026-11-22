@@ -19,6 +19,7 @@ import { fileURLToPath } from 'node:url';
  * @typedef {{ configure: string, units: string[], health: string }} Server
  * @typedef {{ name: string, paths: string[], build: Build, server: Server }} App
  * @typedef {{ infra: string, app: string, diff: string }} DerivedNames
+ * @typedef {{ hostedZoneIds: string[], mailDomains: string[] }} Fence
  * @typedef {{
  *   project: string,
  *   qualifier: string,
@@ -29,6 +30,7 @@ import { fileURLToPath } from 'node:url';
  *   apps: App[],
  *   smoke: { run: string } | null,
  *   alwaysDeploy: boolean,
+ *   fence: Fence,
  *   derived: DerivedNames,
  * }} Config
  * @typedef {{ config: Config | null, problems: string[] }} Result
@@ -244,6 +246,10 @@ function normalise(raw) {
     })),
     smoke: raw.smoke ? { run: raw.smoke.run } : null,
     alwaysDeploy: raw.alwaysDeploy ?? false,
+    fence: {
+      hostedZoneIds: [...(raw.fence?.hostedZoneIds ?? [])],
+      mailDomains: [...(raw.fence?.mailDomains ?? [])],
+    },
     derived: derivedNames(raw.project),
   };
 }

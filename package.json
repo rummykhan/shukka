@@ -4,6 +4,9 @@
   "description": "Reusable deployment pipeline for AWS CDK projects on GitHub Actions",
   "license": "MIT",
   "type": "module",
+  "bin": {
+    "shukka": "bin/shukka"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/rummykhan/shukka.git"
@@ -31,7 +34,6 @@
     "constructs": "^10.8.1",
     "eslint": "^10.15.0",
     "globals": "^17.14.0",
-    "tsx": "^4.23.15",
     "typescript": "~6.0.3",
     "typescript-eslint": "^8.73.0",
     "yaml": "2.9.1"
@@ -39,7 +41,9 @@
   "dependencies": {
     "@aws-sdk/client-cloudformation": "3.1162.0",
     "@aws-sdk/client-ec2": "3.1162.0",
+    "@aws-sdk/client-iam": "3.1162.0",
     "@aws-sdk/client-s3": "3.1162.0",
-    "@aws-sdk/client-ssm": "3.1162.0"
+    "@aws-sdk/client-ssm": "3.1162.0",
+    "tsx": "^4.23.15"
   }
 }
