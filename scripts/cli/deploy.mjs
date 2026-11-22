@@ -17,7 +17,8 @@
 // Every part deploys, whatever changed: an emergency deploy makes AWS match origin/main. The release script
 // redeploys a commit that is already live without harm, and an unchanged stack is a no-op for cdk.
 
-import { copyFileSync, existsSync, mkdtempSync, readFileSync, realpathSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import { copyFileSync, existsSync, lstatSync, mkdtempSync, readFileSync, realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from '../config.mjs';
@@ -26,7 +27,8 @@ import { githubRepoFromUrl, policyGuard, report as policyReport } from '../polic
 import { release } from '../release.mjs';
 import { upload } from '../upload.mjs';
 import {
-  CliError, HOST_CODE_WARNING, NPM_SAFE, PROJECT_IMAGE, cdkBin, cdkPlace, containerArgs, dockerAvailable, mustRun, projectEnv, refuseSymlink, tempDir,
+  CliError, HOST_CODE_WARNING, NPM_SAFE, cdkBin, cdkPlace, containerArgs, dockerAvailable, ensureProjectImage, mustRun, projectEnv, refuseSymlink,
+  startServices, tempDir,
 } from './exec.mjs';
 
 const SHUKKA_DIR = fileURLToPath(new URL('../../', import.meta.url));
@@ -40,12 +42,13 @@ export const SESSION_NAME = 'shukka-emergency';
  * @typedef {import('../config.mjs').Config} Config
  * @typedef {{ profile?: string, region?: string }} Target
  * @typedef {{ root: string, sha: string, tree: string, config: Config, aws: Aws }} Prepared
- * @typedef {{ cwd: string, env?: Record<string, string>, capture?: false | 'stdout' }} StepOptions
+ * @typedef {{ cwd: string, env?: Record<string, string>, capture?: false | 'stdout', network?: string }} StepOptions network: a container whose network the step joins (container mode only)
  * @typedef {import('./exec.mjs').RunResult} RunResult
  * @typedef {{
  *   inContainer: boolean,
  *   exec: (cmd: string, args: string[], options: StepOptions) => RunResult,
  *   run: (what: string, cmd: string, args: string[], options: StepOptions) => RunResult,
+ *   services: (check: string, names: string[]) => { network?: string, stop: () => void },
  * }} ProjectSteps exec returns the result; run fails with `<what> failed (exit N)` on a non-zero exit
  */
 
@@ -146,8 +149,10 @@ export const NO_DOCKER = 'refusing: Docker is not available, and the project\'s 
 
 /**
  * How the project's own code runs (every npm ci, synth, check, build, bundle and smoke command): in a throwaway
- * container of PROJECT_IMAGE when Docker answers (exec.mjs containerArgs: only `tree` mounted, no home directory,
- * only the variables given here), else on this machine with projectEnv when `trust` is set, else refused.
+ * container of the project image (exec.mjs ensureProjectImage, built here when missing) when Docker answers
+ * (exec.mjs containerArgs: only `tree` mounted, no home directory, only the variables given here; a check's services
+ * as sibling containers, exec.mjs startServices), else on this machine with projectEnv when `trust` is set (services
+ * are then the caller's to start), else refused.
  * @param {Io} io
  * @param {string} tree
  * @param {Config} config
@@ -158,23 +163,33 @@ export function projectSteps(io, tree, config, trust) {
   const base = { CDK_DEFAULT_ACCOUNT: config.aws.account, CDK_DEFAULT_REGION: config.aws.region };
   /** @type {(cmd: string, args: string[], options: StepOptions) => RunResult} */
   let exec;
+  /** @type {ProjectSteps['services']} */
+  let services;
   const inContainer = dockerAvailable(io);
   if (inContainer) {
-    io.say(`the project's code (npm ci, cdk synth, checks, build, bundle, smoke) runs in throwaway containers of ${PROJECT_IMAGE}: `
+    const image = ensureProjectImage(io);
+    io.say(`the project's code (npm ci, cdk synth, checks, build, bundle, smoke) runs in throwaway containers of ${image}: `
       + `only ${tree} is mounted, no home directory, no AWS or GitHub credentials`);
     exec = (cmd, args, options) => io.run('docker', containerArgs({
-      tree, cwd: options.cwd, env: { ...base, ...options.env }, cmd, args, label: config.project,
+      image, tree, cwd: options.cwd, env: { ...base, ...options.env }, cmd, args, label: config.project,
+      ...(options.network ? { network: options.network } : {}),
     }), options.capture ? { capture: options.capture } : {});
+    services = (check, names) => startServices(io, check, names, `${config.project}-${randomBytes(4).toString('hex')}`);
   } else {
     if (!trust) throw new CliError(NO_DOCKER);
     io.warn(HOST_CODE_WARNING);
     exec = (cmd, args, options) => io.run(cmd, args, {
       cwd: options.cwd, fullEnv: codeEnv(config, options.env), ...(options.capture ? { capture: options.capture } : {}),
     });
+    services = (check, names) => {
+      io.warn(`check ${check} uses services (${names.join(', ')}) that CI starts; without Docker shukka does not, start them yourself`);
+      return { stop: () => {} };
+    };
   }
   return {
     inContainer,
     exec,
+    services,
     run(what, cmd, args, options) {
       const r = exec(cmd, args, options);
       if (r.status !== 0) throw new CliError(`${what} failed (exit ${r.status})`);
@@ -410,13 +425,17 @@ function deployStacks(io, config, session, assembly, sha) {
  */
 function runChecks(io, steps, tree, config) {
   for (const check of config.checks) {
-    if (check.services.length > 0) {
-      io.warn(`check ${check.name} uses services (${check.services.join(', ')}) that CI starts; shukka deploy does not, start them yourself`);
+    const services = check.services.length > 0 ? steps.services(check.name, check.services) : { stop: () => {} };
+    try {
+      check.run.forEach((command, i) => {
+        io.say(`check ${check.name}, command ${i + 1} of ${check.run.length}`);
+        steps.run(`check ${check.name} (command ${i + 1})`, 'bash', ['-eo', 'pipefail', '-c', command], {
+          cwd: join(tree, check.dir), ...(services.network ? { network: services.network } : {}),
+        });
+      });
+    } finally {
+      services.stop();
     }
-    check.run.forEach((command, i) => {
-      io.say(`check ${check.name}, command ${i + 1} of ${check.run.length}`);
-      steps.run(`check ${check.name} (command ${i + 1})`, 'bash', ['-eo', 'pipefail', '-c', command], { cwd: join(tree, check.dir) });
-    });
   }
 }
 
@@ -468,10 +487,39 @@ async function build(io, steps, aws, tree, config, app, env) {
   if (io.dryRun) return `<directory printed by ${app.build.bundle}>`;
   const dir = r.stdout.split('\n').map((l) => l.trim()).filter(Boolean).pop();
   if (!dir) throw new CliError(`build ${app.name}: the bundle script did not print a directory`);
-  const bundle = resolve(cwd, dir);
-  if (steps.inContainer && !inside(tree, bundle)) {
-    throw new CliError(`build ${app.name}: the bundle script printed ${bundle}, outside the checkout; only the checkout outlives the container`);
+  return checkBundlePath(tree, resolve(cwd, dir), app.name);
+}
+
+/**
+ * The bundle directory, refused unless it is a real directory inside the checkout: no part of its path below the
+ * tree may be a symbolic link (one made by the bundle script, or committed, could point at ~/.aws, and the upload
+ * would follow it), and its real path must be inside the tree's real path. Only the checkout outlives the container.
+ * @param {string} tree
+ * @param {string} bundle
+ * @param {string} app
+ * @returns {string}
+ */
+export function checkBundlePath(tree, bundle, app) {
+  if (!inside(tree, bundle)) throw new CliError(`build ${app}: the bundle script printed ${bundle}, outside the checkout; only the checkout outlives the container`);
+  let at = tree;
+  for (const part of relative(tree, bundle).split(/[\\/]/).filter(Boolean)) {
+    at = join(at, part);
+    let st;
+    try {
+      st = lstatSync(at);
+    } catch {
+      throw new CliError(`build ${app}: the bundle directory ${bundle} does not exist`);
+    }
+    if (st.isSymbolicLink()) throw new CliError(`build ${app}: refusing the bundle ${bundle}: ${at} is a symbolic link`);
   }
+  let real;
+  try {
+    real = realpathSync(bundle);
+  } catch {
+    throw new CliError(`build ${app}: the bundle directory ${bundle} does not exist`);
+  }
+  if (!inside(realpathSync(tree), real)) throw new CliError(`build ${app}: refusing the bundle ${bundle}: its real path ${real} is outside the checkout`);
+  if (!lstatSync(real).isDirectory()) throw new CliError(`build ${app}: the bundle ${bundle} is not a directory`);
   return bundle;
 }
 

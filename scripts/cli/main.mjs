@@ -5,7 +5,7 @@
 // 10 to 13 a release failed with the release script's code (scripts/release.mjs).
 
 import { realAws } from './aws.mjs';
-import { CliError, HOST_CODE_WARNING, PROJECT_IMAGE, cleanTemps, createIo } from './exec.mjs';
+import { CliError, HOST_CODE_WARNING, PROJECT_BASE_IMAGE, PROJECT_PLATFORM, SERVICES, cleanTemps, createIo } from './exec.mjs';
 
 /**
  * @typedef {{ name: string, value?: string, repeat?: boolean, help: string }} FlagSpec
@@ -20,14 +20,21 @@ const TRUST = { name: 'trust-project-code', help: "without Docker, run the proje
 
 /** How diff and deploy run the project's own code: the same text in both commands' help. */
 const PROJECT_CODE_HELP = [
-  "Project code: npm ci, cdk synth, the checks, build, bundle and smoke run in throwaway Docker containers",
-  `(docker run --rm) of ${PROJECT_IMAGE}`,
-  '(Node 22, Debian bookworm, pinned by digest). Only the fresh worktree is mounted, read-write, at its own path;',
-  'the container runs as your user and group, so files written back are yours; it has no home directory of yours',
-  '(HOME=/tmp inside), no capabilities, and none of your environment: only CI=true, CDK_DEFAULT_ACCOUNT,',
-  "CDK_DEFAULT_REGION and the app's build env and buildEnv values (names starting AWS_, GH_ or GITHUB_, and HOME,",
-  'are refused). The network is allowed (npm needs it). git metadata is not in the container (the worktree\'s .git',
-  'points outside it). cdk diff and cdk deploy then run on this machine, as below, on the assembly the container wrote.',
+  'Project code: npm ci, cdk synth, the checks, build, bundle and smoke run in throwaway Docker containers',
+  `(docker run --rm --platform ${PROJECT_PLATFORM}) of the image shukka-project:<hash>, built here from shukka's`,
+  'scripts/cli/image/Dockerfile the first time and again only when that file changes. Its base is node:22 (Debian',
+  'bookworm) pinned by its multi-platform index digest',
+  `(${PROJECT_BASE_IMAGE}); it holds Node 22, npm, npx,`,
+  'bash, git, curl, jq, python3, make, gcc, g++ and ca-certificates. Only the fresh worktree is mounted, read-write,',
+  'at its own path; the container runs as your user and group, so files written back are yours; it has no home',
+  'directory of yours (HOME=/tmp inside), no capabilities, and none of your environment: only CI=true,',
+  "CDK_DEFAULT_ACCOUNT, CDK_DEFAULT_REGION and the app's build env and buildEnv values (names starting AWS_, GH_ or",
+  'GITHUB_, and HOME, are refused). The network is allowed (npm needs it). A check\'s services',
+  `(${Object.keys(SERVICES).join(', ')}) start as sibling containers from the images the workflows use and the check`,
+  'joins their network, so it reaches them on localhost as in CI; they are removed when the check ends. Any other',
+  'service is refused: use --skip-checks. git metadata is not in the container (the worktree\'s .git points outside',
+  'it). The bundle must be a real directory inside the worktree (no symbolic link). cdk diff and cdk deploy then',
+  'run on this machine, as below, on the assembly the container wrote.',
   'Without Docker, diff and deploy refuse unless --trust-project-code is given, and then print this warning:',
   `  ${HOST_CODE_WARNING}.`,
 ];

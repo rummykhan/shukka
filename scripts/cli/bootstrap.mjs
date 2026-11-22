@@ -450,7 +450,9 @@ export async function bootstrapProject(options) {
       io.err(`shukka: ${KIND_NAMES[r.kind]} ${r.path ? `${r.path}${r.name}` : r.name} matches the fence (${project}*, ${Project}*) but is in no stack of ${project}\n`);
     }
     throw new CliError(`${clashes.length} resource(s) in this account (above) are named like ${project} but belong to no stack tagged `
-      + `Project=${project}: the fence would let ${project}'s pipeline change or delete them. Choose a project name nothing else in the account starts with`);
+      + `Project=${project} in this region: the fence would let ${project}'s pipeline change or delete them. Choose a project name nothing else in `
+      + `the account starts with. A stack of ${project} in another region, or a resource a deleted stack retained, also causes this refusal: `
+      + 'delete or rename what is left over, or deploy the project in one region');
   }
 
   // buildEnv values, read now so a missing one stops the bootstrap before anything changes.

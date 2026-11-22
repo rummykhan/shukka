@@ -5,10 +5,12 @@
 // commands (git, `aws sts get-caller-identity`) still run in a dry run, because what is printed depends on them.
 
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { closeSync, lstatSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 /**
  * @typedef {{
@@ -185,12 +187,44 @@ export function projectEnv(extra = {}, from = process.env) {
   return env;
 }
 
+/** node:22 (Debian bookworm) by its multi-platform index digest: the base of the project image (image/Dockerfile). */
+export const PROJECT_BASE_IMAGE = 'node:22@sha256:e13726ca604184d7a91fcacab1fc09eefd642dc28e79ac34e85540dd93b78cfb';
+
+/** The Dockerfile of the image the project's own code runs in. */
+export const PROJECT_DOCKERFILE = fileURLToPath(new URL('./image/Dockerfile', import.meta.url));
+
 /**
- * The image the project's own code runs in for `shukka diff` and `shukka deploy`: Node 22 on Debian bookworm (bash,
- * git, python3 and a compiler for native modules, as on GitHub's runners), pinned by its multi-platform index digest
- * so a moved tag cannot change what runs.
+ * The platform every project container (and the services of a check) is built and run for: linux/amd64, the
+ * architecture of the GitHub-hosted runners that run the same steps in CI, so native modules and binaries come out
+ * the same. On an arm64 machine Docker emulates it (slower).
  */
-export const PROJECT_IMAGE = 'node:22@sha256:e13726ca604184d7a91fcacab1fc09eefd642dc28e79ac34e85540dd93b78cfb';
+export const PROJECT_PLATFORM = 'linux/amd64';
+
+/** The local tag of the project image: shukka-project:<first 16 hex of the Dockerfile's SHA-256>. */
+export function projectImage() {
+  return `shukka-project:${createHash('sha256').update(readFileSync(PROJECT_DOCKERFILE)).digest('hex').slice(0, 16)}`;
+}
+
+/**
+ * Build the project image unless this Docker already has it (`docker image inspect`, read-only); returns its tag.
+ * The build context is an empty directory: the Dockerfile copies nothing in.
+ * @param {Io} io
+ * @returns {string}
+ */
+export function ensureProjectImage(io) {
+  const tag = projectImage();
+  if (io.run('docker', ['image', 'inspect', '--format', '{{.Id}}', tag], { mutates: false, capture: 'merged' }).status === 0) return tag;
+  mustRun(io, `docker build of ${tag}`, 'docker', ['build', '--platform', PROJECT_PLATFORM, '--tag', tag, '--file', PROJECT_DOCKERFILE, tempDir('image')]);
+  return tag;
+}
+
+/**
+ * Services a check may name (shukka.json checks[].services), as pipeline.yml's "Start services" step starts them:
+ * the same image and the port the check reaches on localhost. A test keeps the two in step.
+ */
+export const SERVICES = Object.freeze({
+  'dynamodb-local': { image: 'amazon/dynamodb-local:3.3.1@sha256:ff89bd48ff32cd8d9be5fee8873b65b8854dc408f1afe881be6eb00247bc0dab', port: 8000 },
+});
 
 /** Variable names never passed into the project's container: credentials and the caller's home. */
 const NOT_PASSED = /^(AWS_|GH_|GITHUB_|HOME$)/i;
@@ -218,13 +252,14 @@ export function dockerAvailable(io) {
 let containers = 0;
 
 /**
- * The `docker run` arguments (after `docker`) that run `cmd args` in a throwaway container of PROJECT_IMAGE: only
- * `tree` mounted, read-write, at its own path (so paths printed inside mean the same outside); as the caller's user
- * and group, so files written back are the caller's; HOME=/tmp inside the container (nothing of the caller's home);
- * no capabilities, no privilege gain; the default network (npm needs it). The container sees no variable of this
- * process: only HOME, CI=true and `env`, which is written to an --env-file in a shukka temp directory (values stay off
- * the command line).
- * @param {{ tree: string, cwd: string, env: Record<string, string>, cmd: string, args: string[], label?: string }} spec
+ * The `docker run` arguments (after `docker`) that run `cmd args` in a throwaway container of `image` (the project
+ * image) for PROJECT_PLATFORM: only `tree` mounted, read-write, at its own path (so paths printed inside mean the
+ * same outside); as the caller's user and group, so files written back are the caller's; HOME=/tmp inside the
+ * container (nothing of the caller's home); no capabilities, no privilege gain; the default network (npm needs it),
+ * or with `network` the network of that container (a check's services, reached on localhost). The container sees no
+ * variable of this process: only HOME, CI=true and `env`, which is written to an --env-file in a shukka temp
+ * directory (values stay off the command line).
+ * @param {{ image: string, tree: string, cwd: string, env: Record<string, string>, cmd: string, args: string[], label?: string, network?: string }} spec
  * @returns {string[]}
  */
 export function containerArgs(spec) {
@@ -244,15 +279,57 @@ export function containerArgs(spec) {
   const gid = process.getgid?.() ?? 1000;
   containers += 1;
   return [
-    'run', '--rm',
+    'run', '--rm', '--platform', PROJECT_PLATFORM,
     '--name', `shukka-${spec.label ?? 'step'}-${process.pid}-${containers}`,
     '--user', `${uid}:${gid}`,
     '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
+    ...(spec.network ? ['--network', `container:${spec.network}`] : []),
     '--mount', `type=bind,source=${spec.tree},target=${spec.tree}`,
     '--workdir', spec.cwd,
     '--env', 'HOME=/tmp', '--env', 'CI=true', '--env-file', envFile,
-    PROJECT_IMAGE, spec.cmd, ...spec.args,
+    spec.image, spec.cmd, ...spec.args,
   ];
+}
+
+/**
+ * Start a check's services as sibling containers for PROJECT_PLATFORM (detached, removed when stopped, nothing
+ * mounted, names carrying `runId`): the first on the default network, the others in its network, so the check,
+ * run with `--network container:<first>`, reaches each on localhost:<port> as in CI. Returns the first container's
+ * name (the network) and a stop() that removes them all. Refuses a service shukka does not know.
+ * @param {Io} io
+ * @param {string} check the check's name, for messages
+ * @param {string[]} services
+ * @param {string} runId
+ * @returns {{ network: string, stop: () => void }}
+ */
+export function startServices(io, check, services, runId) {
+  /** @type {Record<string, { image: string, port: number }>} */
+  const known = SERVICES;
+  for (const s of services) {
+    if (!Object.hasOwn(known, s)) {
+      throw new CliError(`check ${check} uses service "${s}", which shukka cannot start (known: ${Object.keys(known).join(', ')}); `
+        + 'run with --skip-checks to deploy without the checks');
+    }
+  }
+  /** @type {string[]} */
+  const names = [];
+  const stop = () => {
+    if (names.length > 0) io.run('docker', ['rm', '--force', ...names], { capture: 'merged' });
+  };
+  try {
+    for (const s of services) {
+      const name = `shukka-${runId}-${s}`;
+      const network = names[0] ? ['--network', `container:${names[0]}`] : [];
+      mustRun(io, `starting service ${s} for check ${check}`, 'docker', [
+        'run', '--detach', '--rm', '--platform', PROJECT_PLATFORM, '--name', name, ...network, /** @type {{ image: string }} */ (known[s]).image,
+      ], { capture: 'merged' });
+      names.push(name);
+    }
+  } catch (error) {
+    stop();
+    throw error;
+  }
+  return { network: /** @type {string} */ (names[0]), stop };
 }
 
 /** npm settings for the cdk child: no project .npmrc can choose the shell or the registry. */
