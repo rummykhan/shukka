@@ -686,14 +686,14 @@ test('shu-9zr: infra deploy tags every stack shukka:revision=<sha>, keeping each
   const same = await runStep(ws, infra, 'deploy', 'Deploy', {});
   assert.equal(same.code, 0, same.out);
   assert.equal(same.outputs.deployed, 'true');
-  assert.deepEqual(same.cdk, [`deploy --app ${assembly} --require-approval never --no-color --all --tags Project=shukkatest --tags shukka:revision=${head}`]);
+  assert.deepEqual(same.cdk, [`deploy --app ${assembly} --require-approval never --no-color --all --tags=Project=shukkatest --tags=shukka:revision=${head}`]);
 
   writeFileSync(join(assembly, 'manifest.json'), manifest((id) => ({ Project: 'shukkatest', Part: id })));
   const each = await runStep(ws, infra, 'deploy', 'Deploy', {});
   assert.equal(each.code, 0, each.out);
   assert.deepEqual(each.cdk, [
-    `deploy --app ${assembly} --require-approval never --no-color --exclusively Shukkatest-Box --tags Project=shukkatest --tags Part=Box --tags shukka:revision=${head}`,
-    `deploy --app ${assembly} --require-approval never --no-color --exclusively Shukkatest-Ci --tags Project=shukkatest --tags Part=Ci --tags shukka:revision=${head}`,
+    `deploy --app ${assembly} --require-approval never --no-color --exclusively Shukkatest-Box --tags=Project=shukkatest --tags=Part=Box --tags=shukka:revision=${head}`,
+    `deploy --app ${assembly} --require-approval never --no-color --exclusively Shukkatest-Ci --tags=Project=shukkatest --tags=Part=Ci --tags=shukka:revision=${head}`,
   ], 'dependencies first');
 
   const failed = await runStep(ws, infra, 'deploy', 'Deploy', {}, { FAKE_DEPLOY_STATUS: '1' });
