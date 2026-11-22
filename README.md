@@ -73,6 +73,7 @@ Inside the pipeline:
 Read this part before you adopt shukka.
 
 - **Anyone who can push to your `main` can change your project's resources**, delete its data, and run code as root on its servers (through the configure hook and the app itself). Merge to `main` is the production approval. The destructive-change guard stops accidents, not someone who intends harm: they can tick `allow_replacement`, or change your app's code. Protect `main` (branch protection, required review) if your plan allows it, and limit who can push.
+- **Anyone who can push to `main` can change who your CI roles trust.** The CI stack (`ShukkaAccess`) is deployed by the pipeline like any other stack, and its roles are inside your fence, so a merge can rewrite their trust policies to admit an outside principal (another AWS account, another repository). That principal then holds your pipeline's access: still fenced to your project, but no longer tied to shukka's workflows on your `main`. v1 does not stop such a change; review every diff to `<Project>-Ci`.
 - **What the pipeline shows is visible to anyone who can read your repository.** The run summaries and the pull-request comment hold the full `cdk diff` (template contents included); the release output holds everything the release script and your configure hook print. shukka never prints your settings files, but it cannot stop your hook, build or smoke commands from printing a secret. In a public repository that means the whole world: keep secrets out of templates, user data, State Manager association parameters and configure-hook output.
 - **`shukka.json` names your AWS account id and project name.** In a public repository, anyone can read which account you deploy to and what your project's resources are called. That is not a credential, but it is a map.
 - **User data and launch templates must hold no secrets.** EC2's describe calls (including `DescribeLaunchTemplateVersions`, which returns user data) cannot be limited to one project, so every project's pipeline can read every instance's description in the account. Keep secrets in SSM Parameter Store (`/<project>/prod/...`) and read them on the server.
@@ -107,7 +108,7 @@ npx github:rummykhan/shukka#v1 bootstrap --account --region us-east-1 --profile 
   --oidc-provider-arn arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com
 ```
 
-Every command takes `--dry-run`, which runs the lookups and prints what would change without changing anything.
+`bootstrap` and `deploy` take `--dry-run`, which runs the lookups and prints what would change without changing anything. `diff` has no `--dry-run`: it changes nothing anyway.
 
 ### 2. Write `shukka.json`
 
@@ -138,14 +139,14 @@ In your project root. The schema (`schema/shukka.schema.json`) documents every f
 }
 ```
 
-- `project`: lowercase, 2 to 21 characters, and **not a prefix of another project's name** in the account (nor prefixed by one). It prefixes every resource, stack and role. Not `shukka`, `cdk`, `cdktoolkit` or `aws`.
-- `qualifier`: your CDK bootstrap qualifier, at most 10 lowercase letters and digits. Usually the project name.
+- `project`: lowercase, 2 to 21 characters, and **not a prefix of another project's name** in the account (nor prefixed by one). It prefixes every resource, stack and role. Reserved: `shukka`, `cdk`, `cdktoolkit` and `aws`, any prefix of them (`aw`, `shuk`), and any `<reserved>-…` name (`aws-tools`).
+- `qualifier`: your CDK bootstrap qualifier: starts with a letter, 2 to 10 lowercase letters and digits. Usually the project name.
 - `checks`: commands run on pull requests and merges, with no AWS access. The only service shukka can start is `dynamodb-local`.
 - `infra.dir`: where your CDK app lives (`cdk.json`, `package-lock.json`); `infra.paths`: the files that count as an infrastructure change.
 - `apps[].build.bundle`: a script in the build dir that prints the path of the directory to ship. `scripts/bundle.sh` is provided by shukka for Next.js `output: 'standalone'` (it adds `.next/static` and `public` and deletes every `.env*`).
 - `apps[].build.env`: non-secret values written in the file. `buildEnv`: names of non-secret values read from GitHub repository variables (step 6 copies them there).
 - `apps[].server.health`: a URL on the server itself (`127.0.0.1` or `localhost`).
-- `aws.deployBucket`: optional; the bucket for app bundles. Default `<project>-deploy-<account>`.
+- `aws.deployBucket`: optional; the bucket for app bundles. Default `<project>-deploy-<account>`. If you set it, it must start with the project name, or your stacks cannot create it through the fence.
 - `alwaysDeploy`: deploy everything on every merge. Default `false`.
 - `fence`: the hosted zone (exactly one, by id) and the SES domains your stacks may change. Read by `shukka bootstrap`.
 
@@ -157,8 +158,11 @@ Install shukka's constructs from the same tag as a git dependency, in your infra
 
 ```bash
 cd infra
-npm install --save github:rummykhan/shukka#v1 aws-cdk-lib constructs tsx
+npm install --save github:rummykhan/shukka#v1.2.3 aws-cdk-lib constructs tsx
+npm install --save-dev --save-exact aws-cdk@2.1148.0
 ```
+
+Use an exact tag for the constructs (see [Versioning](#versioning-and-pins)). `aws-cdk` at shukka's pinned version (2.1148.0 in this release) keeps your local `cdk` reading the same cloud assembly as the pipeline's.
 
 shukka's constructs are TypeScript source, so run your CDK app with `tsx` (`cdk.json`: `"app": "npx tsx bin/app.ts"`; it works for a `.mjs` app too). Import them from `shukka/lib/index.ts`. Commit `package-lock.json`: the pipeline runs `npm ci`.
 
@@ -222,7 +226,7 @@ aws ssm put-parameter --name /acme/prod/CONTACT_EMAIL --type String --value hell
 
 Before changing anything, bootstrap refuses: a project name that prefixes another project in the account (or is prefixed by one); a hosted zone or mail domain already in another project's fence; a qualifier already used by something other than shukka for this project (or CDK's default `hnb659fds`); private CloudFormation extensions in the account (they run with their own roles; `--allow-private-types` goes ahead after listing them); and roles named like the project that lack its boundary.
 
-Useful flags: `--hosted-zone-id` and `--mail-domain` override `fence` in `shukka.json`; `--emergency-principal <role or user ARN>` (repeatable) names who may run `shukka deploy` from a laptop (default: whoever runs the bootstrap); `--dry-run`. Running it again is safe and is how you change the fence or the emergency principals.
+Useful flags: `--hosted-zone-id` and `--mail-domain` override `fence` in `shukka.json`; `--emergency-principal <role or user ARN>` (repeatable) names who may run `shukka deploy` from a laptop (default: whoever runs the bootstrap; the account root is refused, so run it as an IAM role or user); `--dry-run`. Running it again is safe and is how you change the fence or the emergency principals. **Re-running without `--emergency-principal` resets the emergency principals to whoever runs it**, so name every principal you want to keep each time.
 
 ### 5. Deploy the CI stack once, by hand
 
@@ -269,7 +273,7 @@ jobs:
       force: ${{ inputs.force || false }}
 ```
 
-Inputs: `config` (path of `shukka.json`, default `shukka.json`), `allow_replacement` (honoured only on a run started by hand on `main`), `force` (deploy every part whatever changed), and `shukka_ref` (only when `plan` says it cannot read the caller file). If your organisation restricts which actions may run, allow `rummykhan/shukka` and the actions its workflows pin (`actions/checkout`, `actions/setup-node`, `actions/upload-artifact`, `actions/download-artifact`).
+Inputs: `config` (path of `shukka.json`, default `shukka.json`), `allow_replacement` (honoured only on a run started by hand on `main`), `force` (deploy every part whatever changed), and `shukka_ref` (only when `plan` says it cannot read the caller file). If your organisation restricts which actions may run, allow `rummykhan/shukka` and the actions its workflows pin (`actions/checkout`, `actions/setup-node`, `actions/upload-artifact`, `actions/download-artifact`, and `aws-actions/configure-aws-credentials`, which every credentialed job uses).
 
 Push it to `main`. The first merge deploys everything: no stack carries a `shukka:revision` tag yet and no server has a `REVISION` file.
 
@@ -339,7 +343,7 @@ gh workflow run CI --repo acme-org/acme --ref main -f allow_replacement=true
 
 Other CloudFormation states that need an admin:
 
-- **A stack whose first create failed** (`ROLLBACK_COMPLETE`) must be deleted by an admin before the pipeline can create it again. The deploy role refuses `DeleteStack` without the project's execution role, which is how CDK deletes it.
+- **A stack whose first create failed** (`ROLLBACK_COMPLETE`) must be deleted by an admin before the pipeline can create it again. CDK deletes such a stack without passing a `RoleArn`, and the deploy role denies every `DeleteStack` without the project's execution role as `RoleArn`.
 
   ```bash
   aws cloudformation delete-stack --stack-name Acme-Box --profile admin
@@ -423,11 +427,13 @@ There are four places a project names a version. Keep them on the same one:
 | Where | `@v1` (follow v1) | Pinned |
 |---|---|---|
 | Caller workflow | `uses: rummykhan/shukka/.github/workflows/pipeline.yml@v1` | `...@v1.2.3` |
-| Constructs (infra `package.json`) | `"shukka": "github:rummykhan/shukka#v1"` | `#v1.2.3` |
+| Constructs (infra `package.json` and lockfile) | does not follow; see below | `github:rummykhan/shukka#v1.2.3` |
 | CLI | `npx github:rummykhan/shukka#v1 ...` | `#v1.2.3` |
 | `shukka.json` `$schema` | `.../shukka/v1/schema/shukka.schema.json` | `.../v1.2.3/...` |
 
-`@v1` means every v1 release reaches you on your next run. `@v1.2.3` means nothing changes until you bump it. A project pinned to v1.0 is not affected by v1.1.
+In the caller workflow, `@v1` means every v1 release reaches you on your next run, and `@v1.2.3` means nothing changes until you bump it. A project pinned to v1.0 is not affected by v1.1.
+
+The constructs are different: npm records the commit a git dependency resolved to in `package-lock.json`, so even `#v1` stays on that commit. The constructs move only when you run `npm install github:rummykhan/shukka#<tag>` (or `npm update shukka`) and commit the lockfile. Use an exact tag there, and bump it in the same commit as the workflow pin, so the constructs your stacks are built with and the workflows that deploy them come from the same release.
 
 Pin to **tags only**. Your roles trust `infra.yml` and `ec2.yml` at `refs/tags/v1` and `refs/tags/v1.*` (`shukkaVersions` on `ShukkaAccess`), so a branch or commit SHA in `uses:` is refused by AWS. The file names `pipeline.yml`, `infra.yml` and `ec2.yml` are part of the v1 contract and will not change within v1.
 

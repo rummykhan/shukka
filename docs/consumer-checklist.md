@@ -6,7 +6,7 @@ task: shu-e08
 
 Every step a new project takes, in order, each with its command. The [README](../README.md#adopting-shukka) explains why each one is there; read its [security model](../README.md#security-model) first.
 
-Example values: project `acme`, repository `acme-org/acme`, account `123456789012`, region `us-east-1`, admin profile `admin`, project checkout `~/src/acme`. Replace them with yours. Every `shukka` command takes `--dry-run`.
+Example values: project `acme`, repository `acme-org/acme`, account `123456789012`, region `us-east-1`, admin profile `admin`, project checkout `~/src/acme`. Replace them with yours. `shukka bootstrap` and `shukka deploy` take `--dry-run`; `shukka diff` changes nothing anyway.
 
 ## Before you start
 
@@ -22,7 +22,7 @@ Example values: project `acme`, repository `acme-org/acme`, account `12345678901
   aws sts get-caller-identity --profile admin
   ```
 
-- [ ] Pick a project name that is not a prefix of another project in the account, and is not prefixed by one. List the projects shukka knows:
+- [ ] Pick a project name (and a qualifier: a letter first, 2 to 10 lowercase letters and digits) that is not `shukka`, `cdk`, `cdktoolkit` or `aws`, a prefix of one, or `<reserved>-…`, and is not a prefix of another project in the account, and is not prefixed by one. List the projects shukka knows (if the `Shukka-Account` stack exists):
 
   ```bash
   aws cloudformation describe-stacks --stack-name Shukka-Account --profile admin \
@@ -69,7 +69,8 @@ Example values: project `acme`, repository `acme-org/acme`, account `12345678901
 
   ```bash
   cd ~/src/acme/infra
-  npm install --save github:rummykhan/shukka#v1 aws-cdk-lib constructs tsx
+  npm install --save github:rummykhan/shukka#v1.2.3 aws-cdk-lib constructs tsx   # an exact tag
+  npm install --save-dev --save-exact aws-cdk@2.1148.0                          # shukka's pinned cdk CLI
   git add package.json package-lock.json
   ```
 
@@ -79,7 +80,7 @@ Example values: project `acme`, repository `acme-org/acme`, account `12345678901
 
 - [ ] Every stack is named `<project>-...` or `<Project>-...`; every resource you name starts with the project name. Stacks use only the services the fence covers (README, "What the fence stops").
 
-- [ ] A stack creates the deploy bucket `<project>-deploy-<account>` (public access blocked, SSL enforced, 30-day expiry on `<project>/`).
+- [ ] A stack creates the deploy bucket `<project>-deploy-<account>` (a custom `aws.deployBucket` must start with the project name; public access blocked, SSL enforced, 30-day expiry on `<project>/`).
 
 - [ ] The server has the tag `Project=<project>`, an instance role with `AmazonSSMManagedInstanceCore` and read on `s3://<bucket>/<project>/*`, and `bash`, AWS CLI, `curl`, `flock`, systemd (Amazon Linux 2023 has them). No secrets in user data or launch templates.
 
@@ -118,7 +119,7 @@ Example values: project `acme`, repository `acme-org/acme`, account `12345678901
   npx github:rummykhan/shukka#v1 bootstrap acme --config ~/src/acme/shukka.json --repo acme-org/acme --profile admin
   ```
 
-  Add `--emergency-principal <role or user ARN>` for each principal that may run `shukka deploy` (default: whoever runs this).
+  Add `--emergency-principal <role or user ARN>` for each principal that may run `shukka deploy` (default: whoever runs this; the account root is refused). Re-running without it resets the principals to whoever runs it.
 
 - [ ] Check the stacks and the repository variables exist:
 
@@ -144,7 +145,7 @@ Example values: project `acme`, repository `acme-org/acme`, account `12345678901
 
 ## Turn the pipeline on
 
-- [ ] If your organisation restricts actions, allow `rummykhan/shukka` and the actions it pins (`actions/checkout`, `actions/setup-node`, `actions/upload-artifact`, `actions/download-artifact`).
+- [ ] If your organisation restricts actions, allow `rummykhan/shukka` and the actions it pins (`actions/checkout`, `actions/setup-node`, `actions/upload-artifact`, `actions/download-artifact`, `aws-actions/configure-aws-credentials`).
 
 - [ ] Add the caller workflow `.github/workflows/ci.yml` (README, step 7) as the only CI file, remove any other deploying workflow, and push to `main`. The first merge deploys everything.
 
@@ -176,4 +177,5 @@ Example values: project `acme`, repository `acme-org/acme`, account `12345678901
   ```
 
 - [ ] Set an AWS budget alert and watch Actions minutes for the first month.
-- [ ] Decide on a pin: stay on `@v1`, or pin `@v1.x.y` in the caller, `package.json`, the CLI and `$schema` together.
+- [ ] Decide on a pin: `@v1` or `@v1.x.y` in the caller. The constructs stay on the commit in `package-lock.json` until you run `npm install github:rummykhan/shukka#<tag>` and commit the lockfile; bump them with the caller pin, in one commit.
+- [ ] Review every pull request that changes `<Project>-Ci`: a merge can make your CI roles trust an outside principal.
