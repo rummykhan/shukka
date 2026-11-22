@@ -164,13 +164,13 @@ npm install --save-dev --save-exact aws-cdk@2.1148.0
 
 Use an exact tag for the constructs (see [Versioning](#versioning-and-pins)). `aws-cdk` at shukka's pinned version (2.1148.0 in this release) keeps your local `cdk` reading the same cloud assembly as the pipeline's.
 
-shukka's constructs are TypeScript source, so run your CDK app with `tsx` (`cdk.json`: `"app": "npx tsx bin/app.ts"`; it works for a `.mjs` app too). Import them from `shukka/lib/index.ts`. Commit `package-lock.json`: the pipeline runs `npm ci`.
+shukka's constructs are TypeScript source, so run your CDK app with `tsx` (`cdk.json`: `"app": "npx tsx bin/app.ts"`; it works for a `.mjs` app too). Import them from `shukka` (the package entry point; `shukka/lib/index.ts` also works). Commit `package-lock.json`: the pipeline runs `npm ci`.
 
 ```ts
 // infra/bin/app.ts
 import { App, Stack, Tags } from 'aws-cdk-lib';
 import * as s3 from 'aws-cdk-lib/aws-s3';
-import { ShukkaAccess, applyBoundary, shukkaSynthesizer } from 'shukka/lib/index.ts';
+import { ShukkaAccess, applyBoundary, shukkaSynthesizer } from 'shukka';
 
 const app = new App();
 const env = { account: '123456789012', region: 'us-east-1' };

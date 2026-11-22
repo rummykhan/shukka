@@ -343,7 +343,7 @@ test('shu-9bj.9: the app role has no ssm:GetParameter (nothing it runs reads the
   assert.ok(!readFileSync(new URL('../lib/access.ts', import.meta.url), 'utf8').includes('ssmPath'));
 });
 
-test('shu-9bj.9: import { ShukkaAccess } from \'shukka\' works under tsx in a consumer', () => {
+test('shu-9bj.9: import { ShukkaAccess } from \'shukka\' and from \'shukka/lib/index.ts\' work under tsx in a consumer', () => {
   // A consumer's node_modules as a GitHub dependency installs it: a copy of the package (not a link into this
   // checkout), next to the consumer's own aws-cdk-lib and constructs.
   const root = fileURLToPath(new URL('..', import.meta.url));
@@ -361,6 +361,7 @@ test('shu-9bj.9: import { ShukkaAccess } from \'shukka\' works under tsx in a co
     assert.deepEqual(JSON.parse(r.stdout.trim().split('\n').pop() as string), {
       roles: ['consumer-shukka-app', 'consumer-shukka-diff', 'consumer-shukka-infra'],
       boundary: 'function',
+      deepPathSameClass: true,
     });
   } finally {
     rmSync(dir, { recursive: true, force: true });

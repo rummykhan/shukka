@@ -11,7 +11,8 @@
       "types": "./lib/index.ts",
       "default": "./lib/index.ts"
     },
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./lib/*": "./lib/*"
   },
   "bin": {
     "shukka": "bin/shukka"

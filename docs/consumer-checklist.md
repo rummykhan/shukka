@@ -76,7 +76,7 @@ Example values: project `acme`, repository `acme-org/acme`, account `12345678901
 
 - [ ] `cdk.json` runs the app with tsx: `"app": "npx tsx bin/app.ts"`.
 
-- [ ] In the CDK app (README, step 3): `shukkaSynthesizer('<qualifier>')` on every stack; a CI stack `<Project>-Ci` holding `ShukkaAccess` with your `githubRepo` subject and deploy bucket; `Tags.of(app).add('Project', '<project>')`; `applyBoundary(app, '<project>')`. Import from `shukka/lib/index.ts`.
+- [ ] In the CDK app (README, step 3): `shukkaSynthesizer('<qualifier>')` on every stack; a CI stack `<Project>-Ci` holding `ShukkaAccess` with your `githubRepo` subject and deploy bucket; `Tags.of(app).add('Project', '<project>')`; `applyBoundary(app, '<project>')`. Import from `shukka`.
 
 - [ ] Every stack is named `<project>-...` or `<Project>-...`; every resource you name starts with the project name. Stacks use only the services the fence covers (README, "What the fence stops").
 
