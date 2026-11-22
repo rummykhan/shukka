@@ -101,6 +101,7 @@ const SPIKE_EXCEPTIONS: Record<'executionA' | 'executionB' | 'boundary', { chang
       'AgentDocuments', // document-scoped agent calls name the documents
       'AgentAssociations', // DescribeAssociation on the account's associations
       'RunOnOwnServersDocument', // SendCommand's document by ARN (finding 4)
+      'AppRoleAgentStatus', // DescribeInstanceInformation for the app role only (shu-9zr)
     ],
   },
 };
@@ -365,6 +366,8 @@ const STAR_ALLOWED: Record<string, StarReason> = {
   'ssm:PutInventory': 'none',
   'ssm:PutConfigurePackageResult': 'none',
   'ssm:GetCommandInvocation': 'none',
+  // No resource type; lists the account's managed instances, so only the app role (aws:PrincipalArn) may.
+  'ssm:DescribeInstanceInformation': { condition: 'aws:PrincipalArn' },
   // Session Manager and the agent's message channels have no resource types.
   'ssmmessages:*': 'none',
   'ec2messages:*': 'none',
@@ -496,4 +499,18 @@ test('shu-i1b: the boundary names the same infra role ShukkaAccess creates', () 
     deployBucket: s3.Bucket.fromBucketName(stack, 'Bucket', 'shukkatest-deploy'),
   });
   Template.fromStack(stack).hasResourceProperties('AWS::IAM::Role', { RoleName: infraRoleName('shukkatest') });
+});
+
+test('shu-9zr: only the app role may call ssm:DescribeInstanceInformation through the boundary; servers and Lambdas may not', () => {
+  for (const fence of [trendigle, neutral]) {
+    // The action has no resource type, so only a statement on Resource "*" can grant it.
+    const grants = fence.boundary.Statement.filter((s) => s.Effect === 'Allow' && list(s.Resource).includes('*') && list(s.Action).some((a) => a === 'ssm:DescribeInstanceInformation' || a === 'ssm:*' || a === 'ssm:Describe*'));
+    assert.equal(grants.length, 1);
+    const [st] = grants;
+    assert.equal(st?.Sid, 'AppRoleAgentStatus');
+    assert.deepEqual(list(st?.Action), ['ssm:DescribeInstanceInformation']);
+    const arn = (st?.Condition as Record<string, Record<string, string>>).ArnEquals?.['aws:PrincipalArn'];
+    assert.match(String(arn), /^arn:aws:iam::[0-9]{12}:role\/[a-z][a-z0-9-]*-shukka-app$/);
+    assert.ok(!list(fence.boundary.Statement.find((s) => s.Sid === 'RuntimeAgents')?.Action ?? []).includes('ssm:DescribeInstanceInformation'));
+  }
 });

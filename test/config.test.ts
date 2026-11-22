@@ -452,3 +452,15 @@ test("shu-9bj.1: the design's Trendigle example still validates", () => {
   assert.equal(config?.apps[0]?.server.configure, 'implementation/infra/box/configure-app.sh');
   assert.deepEqual(loadConfig(examplePath).problems, []);
 });
+
+test('shu-9zr: aws.deployBucket defaults to <project>-deploy-<account> and can be set', () => {
+  const raw = JSON.parse(readFileSync(join(here, 'fixtures', 'config', 'trendigle.json'), 'utf8'));
+  const plain = validateConfig(raw);
+  assert.equal(plain.config?.aws.deployBucket, `trendigle-deploy-${raw.aws.account}`);
+  raw.aws.deployBucket = `trendigle-prod-deploy-${raw.aws.account}`;
+  assert.equal(validateConfig(raw).config?.aws.deployBucket, `trendigle-prod-deploy-${raw.aws.account}`);
+  raw.aws.deployBucket = 'Not A Bucket';
+  const bad = validateConfig(raw);
+  assert.equal(bad.config, null);
+  assert.ok(bad.problems.some((p) => p.startsWith('shukka.json: aws.deployBucket')), bad.problems.join('\n'));
+});

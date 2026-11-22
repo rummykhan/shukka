@@ -24,7 +24,7 @@ import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { DescribeInstancesCommand, EC2Client } from '@aws-sdk/client-ec2';
 import { PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
-import { GetCommandInvocationCommand, SendCommandCommand, SSMClient } from '@aws-sdk/client-ssm';
+import { DescribeInstanceInformationCommand, GetCommandInvocationCommand, SendCommandCommand, SSMClient } from '@aws-sdk/client-ssm';
 import { loadConfig } from './config.mjs';
 import { APP_RE, BUCKET_RE, parseFlags, PROJECT_RE, REGION_RE, SHA_RE } from './upload.mjs';
 
@@ -53,7 +53,7 @@ const CONFIGURE_RE = /^[A-Za-z0-9._/-]+$/;
  * @typedef {ReleaseArgs & {
  *   checkout: string, configure: string,
  *   script?: string, s3?: AwsLike, ssm?: AwsLike, ec2?: AwsLike, pollMs?: number, timeoutSeconds?: number,
- *   out?: (text: string) => void,
+ *   onlineTimeoutSeconds?: number, out?: (text: string) => void,
  * }} ReleaseOptions
  * @typedef {{ instanceId: string, status: string, code: number, stdout: string, stderr: string, message: string | null }} InstanceResult
  * @typedef {{ ok: boolean, code: number, commandId: string, results: InstanceResult[] }} ReleaseResult
@@ -234,6 +234,52 @@ export async function findInstances(ec2, project) {
 }
 
 /**
+ * Wait until every instance's SSM agent reports Online (a first deploy can start right after the
+ * instance boots, before its agent has registered). Gives up after the timeout with an error. When
+ * the agents' status cannot be read at all (the role may not allow DescribeInstanceInformation),
+ * it says so on stderr and lets SendCommand report what is wrong.
+ * @param {AwsLike} ssm
+ * @param {string[]} instanceIds
+ * @param {number} pollMs
+ * @param {number} timeoutSeconds
+ * @param {(text: string) => void} out
+ * @returns {Promise<void>}
+ */
+export async function waitOnline(ssm, instanceIds, pollMs, timeoutSeconds, out) {
+  const deadline = Date.now() + timeoutSeconds * 1000;
+  let said = false;
+  for (;;) {
+    /** @type {Map<string, string>} */
+    const status = new Map();
+    try {
+      /** @type {string | undefined} */
+      let token;
+      do {
+        const page = await ssm.send(new DescribeInstanceInformationCommand({
+          Filters: [{ Key: 'InstanceIds', Values: instanceIds }],
+          ...(token ? { NextToken: token } : {}),
+        }));
+        for (const info of page.InstanceInformationList ?? []) status.set(String(info.InstanceId), String(info.PingStatus ?? ''));
+        token = page.NextToken;
+      } while (token);
+    } catch (error) {
+      process.stderr.write(`release: cannot read the SSM agents' status (${/** @type {Error} */ (error).name}); sending anyway\n`);
+      return;
+    }
+    const waiting = instanceIds.filter((id) => status.get(id) !== 'Online');
+    if (waiting.length === 0) return;
+    if (Date.now() >= deadline) {
+      throw new Error(`the SSM agent on ${waiting.join(', ')} is not online after ${timeoutSeconds} seconds; nothing was sent`);
+    }
+    if (!said) {
+      out(`shukka: waiting for the SSM agent on ${waiting.join(', ')} to come online\n`);
+      said = true;
+    }
+    await sleep(Math.max(pollMs, 1));
+  }
+}
+
+/**
  * Poll one invocation until it ends or the deadline passes.
  * @param {AwsLike} ssm
  * @param {string} commandId
@@ -295,6 +341,7 @@ export async function release(options) {
   const hook = readHook(options.checkout, options.configure, options.sha);
   const instanceIds = await findInstances(ec2, options.project);
   if (instanceIds.length === 0) throw new Error(`no running instance is tagged Project=${options.project}`);
+  await waitOnline(ssm, instanceIds, pollMs, options.onlineTimeoutSeconds ?? 300, out);
 
   const key = hookKey(options.project, options.app, options.sha);
   await s3.send(new PutObjectCommand({ Bucket: options.bucket, Key: key, Body: hook, ContentType: 'text/x-shellscript' }));

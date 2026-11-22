@@ -22,7 +22,7 @@ import { fileURLToPath } from 'node:url';
  * @typedef {{
  *   project: string,
  *   qualifier: string,
- *   aws: { account: string, region: string },
+ *   aws: { account: string, region: string, deployBucket: string },
  *   node: string,
  *   checks: Check[],
  *   infra: { dir: string, paths: string[] },
@@ -213,7 +213,11 @@ function normalise(raw) {
   return {
     project: raw.project,
     qualifier: raw.qualifier,
-    aws: { account: raw.aws.account, region: raw.aws.region },
+    aws: {
+      account: raw.aws.account,
+      region: raw.aws.region,
+      deployBucket: raw.aws.deployBucket ?? `${raw.project}-deploy-${raw.aws.account}`,
+    },
     node: raw.node ?? DEFAULT_NODE,
     checks: (raw.checks ?? []).map((/** @type {Record<string, any>} */ c) => ({
       name: c.name,

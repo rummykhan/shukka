@@ -282,6 +282,7 @@ test('shu-7nw: app role has exactly the permissions in the design', () => {
       Condition: { StringEquals: { 'ssm:resourceTag/Project': 'demo' } },
     },
     { Effect: 'Allow', Action: ['ec2:DescribeInstances', 'ssm:GetCommandInvocation'], Resource: '*' },
+    { Effect: 'Allow', Action: 'ssm:DescribeInstanceInformation', Resource: '*' },
     { Effect: 'Allow', Action: 'ssm:GetParameter', Resource: `arn:aws:ssm:${REGION}:${ACCOUNT}:parameter/demo/prod/*` },
   ]));
 });
@@ -333,7 +334,7 @@ test('shu-7nw: no permission statement has a wildcard action or Resource * excep
     for (const st of normalise(permissions(template, r.name))) {
       for (const a of st.Action as string[]) assert.ok(!a.includes('*'), `${r.name}: action ${a}`);
       if ((st.Resource as unknown[]).includes('*')) {
-        assert.deepEqual(st.Action, ['ec2:DescribeInstances', 'ssm:GetCommandInvocation'], `${r.name}: Resource * only for these`);
+        assert.ok([JSON.stringify(['ec2:DescribeInstances', 'ssm:GetCommandInvocation']), JSON.stringify(['ssm:DescribeInstanceInformation'])].includes(JSON.stringify(st.Action)), `${r.name}: Resource * only for these`);
       }
     }
   }

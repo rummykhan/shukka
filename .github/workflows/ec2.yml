@@ -1,0 +1,338 @@
+# shukka ec2: the nested reusable workflow that releases a project's apps on its servers (design C3).
+# Called by pipeline.yml with `uses: ./.github/workflows/ec2.yml`. The project's app role trusts this
+# file by name (job_workflow_ref), so its name is part of the v1 contract (design D3).
+#
+# Inputs
+#   config         path of shukka.json in the project (default shukka.json); bundles go to its
+#                  aws.deployBucket (default <project>-deploy-<account>)
+#   force          release every app whatever changed
+# Outputs
+#   released       'true' when at least one app was due for release (the release jobs ran)
+#
+# Jobs
+#   changes        under the app role, decide which apps changed since the REVISION on their servers
+#                  (changed.mjs --part app:<name> for every app; an unreadable app counts as changed)
+#   release <app>  one per changed app, one at a time per app (concurrency shukka-<project>-<app>,
+#                  never cancelled): check out the project without installing or building anything,
+#                  download the bundle-<app> artifact into $RUNNER_TEMP (outside both checkouts),
+#                  skip with a notice when the servers already run a later commit (quick merges),
+#                  upload it, and release it through SSM with the configure hook taken from git
+#
+# No project code runs here: shukka's scripts run from ./.shukka with shukka's own dependencies
+# (npm ci --ignore-scripts). Never runs on pull_request_target, issue_comment or workflow_run.
+name: shukka ec2
+
+on:
+  workflow_call:
+    inputs:
+      config:
+        description: Path of shukka.json in the project
+        type: string
+        default: shukka.json
+      force:
+        description: Release every app, whatever changed
+        type: boolean
+        default: false
+      bundle_digests:
+        description: JSON object of the build job's outputs, values "<app>:<sha256 of bundle.tgz>"
+        type: string
+        default: '{}'
+    outputs:
+      released:
+        description: Whether any app was due for release
+        value: ${{ jobs.changes.outputs.any }}
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  changes:
+    name: changes
+    if: >-
+      !contains(fromJSON('["pull_request_target","issue_comment","workflow_run"]'), github.event_name)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      apps: ${{ steps.decide.outputs.apps }}
+      any: ${{ steps.decide.outputs.any }}
+      project: ${{ steps.config.outputs.project }}
+      account: ${{ steps.config.outputs.account }}
+      region: ${{ steps.config.outputs.region }}
+      bucket: ${{ steps.config.outputs.bucket }}
+    steps:
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      # The job's OIDC token names the commit of this workflow file (job_workflow_sha); scripts are
+      # taken from exactly that commit. The token is requested for another audience than STS and
+      # never printed.
+      - name: Find the shukka commit this job runs
+        id: shukka
+        env:
+          WORKFLOW_FILE: ec2.yml
+        run: |
+          set -euo pipefail
+          node --input-type=module - <<'JS'
+          import { appendFileSync } from 'node:fs';
+          const res = await fetch(`${process.env.ACTIONS_ID_TOKEN_REQUEST_URL}&audience=shukka`, {
+            headers: { Authorization: `bearer ${process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN}` },
+          });
+          if (!res.ok) {
+            console.log(`::error::shukka: cannot read this job's OIDC token (HTTP ${res.status})`);
+            process.exit(1);
+          }
+          const { value } = await res.json();
+          const claims = JSON.parse(Buffer.from(String(value).split('.')[1] ?? '', 'base64url').toString('utf8'));
+          const m = /^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/\.github\/workflows\/([A-Za-z0-9_.-]+)@([A-Za-z0-9_./-]+)$/.exec(claims.job_workflow_ref ?? '');
+          const sha = String(claims.job_workflow_sha ?? '');
+          if (!m || m[2] !== process.env.WORKFLOW_FILE || !/^[0-9a-f]{40}$/.test(sha)) {
+            console.log('::error::shukka: the OIDC token does not name this workflow file and its commit');
+            process.exit(1);
+          }
+          console.log(`shukka: ${m[1]} ${m[2]} at ${m[3]}, commit ${sha}`);
+          appendFileSync(process.env.GITHUB_OUTPUT, `repository=${m[1]}\nsha=${sha}\n`);
+          JS
+
+      # Full history: changed.mjs diffs from the commit each server last released.
+      - name: Check out the project
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: project
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out shukka
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ steps.shukka.outputs.repository }}
+          ref: ${{ steps.shukka.outputs.sha }}
+          path: .shukka
+          persist-credentials: false
+
+      - name: Install shukka's dependencies
+        run: |
+          set -euo pipefail
+          cd .shukka
+          npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Read shukka.json
+        id: config
+        env:
+          CONFIG: ${{ inputs.config }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$CONFIG" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ || "/$CONFIG/" == */../* ]]; then
+            echo "::error::shukka: config must be a path inside the project"
+            exit 1
+          fi
+          node .shukka/scripts/config.mjs "project/$CONFIG" --json >"$RUNNER_TEMP/shukka-config.json"
+          node --input-type=module - "$RUNNER_TEMP/shukka-config.json" <<'JS'
+          import { appendFileSync, readFileSync } from 'node:fs';
+          const c = JSON.parse(readFileSync(process.argv[2], 'utf8'));
+          const out = { project: c.project, account: c.aws.account, region: c.aws.region, bucket: c.aws.deployBucket, apps: JSON.stringify(c.apps.map((a) => a.name)) };
+          appendFileSync(process.env.GITHUB_OUTPUT, Object.entries(out).map(([k, v]) => `${k}=${v}\n`).join(''));
+          JS
+
+      - name: Assume the app role
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: arn:aws:iam::${{ steps.config.outputs.account }}:role/${{ steps.config.outputs.project }}-shukka-app
+          role-session-name: shukka-app-changes
+          aws-region: ${{ steps.config.outputs.region }}
+
+      # Fail safe: when the revisions cannot be read, every app counts as changed and is released.
+      - name: Decide which apps changed
+        id: decide
+        env:
+          CONFIG: ${{ inputs.config }}
+          APPS: ${{ steps.config.outputs.apps }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set +e -uo pipefail
+          args=(--repo project)
+          while IFS= read -r app; do args+=(--part "app:$app"); done < <(jq -r '.[]' <<<"$APPS")
+          [[ "$FORCE" == true ]] && args+=(--force)
+          if out=$(node .shukka/scripts/changed.mjs "project/$CONFIG" "${args[@]}") \
+            && changed=$(jq -ec --argjson all "$APPS" '[$all[] as $a | select(.apps[$a] != false) | $a]' <<<"$out"); then
+            jq -r '.apps | to_entries[] | "shukka: app \(.key): \(if .value then "changed; releasing" else "not changed; nothing to release" end)"' <<<"$out"
+          else
+            echo "::warning::shukka: could not decide which apps changed; releasing every app"
+            changed=$(jq -c . <<<"$APPS")
+          fi
+          any=false
+          [[ "$changed" != '[]' ]] && any=true
+          {
+            echo "apps=$changed"
+            echo "any=$any"
+          } >>"$GITHUB_OUTPUT"
+
+  release:
+    name: release ${{ matrix.app }}
+    needs: changes
+    if: needs.changes.outputs.any == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        app: ${{ fromJSON(needs.changes.outputs.apps) }}
+    concurrency:
+      group: shukka-${{ needs.changes.outputs.project }}-${{ matrix.app }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Find the shukka commit this job runs
+        id: shukka
+        env:
+          WORKFLOW_FILE: ec2.yml
+        run: |
+          set -euo pipefail
+          node --input-type=module - <<'JS'
+          import { appendFileSync } from 'node:fs';
+          const res = await fetch(`${process.env.ACTIONS_ID_TOKEN_REQUEST_URL}&audience=shukka`, {
+            headers: { Authorization: `bearer ${process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN}` },
+          });
+          if (!res.ok) {
+            console.log(`::error::shukka: cannot read this job's OIDC token (HTTP ${res.status})`);
+            process.exit(1);
+          }
+          const { value } = await res.json();
+          const claims = JSON.parse(Buffer.from(String(value).split('.')[1] ?? '', 'base64url').toString('utf8'));
+          const m = /^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/\.github\/workflows\/([A-Za-z0-9_.-]+)@([A-Za-z0-9_./-]+)$/.exec(claims.job_workflow_ref ?? '');
+          const sha = String(claims.job_workflow_sha ?? '');
+          if (!m || m[2] !== process.env.WORKFLOW_FILE || !/^[0-9a-f]{40}$/.test(sha)) {
+            console.log('::error::shukka: the OIDC token does not name this workflow file and its commit');
+            process.exit(1);
+          }
+          console.log(`shukka: ${m[1]} ${m[2]} at ${m[3]}, commit ${sha}`);
+          appendFileSync(process.env.GITHUB_OUTPUT, `repository=${m[1]}\nsha=${sha}\n`);
+          JS
+
+      # The configure hook is read from this checkout's git HEAD, never from the bundle. Nothing of
+      # the project's is installed or built here. Full history: the servers' REVISION is compared
+      # with this commit before releasing.
+      - name: Check out the project
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: project
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out shukka
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ steps.shukka.outputs.repository }}
+          ref: ${{ steps.shukka.outputs.sha }}
+          path: .shukka
+          persist-credentials: false
+
+      - name: Install shukka's dependencies
+        run: |
+          set -euo pipefail
+          cd .shukka
+          npm ci --ignore-scripts --no-audit --no-fund
+
+      # Outside both checkouts: the bundle is built by the project's code and must not stand in for
+      # anything git or shukka's scripts read.
+      - name: Download the bundle
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bundle-${{ matrix.app }}
+          path: ${{ runner.temp }}/shukka-artifact/${{ matrix.app }}
+
+      # Only the bundle the build job produced: its digest came through the job outputs, not the artifact.
+      - name: Unpack the bundle
+        env:
+          APP: ${{ matrix.app }}
+          BUNDLE_DIGESTS: ${{ inputs.bundle_digests }}
+        run: |
+          set -euo pipefail
+          file="$RUNNER_TEMP/shukka-artifact/$APP/bundle.tgz"
+          node --input-type=module - "$file" <<'JS'
+          import { createHash } from 'node:crypto';
+          import { readFileSync } from 'node:fs';
+          const app = process.env.APP;
+          let digests = {};
+          try { digests = JSON.parse(process.env.BUNDLE_DIGESTS || '{}'); } catch { digests = {}; }
+          const wanted = [...new Set(Object.values(digests).filter((v) => typeof v === 'string' && v.startsWith(`${app}:`)).map((v) => v.slice(app.length + 1)))];
+          const got = createHash('sha256').update(readFileSync(process.argv[2])).digest('hex');
+          if (wanted.length !== 1 || !/^[0-9a-f]{64}$/.test(wanted[0]) || wanted[0] !== got) {
+            console.log(`::error::shukka: bundle-${app} is not the one the build job produced (sha256 ${got}); refusing it`);
+            process.exit(1);
+          }
+          console.log(`shukka: bundle-${app} matches the build job's sha256 ${got}`);
+          JS
+          dest="$RUNNER_TEMP/shukka-bundle/$APP"
+          rm -rf -- "$dest"
+          mkdir -p -- "$dest"
+          tar -xzf "$file" -C "$dest" --no-same-owner --no-same-permissions
+          echo "shukka: unpacked bundle-$APP into $dest"
+
+      - name: Assume the app role
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: arn:aws:iam::${{ needs.changes.outputs.account }}:role/${{ needs.changes.outputs.project }}-shukka-app
+          role-session-name: shukka-app-release
+          aws-region: ${{ needs.changes.outputs.region }}
+
+      # Quick merges: inside the per-app lock, a release of an older commit than the servers already
+      # run is skipped.
+      - name: Check the servers are not ahead of this commit
+        id: order
+        env:
+          APP: ${{ matrix.app }}
+          CONFIG: ${{ inputs.config }}
+        run: |
+          set +e -uo pipefail
+          sha=$(git -C project rev-parse HEAD)
+          skip=false
+          if out=$(node .shukka/scripts/changed.mjs "project/$CONFIG" --repo project --part "app:$APP"); then
+            base=$(jq -r --arg a "$APP" '.base.apps[$a] // empty' <<<"$out")
+            if [[ -n "$base" && "$base" != "$sha" ]] && git -C project merge-base --is-ancestor "$sha" "$base"; then
+              echo "::notice::shukka: $APP already runs $base, a later commit than this run's $sha; not releasing an older commit"
+              skip=true
+            fi
+          else
+            echo "::warning::shukka: could not read $APP's revision on the servers; releasing"
+          fi
+          echo "skip=$skip" >>"$GITHUB_OUTPUT"
+
+      - name: Upload the bundle
+        if: steps.order.outputs.skip != 'true'
+        env:
+          APP: ${{ matrix.app }}
+          CONFIG: ${{ inputs.config }}
+          BUCKET: ${{ needs.changes.outputs.bucket }}
+        run: |
+          set -euo pipefail
+          sha=$(git -C project rev-parse HEAD)
+          node .shukka/scripts/upload.mjs --dir "$RUNNER_TEMP/shukka-bundle/$APP" --bucket "$BUCKET" --sha "$sha" \
+            --config "project/$CONFIG" --app "$APP"
+
+      # release.mjs sends box/shukka-release.sh from this shukka checkout to the instances tagged
+      # Project=<project> (InstanceIds resolved from the tag), waits, prints each server's output and
+      # fails with the release script's meaning when it fails.
+      - name: Release
+        if: steps.order.outputs.skip != 'true'
+        env:
+          APP: ${{ matrix.app }}
+          CONFIG: ${{ inputs.config }}
+          BUCKET: ${{ needs.changes.outputs.bucket }}
+        run: |
+          set -euo pipefail
+          sha=$(git -C project rev-parse HEAD)
+          node .shukka/scripts/release.mjs --bucket "$BUCKET" --sha "$sha" --checkout project \
+            --config "project/$CONFIG" --app "$APP"

@@ -142,6 +142,9 @@ export class ShukkaAccess extends Construct {
             // Resource '*': neither action supports a resource type (GetCommandInvocation reads by command id,
             // DescribeInstances is list-only).
             new iam.PolicyStatement({ actions: ['ssm:GetCommandInvocation', 'ec2:DescribeInstances'], resources: ['*'] }),
+            // Resource '*': DescribeInstanceInformation has no resource type either. release.mjs uses it to wait for the
+            // instances' SSM agent to come online before SendCommand (a first deploy right after boot).
+            new iam.PolicyStatement({ actions: ['ssm:DescribeInstanceInformation'], resources: ['*'] }),
             // Read the project's settings.
             new iam.PolicyStatement({ actions: ['ssm:GetParameter'], resources: [arn('ssm', 'parameter', `${ssmPath.slice(1)}/*`)] }),
           ],

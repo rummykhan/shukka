@@ -1,0 +1,861 @@
+# shukka infra: the nested reusable workflow that diffs and deploys a project's CDK stacks (design C2).
+# Called by pipeline.yml with `uses: ./.github/workflows/infra.yml`. The project's roles trust this
+# file by name (job_workflow_ref), so its name is part of the v1 contract (design D3).
+#
+# Inputs
+#   mode               diff | deploy (required)
+#   config             path of shukka.json in the project (default shukka.json)
+#   allow_replacement  deploy even if the guard finds a deletion or replacement; honoured only on
+#                      workflow_dispatch, so a caller cannot switch the guard off for every merge
+#   force              deploy whatever changed
+# Outputs
+#   changed            'true' when the stacks changed since their shukka:revision tags (deploy mode)
+#   deployed           'true' when cdk deploy ran and succeeded
+#
+# Jobs
+#   synth    both modes, NO id-token: the project's own `npm ci` and `cdk synth` in its infra dir; the
+#            cloud assembly (cdk.out) is uploaded as the artifact shukka-cdk-out
+#   changes  deploy mode: under the infra role (chained into the project's CDK deploy role, which can
+#            read stacks) decide with changed.mjs --part infra over the assembly's stacks
+#   deploy   deploy mode, when changed, one at a time per project: refuse an assembly whose assets run
+#            commands, build Docker images or reach outside it (assembly.mjs check); skip when the
+#            stacks are already at a later commit; cdk diff, ### Infrastructure changes and ### Guard
+#            in the step summary, guard.mjs, cdk deploy tagged shukka:revision=<sha>
+#   diff     diff mode (pull requests): the same diff under the read-only diff role with
+#            --method=template; the diff and the guard's verdict go to the artifact shukka-diff; a
+#            destructive diff never fails it. Skipped with a notice when GitHub gives the job no
+#            OIDC token (pull requests from forks, Dependabot)
+#   comment  diff mode: posts shukka-diff as one PR comment marked <!-- shukka:diff -->, updated in
+#            place, saying the merge will stop when the guard refuses
+#
+# Artifacts are tied to the job that produced them: synth and diff output the sha256 of what they
+# upload, and every consumer refuses a download whose digest differs.
+# The project's code runs only in synth, which cannot obtain credentials. The credentialed jobs
+# (changes, deploy, diff) install nothing of the project's and run no project code: they read the
+# assembly with shukka's own scripts and shukka's own cdk CLI (aws-cdk from shukka's lockfile,
+# `npm ci --ignore-scripts` in ./.shukka), with --app <assembly>. Never runs on
+# pull_request_target, issue_comment or workflow_run, and never checks out a pull request's head.
+name: shukka infra
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: diff or deploy
+        type: string
+        required: true
+      config:
+        description: Path of shukka.json in the project
+        type: string
+        default: shukka.json
+      allow_replacement:
+        description: Deploy even if resources are deleted or replaced (workflow_dispatch only)
+        type: boolean
+        default: false
+      force:
+        description: Deploy whatever changed
+        type: boolean
+        default: false
+    outputs:
+      changed:
+        description: Whether the stacks changed since they were last deployed
+        value: ${{ jobs.changes.outputs.changed }}
+      deployed:
+        description: Whether cdk deploy ran and succeeded
+        value: ${{ jobs.deploy.outputs.deployed }}
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  synth:
+    name: synth
+    if: >-
+      (inputs.mode == 'deploy' || inputs.mode == 'diff')
+      && !contains(fromJSON('["pull_request_target","issue_comment","workflow_run"]'), github.event_name)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      digest: ${{ steps.synth.outputs.digest }}
+    steps:
+      # The default ref: on a pull request, GitHub's merge commit; never the pull request's head.
+      - name: Check out the project
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: project
+          persist-credentials: false
+
+      # Only what synth needs; the credentialed jobs validate the whole file with config.mjs.
+      - name: Read the infra settings
+        id: config
+        env:
+          CONFIG: ${{ inputs.config }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$CONFIG" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ || "/$CONFIG/" == */../* ]]; then
+            echo "::error::shukka: config must be a path inside the project"
+            exit 1
+          fi
+          node --input-type=module - "project/$CONFIG" <<'JS'
+          import { appendFileSync, readFileSync } from 'node:fs';
+          const c = JSON.parse(readFileSync(process.argv[2], 'utf8'));
+          const dir = String(c?.infra?.dir ?? '');
+          const ok = /^(?!-)(?!(?:.*\/)?\.\.(?:\/|$))[A-Za-z0-9._@+-][A-Za-z0-9._@+/-]*$/.test(dir)
+            && /^[0-9]+$/.test(String(c.node ?? '22')) && /^[0-9]{12}$/.test(String(c?.aws?.account)) && /^[a-z]{2}(-[a-z]+)+-[0-9]+$/.test(String(c?.aws?.region));
+          if (!ok) {
+            console.log('::error::shukka: shukka.json: infra.dir, node, aws.account or aws.region is not valid');
+            process.exit(1);
+          }
+          const out = { infra_dir: dir, node: String(c.node ?? '22'), account: c.aws.account, region: c.aws.region };
+          appendFileSync(process.env.GITHUB_OUTPUT, Object.entries(out).map(([k, v]) => `${k}=${v}\n`).join(''));
+          JS
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ steps.config.outputs.node }}
+
+      # The digest travels as a job output: a consumer refuses an artifact another job of the run
+      # replaced under the same name.
+      - name: Synthesize
+        id: synth
+        env:
+          INFRA_DIR: ${{ steps.config.outputs.infra_dir }}
+          CDK_DEFAULT_ACCOUNT: ${{ steps.config.outputs.account }}
+          CDK_DEFAULT_REGION: ${{ steps.config.outputs.region }}
+        run: |
+          set -euo pipefail
+          (cd "project/$INFRA_DIR" && npm ci && npx --no-install cdk synth --quiet --output "$RUNNER_TEMP/cdk.out")
+          mkdir -p "$RUNNER_TEMP/shukka-assembly"
+          tar -C "$RUNNER_TEMP/cdk.out" -czf "$RUNNER_TEMP/shukka-assembly/cdk.out.tgz" .
+          echo "shukka: synthesized $(find "$RUNNER_TEMP/cdk.out" -name '*.template.json' | wc -l | tr -d ' ') template(s)"
+          digest() {
+            node --input-type=module - "$1" <<'JS'
+          import { createHash } from 'node:crypto';
+          import { readdirSync, readFileSync, statSync } from 'node:fs';
+          import { join } from 'node:path';
+          const path = process.argv[2];
+          const sha = (b) => createHash('sha256').update(b).digest('hex');
+          process.stdout.write(statSync(path).isDirectory()
+            ? sha(readdirSync(path).sort().map((n) => `${n}\0${sha(readFileSync(join(path, n)))}\n`).join(''))
+            : sha(readFileSync(path)));
+          JS
+          }
+          echo "digest=$(digest "$RUNNER_TEMP/shukka-assembly/cdk.out.tgz")" >>"$GITHUB_OUTPUT"
+
+      - name: Upload the assembly
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: shukka-cdk-out
+          path: ${{ runner.temp }}/shukka-assembly/cdk.out.tgz
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
+
+  changes:
+    name: changes
+    needs: synth
+    if: inputs.mode == 'deploy'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      changed: ${{ steps.decide.outputs.changed }}
+      project: ${{ steps.config.outputs.project }}
+    steps:
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      # The job's OIDC token names the commit of this workflow file (job_workflow_sha); scripts are
+      # taken from exactly that commit. The token is requested for another audience than STS and
+      # never printed.
+      - name: Find the shukka commit this job runs
+        id: shukka
+        env:
+          WORKFLOW_FILE: infra.yml
+        run: |
+          set -euo pipefail
+          node --input-type=module - <<'JS'
+          import { appendFileSync } from 'node:fs';
+          const res = await fetch(`${process.env.ACTIONS_ID_TOKEN_REQUEST_URL}&audience=shukka`, {
+            headers: { Authorization: `bearer ${process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN}` },
+          });
+          if (!res.ok) {
+            console.log(`::error::shukka: cannot read this job's OIDC token (HTTP ${res.status})`);
+            process.exit(1);
+          }
+          const { value } = await res.json();
+          const claims = JSON.parse(Buffer.from(String(value).split('.')[1] ?? '', 'base64url').toString('utf8'));
+          const m = /^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/\.github\/workflows\/([A-Za-z0-9_.-]+)@([A-Za-z0-9_./-]+)$/.exec(claims.job_workflow_ref ?? '');
+          const sha = String(claims.job_workflow_sha ?? '');
+          if (!m || m[2] !== process.env.WORKFLOW_FILE || !/^[0-9a-f]{40}$/.test(sha)) {
+            console.log('::error::shukka: the OIDC token does not name this workflow file and its commit');
+            process.exit(1);
+          }
+          console.log(`shukka: ${m[1]} ${m[2]} at ${m[3]}, commit ${sha}`);
+          appendFileSync(process.env.GITHUB_OUTPUT, `repository=${m[1]}\nsha=${sha}\n`);
+          JS
+
+      # Full history: changed.mjs diffs from the commit each stack was last deployed at.
+      - name: Check out the project
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: project
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out shukka
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ steps.shukka.outputs.repository }}
+          ref: ${{ steps.shukka.outputs.sha }}
+          path: .shukka
+          persist-credentials: false
+
+      - name: Install shukka's dependencies
+        run: |
+          set -euo pipefail
+          cd .shukka
+          npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Read shukka.json
+        id: config
+        env:
+          CONFIG: ${{ inputs.config }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$CONFIG" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ || "/$CONFIG/" == */../* ]]; then
+            echo "::error::shukka: config must be a path inside the project"
+            exit 1
+          fi
+          node .shukka/scripts/config.mjs "project/$CONFIG" --json >"$RUNNER_TEMP/shukka-config.json"
+          node --input-type=module - "$RUNNER_TEMP/shukka-config.json" <<'JS'
+          import { appendFileSync, readFileSync } from 'node:fs';
+          const c = JSON.parse(readFileSync(process.argv[2], 'utf8'));
+          const out = { project: c.project, qualifier: c.qualifier, account: c.aws.account, region: c.aws.region };
+          appendFileSync(process.env.GITHUB_OUTPUT, Object.entries(out).map(([k, v]) => `${k}=${v}\n`).join(''));
+          JS
+
+      # Outside both checkouts.
+      - name: Download the assembly
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: shukka-cdk-out
+          path: ${{ runner.temp }}/shukka-assembly
+
+      - name: List the stacks
+        id: stacks
+        env:
+          DIGEST: ${{ needs.synth.outputs.digest }}
+        run: |
+          set -euo pipefail
+          digest() {
+            node --input-type=module - "$1" <<'JS'
+          import { createHash } from 'node:crypto';
+          import { readdirSync, readFileSync, statSync } from 'node:fs';
+          import { join } from 'node:path';
+          const path = process.argv[2];
+          const sha = (b) => createHash('sha256').update(b).digest('hex');
+          process.stdout.write(statSync(path).isDirectory()
+            ? sha(readdirSync(path).sort().map((n) => `${n}\0${sha(readFileSync(join(path, n)))}\n`).join(''))
+            : sha(readFileSync(path)));
+          JS
+          }
+          got=$(digest "$RUNNER_TEMP/shukka-assembly/cdk.out.tgz")
+          if [[ ! "$DIGEST" =~ ^[0-9a-f]{64}$ || "$got" != "$DIGEST" ]]; then
+            echo "::error::shukka: the downloaded assembly is not the one the synth job produced (sha256 $got); refusing it"
+            exit 1
+          fi
+          rm -rf -- "$RUNNER_TEMP/cdk.out"
+          mkdir -p -- "$RUNNER_TEMP/cdk.out"
+          tar -xzf "$RUNNER_TEMP/shukka-assembly/cdk.out.tgz" -C "$RUNNER_TEMP/cdk.out" --no-same-owner --no-same-permissions
+          stacks=$(node .shukka/scripts/assembly.mjs stacks "$RUNNER_TEMP/cdk.out")
+          echo "shukka: stacks: $stacks"
+          echo "stacks=$stacks" >>"$GITHUB_OUTPUT"
+
+      - name: Assume the infra role
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: arn:aws:iam::${{ steps.config.outputs.account }}:role/${{ steps.config.outputs.project }}-shukka-infra
+          role-session-name: shukka-infra-changes
+          aws-region: ${{ steps.config.outputs.region }}
+
+      # The infra role itself may only assume the project's CDK roles; their deploy role reads stacks.
+      - name: Assume the project's CDK deploy role
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-chaining: true
+          role-skip-session-tagging: true
+          role-to-assume: arn:aws:iam::${{ steps.config.outputs.account }}:role/cdk-${{ steps.config.outputs.qualifier }}-deploy-role-${{ steps.config.outputs.account }}-${{ steps.config.outputs.region }}
+          role-session-name: shukka-infra-changes
+          aws-region: ${{ steps.config.outputs.region }}
+
+      # Fail safe: when the revisions cannot be read, the stacks count as changed and deploy.
+      - name: Decide whether the stacks changed
+        id: decide
+        env:
+          CONFIG: ${{ inputs.config }}
+          STACKS: ${{ steps.stacks.outputs.stacks }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set +e -uo pipefail
+          args=(--part infra --repo project)
+          [[ -n "$STACKS" ]] && args+=(--stacks "$STACKS")
+          [[ "$FORCE" == true ]] && args+=(--force)
+          if out=$(node .shukka/scripts/changed.mjs "project/$CONFIG" "${args[@]}") \
+            && changed=$(jq -er '.infra | if type == "boolean" then tostring else error("no infra part") end' <<<"$out"); then
+            base=$(jq -r '.base.infra // "unknown"' <<<"$out")
+          else
+            echo "::warning::shukka: could not decide whether the stacks changed; deploying them"
+            changed=true
+            base=unknown
+          fi
+          if [[ "$changed" == true ]]; then
+            echo "shukka: infrastructure changed since $base; deploying"
+          else
+            echo "shukka: infrastructure has not changed since $base; nothing to deploy"
+          fi
+          echo "changed=$changed" >>"$GITHUB_OUTPUT"
+
+  deploy:
+    name: deploy
+    needs: [synth, changes]
+    if: needs.changes.outputs.changed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: shukka-${{ needs.changes.outputs.project }}-infra
+      cancel-in-progress: false
+    outputs:
+      deployed: ${{ steps.deploy.outputs.deployed }}
+    steps:
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Find the shukka commit this job runs
+        id: shukka
+        env:
+          WORKFLOW_FILE: infra.yml
+        run: |
+          set -euo pipefail
+          node --input-type=module - <<'JS'
+          import { appendFileSync } from 'node:fs';
+          const res = await fetch(`${process.env.ACTIONS_ID_TOKEN_REQUEST_URL}&audience=shukka`, {
+            headers: { Authorization: `bearer ${process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN}` },
+          });
+          if (!res.ok) {
+            console.log(`::error::shukka: cannot read this job's OIDC token (HTTP ${res.status})`);
+            process.exit(1);
+          }
+          const { value } = await res.json();
+          const claims = JSON.parse(Buffer.from(String(value).split('.')[1] ?? '', 'base64url').toString('utf8'));
+          const m = /^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/\.github\/workflows\/([A-Za-z0-9_.-]+)@([A-Za-z0-9_./-]+)$/.exec(claims.job_workflow_ref ?? '');
+          const sha = String(claims.job_workflow_sha ?? '');
+          if (!m || m[2] !== process.env.WORKFLOW_FILE || !/^[0-9a-f]{40}$/.test(sha)) {
+            console.log('::error::shukka: the OIDC token does not name this workflow file and its commit');
+            process.exit(1);
+          }
+          console.log(`shukka: ${m[1]} ${m[2]} at ${m[3]}, commit ${sha}`);
+          appendFileSync(process.env.GITHUB_OUTPUT, `repository=${m[1]}\nsha=${sha}\n`);
+          JS
+
+      # Full history: before deploying, the stacks' shukka:revision is compared with this commit.
+      - name: Check out the project
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: project
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out shukka
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ steps.shukka.outputs.repository }}
+          ref: ${{ steps.shukka.outputs.sha }}
+          path: .shukka
+          persist-credentials: false
+
+      - name: Install shukka's dependencies
+        run: |
+          set -euo pipefail
+          cd .shukka
+          npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Read shukka.json
+        id: config
+        env:
+          CONFIG: ${{ inputs.config }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$CONFIG" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ || "/$CONFIG/" == */../* ]]; then
+            echo "::error::shukka: config must be a path inside the project"
+            exit 1
+          fi
+          node .shukka/scripts/config.mjs "project/$CONFIG" --json >"$RUNNER_TEMP/shukka-config.json"
+          node --input-type=module - "$RUNNER_TEMP/shukka-config.json" <<'JS'
+          import { appendFileSync, readFileSync } from 'node:fs';
+          const c = JSON.parse(readFileSync(process.argv[2], 'utf8'));
+          const out = { project: c.project, qualifier: c.qualifier, account: c.aws.account, region: c.aws.region };
+          appendFileSync(process.env.GITHUB_OUTPUT, Object.entries(out).map(([k, v]) => `${k}=${v}\n`).join(''));
+          JS
+
+      - name: Download the assembly
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: shukka-cdk-out
+          path: ${{ runner.temp }}/shukka-assembly
+
+      # cdk-assets runs on this runner with the deploy role: no asset may run a command, build a
+      # Docker image or read outside the assembly.
+      - name: Check the assembly
+        id: assembly
+        env:
+          DIGEST: ${{ needs.synth.outputs.digest }}
+        run: |
+          set -euo pipefail
+          digest() {
+            node --input-type=module - "$1" <<'JS'
+          import { createHash } from 'node:crypto';
+          import { readdirSync, readFileSync, statSync } from 'node:fs';
+          import { join } from 'node:path';
+          const path = process.argv[2];
+          const sha = (b) => createHash('sha256').update(b).digest('hex');
+          process.stdout.write(statSync(path).isDirectory()
+            ? sha(readdirSync(path).sort().map((n) => `${n}\0${sha(readFileSync(join(path, n)))}\n`).join(''))
+            : sha(readFileSync(path)));
+          JS
+          }
+          got=$(digest "$RUNNER_TEMP/shukka-assembly/cdk.out.tgz")
+          if [[ ! "$DIGEST" =~ ^[0-9a-f]{64}$ || "$got" != "$DIGEST" ]]; then
+            echo "::error::shukka: the downloaded assembly is not the one the synth job produced (sha256 $got); refusing it"
+            exit 1
+          fi
+          rm -rf -- "$RUNNER_TEMP/cdk.out"
+          mkdir -p -- "$RUNNER_TEMP/cdk.out"
+          tar -xzf "$RUNNER_TEMP/shukka-assembly/cdk.out.tgz" -C "$RUNNER_TEMP/cdk.out" --no-same-owner --no-same-permissions
+          node .shukka/scripts/assembly.mjs check "$RUNNER_TEMP/cdk.out"
+          echo "stacks=$(node .shukka/scripts/assembly.mjs stacks "$RUNNER_TEMP/cdk.out")" >>"$GITHUB_OUTPUT"
+
+      - name: Assume the infra role
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: arn:aws:iam::${{ steps.config.outputs.account }}:role/${{ steps.config.outputs.project }}-shukka-infra
+          role-session-name: shukka-infra-deploy
+          aws-region: ${{ steps.config.outputs.region }}
+
+      # Quick merges: when the stacks already carry a later commit than this run's, deploying this
+      # one would go backwards. The stacks are read with the deploy role's credentials, handed to
+      # changed.mjs alone (the job keeps the infra role for cdk).
+      - name: Check the stacks are not ahead of this commit
+        id: order
+        env:
+          CONFIG: ${{ inputs.config }}
+          STACKS: ${{ steps.assembly.outputs.stacks }}
+          ACCOUNT: ${{ steps.config.outputs.account }}
+          QUALIFIER: ${{ steps.config.outputs.qualifier }}
+          REGION: ${{ steps.config.outputs.region }}
+        run: |
+          set +e -uo pipefail
+          sha=$(git -C project rev-parse HEAD)
+          skip=false
+          role="arn:aws:iam::$ACCOUNT:role/cdk-$QUALIFIER-deploy-role-$ACCOUNT-$REGION"
+          if creds=$(aws sts assume-role --role-arn "$role" --role-session-name shukka-infra-order --query Credentials --output json); then
+            key=$(jq -r .AccessKeyId <<<"$creds")
+            secret=$(jq -r .SecretAccessKey <<<"$creds")
+            token=$(jq -r .SessionToken <<<"$creds")
+            echo "::add-mask::$secret"
+            echo "::add-mask::$token"
+            args=(--part infra --repo project)
+            [[ -n "$STACKS" ]] && args+=(--stacks "$STACKS")
+            out=$(AWS_ACCESS_KEY_ID=$key AWS_SECRET_ACCESS_KEY=$secret AWS_SESSION_TOKEN=$token node .shukka/scripts/changed.mjs "project/$CONFIG" "${args[@]}")
+            base=$(jq -r '.base.infra // empty' <<<"$out")
+            if [[ -n "$base" && "$base" != "$sha" ]] && git -C project merge-base --is-ancestor "$sha" "$base"; then
+              echo "::notice::shukka: the stacks are already at $base, a later commit than this run's $sha; not deploying an older commit"
+              skip=true
+            fi
+          else
+            echo "::warning::shukka: could not read the stacks' revisions; deploying"
+          fi
+          echo "skip=$skip" >>"$GITHUB_OUTPUT"
+
+      - name: Diff and guard
+        if: steps.order.outputs.skip != 'true'
+        env:
+          CDK: .shukka/node_modules/.bin/cdk
+          ALLOW_REPLACEMENT: ${{ inputs.allow_replacement }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set +e -uo pipefail
+          diff="$RUNNER_TEMP/shukka-diff.txt"
+          "$CDK" diff --app "$RUNNER_TEMP/cdk.out" --no-color 2>&1 | tee "$diff"
+          diff_status=${PIPESTATUS[0]}
+          node --input-type=module - "$diff" >>"$GITHUB_STEP_SUMMARY" <<'JS'
+          import { readFileSync } from 'node:fs';
+          const text = readFileSync(process.argv[2], 'utf8').slice(0, 900_000);
+          const fence = '`'.repeat(Math.max(3, ...(text.match(/`+/g) ?? []).map((r) => r.length + 1)));
+          process.stdout.write(`### Infrastructure changes\n\n${fence}\n${text.replace(/\n*$/, '')}\n${fence}\n\n`);
+          JS
+          allow=()
+          if [[ "$ALLOW_REPLACEMENT" == true ]]; then
+            if [[ "$EVENT_NAME" == workflow_dispatch ]]; then
+              allow=(--allow)
+            else
+              echo "::warning::shukka: allow_replacement is honoured only when the workflow is run by hand; ignoring it"
+            fi
+          fi
+          node .shukka/scripts/guard.mjs ${allow[@]+"${allow[@]}"} --summary "$GITHUB_STEP_SUMMARY" <"$diff"
+          guard_status=$?
+          if [[ $guard_status -ne 0 ]]; then
+            echo "::error::shukka: the guard stopped the infrastructure deploy"
+            exit 1
+          fi
+          if [[ $diff_status -ne 0 ]]; then
+            echo "::error::shukka: cdk diff failed (exit $diff_status)"
+            exit 1
+          fi
+
+      # cdk deploy --tags replaces a stack's own tags, so each stack gets its synthesized tags plus
+      # shukka:revision. Stacks with the same tags deploy together; otherwise one by one in
+      # dependency order.
+      - name: Deploy
+        id: deploy
+        if: steps.order.outputs.skip != 'true'
+        env:
+          CDK: .shukka/node_modules/.bin/cdk
+        run: |
+          set -euo pipefail
+          sha=$(git -C project rev-parse HEAD)
+          node --input-type=module - "$RUNNER_TEMP/cdk.out" "$sha" <<'JS'
+          import { readFileSync } from 'node:fs';
+          import { join } from 'node:path';
+          import { spawnSync } from 'node:child_process';
+          const [assembly, sha] = process.argv.slice(2);
+          const { artifacts = {} } = JSON.parse(readFileSync(join(assembly, 'manifest.json'), 'utf8'));
+          const stacks = Object.entries(artifacts).filter(([, a]) => a.type === 'aws:cloudformation:stack');
+          const ids = new Set(stacks.map(([id]) => id));
+          const tagArgs = (a) => Object.entries({ ...(a.properties?.tags ?? {}), 'shukka:revision': sha }).flatMap(([k, v]) => ['--tags', `${k}=${v}`]);
+          const deploy = (args) => {
+            const r = spawnSync(process.env.CDK, ['deploy', '--app', assembly, '--require-approval', 'never', '--no-color', ...args], { stdio: 'inherit' });
+            if (r.status !== 0) {
+              console.log(`::error::shukka: cdk deploy failed (exit ${r.status ?? r.signal})`);
+              process.exit(1);
+            }
+          };
+          const keys = new Set(stacks.map(([, a]) => JSON.stringify(Object.entries(a.properties?.tags ?? {}).sort())));
+          if (stacks.length === 0) {
+            console.log('shukka: the app has no stacks');
+          } else if (keys.size === 1) {
+            deploy(['--all', ...tagArgs(stacks[0][1])]);
+          } else {
+            const done = new Set();
+            const visit = (id, seen = new Set()) => {
+              if (done.has(id) || seen.has(id)) return;
+              seen.add(id);
+              const a = artifacts[id];
+              for (const dep of a.dependencies ?? []) if (ids.has(dep)) visit(dep, seen);
+              deploy(['--exclusively', a.displayName ?? id, ...tagArgs(a)]);
+              done.add(id);
+            };
+            for (const [id] of stacks) visit(id);
+          }
+          JS
+          echo "shukka: infrastructure deployed at $sha"
+          echo "deployed=true" >>"$GITHUB_OUTPUT"
+
+  diff:
+    name: diff
+    needs: synth
+    if: inputs.mode == 'diff'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: shukka-diff-${{ github.event.pull_request.number || github.run_id }}
+      cancel-in-progress: true
+    outputs:
+      available: ${{ steps.token.outputs.available }}
+      digest: ${{ steps.guard.outputs.digest }}
+    steps:
+      # Pull requests from forks and Dependabot get no OIDC token, so no diff role.
+      - name: Check for an OIDC token
+        id: token
+        run: |
+          if [[ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]]; then
+            echo "::notice::shukka: this pull request gets no OIDC token (a fork or Dependabot), so there is no infrastructure diff"
+            echo "available=false" >>"$GITHUB_OUTPUT"
+          else
+            echo "available=true" >>"$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: steps.token.outputs.available == 'true'
+        with:
+          node-version: 22
+
+      - name: Find the shukka commit this job runs
+        id: shukka
+        if: steps.token.outputs.available == 'true'
+        env:
+          WORKFLOW_FILE: infra.yml
+        run: |
+          set -euo pipefail
+          node --input-type=module - <<'JS'
+          import { appendFileSync } from 'node:fs';
+          const res = await fetch(`${process.env.ACTIONS_ID_TOKEN_REQUEST_URL}&audience=shukka`, {
+            headers: { Authorization: `bearer ${process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN}` },
+          });
+          if (!res.ok) {
+            console.log(`::error::shukka: cannot read this job's OIDC token (HTTP ${res.status})`);
+            process.exit(1);
+          }
+          const { value } = await res.json();
+          const claims = JSON.parse(Buffer.from(String(value).split('.')[1] ?? '', 'base64url').toString('utf8'));
+          const m = /^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/\.github\/workflows\/([A-Za-z0-9_.-]+)@([A-Za-z0-9_./-]+)$/.exec(claims.job_workflow_ref ?? '');
+          const sha = String(claims.job_workflow_sha ?? '');
+          if (!m || m[2] !== process.env.WORKFLOW_FILE || !/^[0-9a-f]{40}$/.test(sha)) {
+            console.log('::error::shukka: the OIDC token does not name this workflow file and its commit');
+            process.exit(1);
+          }
+          console.log(`shukka: ${m[1]} ${m[2]} at ${m[3]}, commit ${sha}`);
+          appendFileSync(process.env.GITHUB_OUTPUT, `repository=${m[1]}\nsha=${sha}\n`);
+          JS
+
+      # Read as data only (shukka.json); nothing of the project's is installed or run here.
+      - name: Check out the project
+        if: steps.token.outputs.available == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: project
+          persist-credentials: false
+
+      - name: Check out shukka
+        if: steps.token.outputs.available == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ steps.shukka.outputs.repository }}
+          ref: ${{ steps.shukka.outputs.sha }}
+          path: .shukka
+          persist-credentials: false
+
+      - name: Install shukka's dependencies
+        if: steps.token.outputs.available == 'true'
+        run: |
+          set -euo pipefail
+          cd .shukka
+          npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Read shukka.json
+        id: config
+        if: steps.token.outputs.available == 'true'
+        env:
+          CONFIG: ${{ inputs.config }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$CONFIG" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ || "/$CONFIG/" == */../* ]]; then
+            echo "::error::shukka: config must be a path inside the project"
+            exit 1
+          fi
+          node .shukka/scripts/config.mjs "project/$CONFIG" --json >"$RUNNER_TEMP/shukka-config.json"
+          node --input-type=module - "$RUNNER_TEMP/shukka-config.json" <<'JS'
+          import { appendFileSync, readFileSync } from 'node:fs';
+          const c = JSON.parse(readFileSync(process.argv[2], 'utf8'));
+          const out = { project: c.project, qualifier: c.qualifier, account: c.aws.account, region: c.aws.region };
+          appendFileSync(process.env.GITHUB_OUTPUT, Object.entries(out).map(([k, v]) => `${k}=${v}\n`).join(''));
+          JS
+
+      - name: Download the assembly
+        if: steps.token.outputs.available == 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: shukka-cdk-out
+          path: ${{ runner.temp }}/shukka-assembly
+
+      # The template diff publishes nothing, but the CLI still reads the assembly: same checks as deploy.
+      - name: Check the assembly
+        if: steps.token.outputs.available == 'true'
+        env:
+          DIGEST: ${{ needs.synth.outputs.digest }}
+        run: |
+          set -euo pipefail
+          digest() {
+            node --input-type=module - "$1" <<'JS'
+          import { createHash } from 'node:crypto';
+          import { readdirSync, readFileSync, statSync } from 'node:fs';
+          import { join } from 'node:path';
+          const path = process.argv[2];
+          const sha = (b) => createHash('sha256').update(b).digest('hex');
+          process.stdout.write(statSync(path).isDirectory()
+            ? sha(readdirSync(path).sort().map((n) => `${n}\0${sha(readFileSync(join(path, n)))}\n`).join(''))
+            : sha(readFileSync(path)));
+          JS
+          }
+          got=$(digest "$RUNNER_TEMP/shukka-assembly/cdk.out.tgz")
+          if [[ ! "$DIGEST" =~ ^[0-9a-f]{64}$ || "$got" != "$DIGEST" ]]; then
+            echo "::error::shukka: the downloaded assembly is not the one the synth job produced (sha256 $got); refusing it"
+            exit 1
+          fi
+          rm -rf -- "$RUNNER_TEMP/cdk.out"
+          mkdir -p -- "$RUNNER_TEMP/cdk.out"
+          tar -xzf "$RUNNER_TEMP/shukka-assembly/cdk.out.tgz" -C "$RUNNER_TEMP/cdk.out" --no-same-owner --no-same-permissions
+          node .shukka/scripts/assembly.mjs check "$RUNNER_TEMP/cdk.out"
+
+      - name: Assume the diff role
+        if: steps.token.outputs.available == 'true'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: arn:aws:iam::${{ steps.config.outputs.account }}:role/${{ steps.config.outputs.project }}-shukka-diff
+          role-session-name: shukka-diff
+          aws-region: ${{ steps.config.outputs.region }}
+
+      # The diff role reads templates only and cannot create change sets: --method=template.
+      - name: Diff and guard
+        id: guard
+        if: steps.token.outputs.available == 'true'
+        env:
+          CDK: .shukka/node_modules/.bin/cdk
+        run: |
+          set +e -uo pipefail
+          out="$RUNNER_TEMP/shukka-pr-diff"
+          mkdir -p "$out"
+          "$CDK" diff --app "$RUNNER_TEMP/cdk.out" --no-color --method=template 2>&1 | tee "$out/diff.txt"
+          node --input-type=module - "$out/diff.txt" >>"$GITHUB_STEP_SUMMARY" <<'JS'
+          import { readFileSync } from 'node:fs';
+          const text = readFileSync(process.argv[2], 'utf8').slice(0, 900_000);
+          const fence = '`'.repeat(Math.max(3, ...(text.match(/`+/g) ?? []).map((r) => r.length + 1)));
+          process.stdout.write(`### Infrastructure changes\n\n${fence}\n${text.replace(/\n*$/, '')}\n${fence}\n\n`);
+          JS
+          node .shukka/scripts/guard.mjs --summary "$GITHUB_STEP_SUMMARY" <"$out/diff.txt" | tee "$out/guard.txt"
+          guard_status=${PIPESTATUS[0]}
+          echo "$guard_status" >"$out/guard-status"
+          if [[ $guard_status -ne 0 ]]; then
+            echo "::warning::shukka: this merge will stop at the guard unless it is rerun by hand with allow_replacement"
+          fi
+          digest() {
+            node --input-type=module - "$1" <<'JS'
+          import { createHash } from 'node:crypto';
+          import { readdirSync, readFileSync, statSync } from 'node:fs';
+          import { join } from 'node:path';
+          const path = process.argv[2];
+          const sha = (b) => createHash('sha256').update(b).digest('hex');
+          process.stdout.write(statSync(path).isDirectory()
+            ? sha(readdirSync(path).sort().map((n) => `${n}\0${sha(readFileSync(join(path, n)))}\n`).join(''))
+            : sha(readFileSync(path)));
+          JS
+          }
+          echo "digest=$(digest "$out")" >>"$GITHUB_OUTPUT"
+
+      - name: Upload the diff for the comment
+        if: steps.token.outputs.available == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: shukka-diff
+          path: ${{ runner.temp }}/shukka-pr-diff
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
+
+  # No credentials and no project code: only the diff job's text, from its artifact.
+  comment:
+    name: comment
+    needs: diff
+    if: inputs.mode == 'diff' && needs.diff.outputs.available == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      pull-requests: write
+    concurrency:
+      group: shukka-diff-${{ github.event.pull_request.number || github.run_id }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Download the diff
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: shukka-diff
+          path: ${{ runner.temp }}/shukka-pr-diff
+
+      - name: Verify the diff
+        env:
+          DIGEST: ${{ needs.diff.outputs.digest }}
+        run: |
+          set -euo pipefail
+          digest() {
+            node --input-type=module - "$1" <<'JS'
+          import { createHash } from 'node:crypto';
+          import { readdirSync, readFileSync, statSync } from 'node:fs';
+          import { join } from 'node:path';
+          const path = process.argv[2];
+          const sha = (b) => createHash('sha256').update(b).digest('hex');
+          process.stdout.write(statSync(path).isDirectory()
+            ? sha(readdirSync(path).sort().map((n) => `${n}\0${sha(readFileSync(join(path, n)))}\n`).join(''))
+            : sha(readFileSync(path)));
+          JS
+          }
+          got=$(digest "$RUNNER_TEMP/shukka-pr-diff")
+          if [[ ! "$DIGEST" =~ ^[0-9a-f]{64}$ || "$got" != "$DIGEST" ]]; then
+            echo "::error::shukka: the downloaded diff is not the one the diff job produced (sha256 $got); refusing it"
+            exit 1
+          fi
+
+      - name: Comment on the pull request
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "shukka: not a pull request; the diff is in the step summary only"
+            exit 0
+          fi
+          node --input-type=module - "$RUNNER_TEMP/shukka-pr-diff" <<'JS'
+          import { readFileSync } from 'node:fs';
+          import { join } from 'node:path';
+          const MARKER = '<!-- shukka:diff -->';
+          const dir = process.argv[2];
+          const fenced = (text) => {
+            const fence = '`'.repeat(Math.max(3, ...(text.match(/`+/g) ?? []).map((r) => r.length + 1)));
+            return `${fence}\n${text.replace(/\n*$/, '')}\n${fence}`;
+          };
+          let diff = readFileSync(join(dir, 'diff.txt'), 'utf8');
+          if (diff.length > 55_000) diff = `${diff.slice(0, 55_000)}\n... (cut; the whole diff is in the run's summary)`;
+          const guard = readFileSync(join(dir, 'guard.txt'), 'utf8').slice(0, 5_000);
+          const stops = readFileSync(join(dir, 'guard-status'), 'utf8').trim() !== '0';
+          const verdict = stops
+            ? '**This merge will stop** at the guard: it deletes or replaces a resource, or the diff is incomplete. If that is intended, run the workflow by hand on `main` with `allow_replacement` ticked after merging.'
+            : 'Nothing is deleted or replaced; the merge will deploy these changes.';
+          const body = `${MARKER}\n### Infrastructure changes\n\n${verdict}\n\n${fenced(diff)}\n\n### Guard\n\n${fenced(guard)}\n`;
+          const api = `${process.env.GITHUB_API_URL}/repos/${process.env.GITHUB_REPOSITORY}`;
+          const headers = { Authorization: `Bearer ${process.env.GITHUB_TOKEN}`, Accept: 'application/vnd.github+json', 'Content-Type': 'application/json' };
+          let existing;
+          for (let page = 1; !existing && page <= 50; page++) {
+            const res = await fetch(`${api}/issues/${process.env.PR_NUMBER}/comments?per_page=100&page=${page}`, { headers });
+            if (!res.ok) throw new Error(`listing comments: HTTP ${res.status}`);
+            const comments = await res.json();
+            if (comments.length === 0) break;
+            existing = comments.find((c) => c.user?.login === 'github-actions[bot]' && String(c.body ?? '').includes(MARKER));
+          }
+          const res = existing
+            ? await fetch(`${api}/issues/comments/${existing.id}`, { method: 'PATCH', headers, body: JSON.stringify({ body }) })
+            : await fetch(`${api}/issues/${process.env.PR_NUMBER}/comments`, { method: 'POST', headers, body: JSON.stringify({ body }) });
+          if (!res.ok) {
+            console.log(`::warning::shukka: could not comment on the pull request (HTTP ${res.status}); the diff is in the step summary`);
+          } else {
+            console.log(`shukka: ${existing ? 'updated' : 'posted'} the diff comment`);
+          }
+          JS
