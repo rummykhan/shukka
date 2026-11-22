@@ -7,7 +7,7 @@ import { gunzipSync } from 'node:zlib';
 import { DescribeInstancesCommand } from '@aws-sdk/client-ec2';
 import { PutObjectCommand } from '@aws-sdk/client-s3';
 import { GetCommandInvocationCommand, SendCommandCommand } from '@aws-sdk/client-ssm';
-import { buildCommands, checkArgs, EXIT_MESSAGES, hookKey, main, readHook, release, resultLine, scriptArgs } from '../scripts/release.mjs';
+import { buildCommands, checkArgs, EXIT_MESSAGES, hookKey, main, readHook, release, resultLine, scriptArgs, waitOnline } from '../scripts/release.mjs';
 import { upload } from '../scripts/upload.mjs';
 import { bundleDir, GOOD_HOOK, gitCheckout, headOf, HOOK, SHA, stubClient, tarEntries, withTmp, write } from './helpers/release-fixtures.js';
 
@@ -230,3 +230,25 @@ test('shu-mf3: the failure message shows the last line only when it is the relea
     ssm: stubSsm(() => ({ Status: 'Failed', ResponseCode: 12, StandardOutputContent: 'a long log, cut off by SSM, ends mid-li' })).client });
   assert.ok(printed.includes(`shukka: release failed on i-0aaa: ${EXIT_MESSAGES[12]} (output truncated)`), printed);
 }));
+
+test('shu-9zr: release waits for the SSM agents to report Online before sending, and gives up after the bound', async () => {
+  const seen: string[][] = [];
+  let polls = 0;
+  const ssm = stubClient((command) => {
+    seen.push((command.input as { Filters: { Values: string[] }[] }).Filters[0]!.Values);
+    polls++;
+    return { InstanceInformationList: [{ InstanceId: 'i-1', PingStatus: 'Online' }, { InstanceId: 'i-2', PingStatus: polls < 3 ? 'ConnectionLost' : 'Online' }] };
+  });
+  let printed = '';
+  await waitOnline(ssm.client, ['i-1', 'i-2'], 0, 60, (t) => { printed += t; });
+  assert.equal(polls, 3);
+  assert.deepEqual(seen[0], ['i-1', 'i-2']);
+  assert.match(printed, /waiting for the SSM agent on i-2 to come online/);
+
+  const never = stubClient(() => ({ InstanceInformationList: [] }));
+  await assert.rejects(waitOnline(never.client, ['i-9'], 0, 0, () => {}), /SSM agent on i-9 is not online after 0 seconds; nothing was sent/);
+
+  // A role that may not read agent status: say so and let SendCommand report.
+  const denied = stubClient(() => { throw Object.assign(new Error('no'), { name: 'AccessDeniedException' }); });
+  await waitOnline(denied.client, ['i-1'], 0, 60, () => {});
+});

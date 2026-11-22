@@ -9,7 +9,7 @@
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
-import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -68,9 +68,9 @@ test('shu-9zr: pipeline.yml has the design\'s jobs, each with its own permission
   assert.deepEqual(pipeline.jobs.app.needs, ['plan', 'infra']);
   assert.deepEqual(pipeline.jobs.smoke.needs, ['plan', 'infra', 'app']);
   assert.match(pipeline.jobs.diff.if, /github\.event_name == 'pull_request'/);
-  for (const id of ['build', 'infra']) assert.match(pipeline.jobs[id].if, /github\.event_name != 'pull_request'/, id);
-  // The inputs the caller contract passes, plus the documented optional ones.
-  assert.deepEqual(Object.keys(pipeline.on.workflow_call.inputs), ['config', 'allow_replacement', 'force', 'deploy_bucket', 'shukka_ref']);
+  for (const id of ['build', 'infra']) assert.match(pipeline.jobs[id].if, /needs\.plan\.outputs\.deploy == 'true'/, id);
+  // The inputs the caller contract passes, plus the documented optional one.
+  assert.deepEqual(Object.keys(pipeline.on.workflow_call.inputs), ['config', 'allow_replacement', 'force', 'shukka_ref']);
   assert.equal(pipeline.jobs.infra.with.allow_replacement, '${{ inputs.allow_replacement }}');
   assert.equal(pipeline.jobs.infra.with.force, '${{ inputs.force }}');
   assert.equal(pipeline.jobs.app.with.force, '${{ inputs.force }}');
@@ -81,7 +81,7 @@ test('shu-9zr: job display names carry the words the acceptance suite matches', 
   assert.match(pipeline.jobs.checks.name, /^check /);
   assert.match(pipeline.jobs.build.name, /^build /);
   assert.equal(pipeline.jobs.smoke.name, 'smoke');
-  assert.deepEqual(jobs(infra).map(([id, j]) => [id, j.name]), [['changes', 'changes'], ['deploy', 'deploy'], ['diff', 'diff']]);
+  assert.deepEqual(jobs(infra).map(([id, j]) => [id, j.name]), [['synth', 'synth'], ['changes', 'changes'], ['deploy', 'deploy'], ['diff', 'diff'], ['comment', 'comment']]);
   assert.deepEqual(jobs(ec2).map(([id, j]) => [id, j.name]), [['changes', 'changes'], ['release', 'release ${{ matrix.app }}']]);
   // The suite (test/acceptance/lib/common.sh) matches, case-insensitively: plan, check, build,
   // infra|deploy (minus diff and app matches), diff, app|ec2|release, smoke. Every name a run can
@@ -98,8 +98,8 @@ test('shu-9zr: job display names carry the words the acceptance suite matches', 
     release: [`shukka / ${pipeline.jobs.app.name} / release web`, `shukka / ${pipeline.jobs.app.name} / release \${{ matrix.app }}`],
     smoke: [`shukka / ${pipeline.jobs.smoke.name}`],
     none: [
-      ...shown(`shukka / ${pipeline.jobs.diff.name}`, ['changes']),
-      ...shown(`shukka / ${pipeline.jobs.infra.name}`, ['changes']),
+      ...shown(`shukka / ${pipeline.jobs.diff.name}`, ['synth', 'changes', 'comment']),
+      ...shown(`shukka / ${pipeline.jobs.infra.name}`, ['synth', 'changes', 'comment']),
       ...shown(`shukka / ${pipeline.jobs.app.name}`, ['changes']),
     ],
   };
@@ -179,8 +179,6 @@ test('shu-9zr: infra.yml and ec2.yml are only callable, refuse the events that r
     assert.deepEqual(Object.keys(doc.on), ['workflow_call']);
     for (const [id, job] of jobs(doc)) {
       assert.equal(job.environment, undefined, id);
-      const credentialed = job.permissions?.['id-token'] === 'write';
-      assert.ok(credentialed, `${id} is a credentialed job`);
       // Either the job refuses the three events itself or it needs a job that does.
       const guarded = (j: Loose): boolean => /pull_request_target.*issue_comment.*workflow_run/.test(String(j.if ?? ''))
         || [j.needs ?? []].flat().some((n: string) => guarded(doc.jobs[n]));
@@ -194,13 +192,15 @@ test('shu-9zr: ec2.yml checks out without installing anything, downloads the art
   assert.deepEqual(release.concurrency, { group: 'shukka-${{ needs.changes.outputs.project }}-${{ matrix.app }}', 'cancel-in-progress': false });
   assert.equal(release.strategy.matrix.app, '${{ fromJSON(needs.changes.outputs.apps) }}');
   const names = steps(release).map((s) => s.name ?? s.uses);
-  const order = ['Check out the project', 'Download the bundle', 'Unpack the bundle', 'Assume the app role', 'Upload the bundle', 'Release'];
+  const order = ['Check out the project', 'Download the bundle', 'Unpack the bundle', 'Assume the app role', 'Check the servers are not ahead of this commit', 'Upload the bundle', 'Release'];
   const at = order.map((n) => names.indexOf(n));
   assert.ok(at.every((i) => i >= 0), JSON.stringify(names));
   assert.deepEqual([...at].sort((a, b) => a - b), at, 'in this order');
   for (const [id, job] of jobs(ec2)) {
     for (const s of steps(job)) {
-      assert.doesNotMatch(String(s.run ?? ''), /\b(npm|npx|yarn|pnpm|pip3?|bun)\b/, `${id}: ${s.name}`);
+      // Only shukka's own lockfile is installed, in ./.shukka, without lifecycle scripts.
+      const run = String(s.run ?? '').replace(/cd \.shukka\n\s*npm ci --ignore-scripts --no-audit --no-fund/, '');
+      assert.doesNotMatch(run, /\b(npm|npx|yarn|pnpm|pip3?|bun)\b/, `${id}: ${s.name}`);
       assert.equal(s.with?.cache, undefined, `${id}: ${s.name} restores no cache`);
     }
   }
@@ -229,12 +229,12 @@ test('shu-9zr: every job that runs changed.mjs checks out the project with full 
       assert.equal(project?.with?.['fetch-depth'], 0, `${file} ${id}`);
     }
   }
-  assert.equal(found, 2, 'infra.yml changes and ec2.yml changes');
+  assert.equal(found, 4, 'infra.yml changes and deploy, ec2.yml changes and release');
 });
 
 test('shu-9zr: credentialed jobs take shukka\'s scripts from the commit in their OIDC token', () => {
   for (const [file, doc] of [['infra.yml', infra], ['ec2.yml', ec2]] as const) {
-    for (const [id, job] of jobs(doc)) {
+    for (const [id, job] of jobs(doc).filter(([, j]) => j.permissions?.['id-token'] === 'write')) {
       const find = steps(job).find((s) => s.name === 'Find the shukka commit this job runs');
       assert.ok(find, `${file} ${id}`);
       assert.equal(find.env.WORKFLOW_FILE, file);
@@ -245,6 +245,60 @@ test('shu-9zr: credentialed jobs take shukka\'s scripts from the commit in their
   }
 });
 
+const credentialedJobs = () => [['infra.yml', infra], ['ec2.yml', ec2]].flatMap(([file, doc]) =>
+  jobs(doc as Loose).filter(([, j]) => j.permissions?.['id-token'] === 'write').map(([id, j]) => [file as string, id, j] as const));
+
+test('shu-9zr: project code runs only in jobs that cannot obtain credentials; credentialed jobs install and run nothing of the project\'s', () => {
+  const ids = credentialedJobs().map(([file, id]) => `${file}:${id}`);
+  assert.deepEqual(ids, ['infra.yml:changes', 'infra.yml:deploy', 'infra.yml:diff', 'ec2.yml:changes', 'ec2.yml:release']);
+  for (const [file, id, job] of credentialedJobs()) {
+    for (const s of steps(job)) {
+      const where = `${file} ${id} "${s.name ?? s.uses}"`;
+      assert.equal(s['working-directory'], undefined, where);
+      const run = String(s.run ?? '').replace(/cd \.shukka\n\s*npm ci --ignore-scripts --no-audit --no-fund/, '');
+      assert.doesNotMatch(run, /\b(npm|npx|yarn|pnpm|bun)\b|cd "?project/, where);
+      // node runs only shukka's scripts and the inline scripts here.
+      for (const m of run.matchAll(/\bnode (\S+)/g)) assert.match(m[1] as string, /^(\.shukka\/scripts\/[a-z]+\.mjs|--input-type=module)$/, where);
+      // cdk is shukka's own CLI, on the synthesized assembly.
+      if (/\$CDK\b/.test(run)) {
+        assert.equal(s.env?.CDK, '.shukka/node_modules/.bin/cdk', where);
+        for (const m of run.matchAll(/"\$CDK" (\w+)/g)) assert.ok(m[1] === 'diff', where);
+        assert.match(run, /--app "\$RUNNER_TEMP\/cdk\.out"/, where);
+      }
+      if (String(s.uses ?? '').startsWith('actions/setup-node@')) assert.equal(s.with['node-version'], 22, where);
+    }
+  }
+  // The project's npm ci and cdk synth run in infra.yml's synth job, which has no id-token.
+  assert.deepEqual(infra.jobs.synth.permissions, { contents: 'read' });
+  assert.match(step(infra, 'synth', 'Synthesize').run, /npm ci && npx --no-install cdk synth --quiet --output "\$RUNNER_TEMP\/cdk\.out"/);
+  assert.equal(step(infra, 'synth', 'Upload the assembly').with.name, 'shukka-cdk-out');
+  for (const id of ['changes', 'deploy', 'diff']) assert.ok([infra.jobs[id].needs].flat().includes('synth'), id);
+  // shukka's cdk CLI is pinned exactly in its own lockfile.
+  const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
+  assert.match(pkg.devDependencies['aws-cdk'], /^\d+\.\d+\.\d+$/);
+});
+
+test('shu-9zr: deploy refuses an unsafe assembly before any credential is configured, and skips when the stacks are ahead', () => {
+  const names = steps(infra.jobs.deploy).map((s) => s.name ?? s.uses);
+  const at = ['Download the assembly', 'Check the assembly', 'Assume the infra role', 'Check the stacks are not ahead of this commit', 'Diff and guard', 'Deploy'].map((n) => names.indexOf(n));
+  assert.ok(at.every((i) => i >= 0), JSON.stringify(names));
+  assert.deepEqual([...at].sort((a, b) => a - b), at);
+  assert.match(step(infra, 'deploy', 'Check the assembly').run, /\.shukka\/scripts\/assembly\.mjs check "\$RUNNER_TEMP\/cdk\.out"/);
+  for (const n of ['Diff and guard', 'Deploy']) assert.equal(step(infra, 'deploy', n).if, "steps.order.outputs.skip != 'true'");
+  for (const n of ['Upload the bundle', 'Release']) assert.equal(step(ec2, 'release', n).if, "steps.order.outputs.skip != 'true'");
+});
+
+test('shu-9zr: the PR comment comes from a job with no credentials and no checkout; the diff is one at a time per pull request', () => {
+  const comment = infra.jobs.comment;
+  assert.deepEqual(comment.permissions, { 'pull-requests': 'write' });
+  assert.equal(comment.needs, 'diff');
+  assert.ok(!steps(comment).some((s) => String(s.uses ?? '').startsWith('actions/checkout@')));
+  assert.equal(step(infra, 'comment', 'Download the diff').with.name, 'shukka-diff');
+  assert.equal(step(infra, 'diff', 'Upload the diff for the comment').with.name, 'shukka-diff');
+  assert.deepEqual(infra.jobs.diff.concurrency, { group: 'shukka-diff-${{ github.event.pull_request.number || github.run_id }}', 'cancel-in-progress': true });
+  assert.ok(!('pull-requests' in infra.jobs.diff.permissions), 'the credentialed diff job cannot write to the pull request');
+});
+
 // ---------------------------------------------------------------------------
 // Dry composition: run the steps' bash against a fake workspace.
 // ---------------------------------------------------------------------------
@@ -253,26 +307,40 @@ after(() => rmSync(scratch, { recursive: true, force: true }));
 
 const fakeBin = join(scratch, 'bin');
 mkdirSync(fakeBin);
-// `npx --no-install cdk <command>`: diff prints $FAKE_DIFF (and --method in its help when
-// FAKE_CDK_METHOD=1); every call is logged one per line to $FAKE_NPX_LOG.
-writeFileSync(join(fakeBin, 'npx'), `#!/usr/bin/env bash
-printf '%s\\n' "$*" >>"$FAKE_NPX_LOG"
-[[ "$1" == --no-install && "$2" == cdk ]] || { echo "fake npx: unexpected $*" >&2; exit 97; }
-case "$3" in
-  diff)
-    if [[ " $* " == *" --help "* ]]; then
-      [[ "\${FAKE_CDK_METHOD:-0}" == 1 ]] && echo '  --method, -m   How to compute the diff'
-      exit 0
-    fi
-    cat "$FAKE_DIFF"; exit "\${FAKE_DIFF_STATUS:-0}";;
+const executable = (name: string, text: string) => {
+  writeFileSync(join(fakeBin, name), text);
+  chmodSync(join(fakeBin, name), 0o755);
+  return join(fakeBin, name);
+};
+// shukka's cdk CLI ($CDK in the steps): diff prints $FAKE_DIFF; every call is logged to $FAKE_CDK_LOG.
+const fakeCdk = executable('fake-cdk', `#!/usr/bin/env bash
+printf '%s\\n' "$*" >>"$FAKE_CDK_LOG"
+case "$1" in
+  diff) cat "$FAKE_DIFF"; exit "\${FAKE_DIFF_STATUS:-0}";;
   deploy) echo "fake cdk: deployed"; exit "\${FAKE_DEPLOY_STATUS:-0}";;
-  *) echo "fake npx: unexpected $*" >&2; exit 97;;
+  *) echo "fake cdk: unexpected $*" >&2; exit 97;;
 esac
 `);
-chmodSync(join(fakeBin, 'npx'), 0o755);
+// The project's own `npx --no-install cdk synth` (synth job only): writes a small assembly.
+executable('npx', `#!/usr/bin/env bash
+printf '%s\\n' "$*" >>"$FAKE_CDK_LOG"
+[[ "$1 $2 $3" == "--no-install cdk synth" && "$5" == --output ]] || { echo "fake npx: unexpected $*" >&2; exit 97; }
+mkdir -p "$6"
+echo '{"artifacts":{"Shukkatest-Box":{"type":"aws:cloudformation:stack","properties":{"templateFile":"Shukkatest-Box.template.json"}}}}' >"$6/manifest.json"
+echo '{}' >"$6/Shukkatest-Box.template.json"
+`);
+executable('npm', `#!/usr/bin/env bash
+printf 'npm %s in %s\\n' "$*" "$PWD" >>"$FAKE_CDK_LOG"
+`);
+// aws sts assume-role (the deploy job's ordering check): prints credentials unless FAKE_AWS_FAIL.
+executable('aws', `#!/usr/bin/env bash
+printf 'aws %s\\n' "$*" >>"$FAKE_CDK_LOG"
+[[ -z "\${FAKE_AWS_FAIL:-}" ]] || { echo "An error occurred (AccessDenied)" >&2; exit 254; }
+echo '{"AccessKeyId":"AKIAORDERCHECK","SecretAccessKey":"order-secret","SessionToken":"order-token"}'
+`);
 
-// SHUKKA_NODE: real node, except that changed.mjs, upload.mjs and release.mjs run their own main()
-// with stubbed AWS clients (from $FAKE_WORLD), and each call's arguments are logged to $FAKE_LOG.
+// node: real node, except that changed.mjs, upload.mjs and release.mjs run their own main() with
+// stubbed AWS clients (from $FAKE_WORLD); each call's arguments are logged to $FAKE_LOG.
 const fakeNodeModule = join(scratch, 'fake-node.mjs');
 writeFileSync(fakeNodeModule, `
 import { appendFileSync } from 'node:fs';
@@ -292,6 +360,7 @@ const stubs = {
   ssm: { async send(c) {
     record('ssm', c); fail();
     if (c.constructor.name === 'SendCommandCommand') return { Command: { CommandId: 'cmd-1' } };
+    if (c.constructor.name === 'DescribeInstanceInformationCommand') return { InstanceInformationList: [{ InstanceId: 'i-0123456789abcdef0', PingStatus: 'Online' }] };
     if (name === 'changed.mjs') {
       const apps = Object.keys(world.revisions ?? {});
       return { Status: 'Success', StandardOutputContent: apps.map((a) => a + '\\t' + world.revisions[a]).join('\\n') + '\\n' };
@@ -305,16 +374,14 @@ if (['changed.mjs', 'upload.mjs', 'release.mjs'].includes(name)) {
     ? { clients: { cfn: stubs.cfn, ec2: stubs.ec2, ssm: stubs.ssm }, wait: { sleep: async () => {}, timeoutMs: 10, intervalMs: 1 } }
     : { s3: stubs.s3, ssm: stubs.ssm, ec2: stubs.ec2, pollMs: 1 };
   const code = await mod.main(args.slice(1), deps);
-  appendFileSync(process.env.FAKE_LOG, JSON.stringify({ script: name, args: args.slice(1), code, sent }) + '\\n');
+  appendFileSync(process.env.FAKE_LOG, JSON.stringify({ script: name, args: args.slice(1), code, sent, key: process.env.AWS_ACCESS_KEY_ID ?? null }) + '\\n');
   process.exitCode = code;
 } else {
   const r = spawnSync(process.execPath, args, { stdio: 'inherit' });
   process.exitCode = r.status ?? 1;
 }
 `);
-const fakeNode = join(fakeBin, 'shukka-node');
-writeFileSync(fakeNode, `#!/usr/bin/env bash\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(fakeNodeModule)} "$@"\n`);
-chmodSync(fakeNode, 0o755);
+executable('node', `#!/usr/bin/env bash\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(fakeNodeModule)} "$@"\n`);
 
 const SHUKKA_REPO_SHA = 'a'.repeat(40);
 
@@ -394,7 +461,7 @@ function workspace(): Workspace {
   return { dir, project, shukka, temp, commits: { c1, c2, c3 } };
 }
 
-interface StepResult { code: number; out: string; outputs: Record<string, string>; summary: string; npx: string[]; calls: Loose[] }
+interface StepResult { code: number; out: string; outputs: Record<string, string>; summary: string; cdk: string[]; calls: Loose[] }
 
 /**
  * Run one step's `run:` script the way GitHub does (bash --noprofile --norc -eo pipefail), with
@@ -409,7 +476,7 @@ async function runStep(ws: Workspace, doc: Loose, jobId: string, name: string, e
       return exprs[expr] as string;
     });
   }
-  const files = { output: join(ws.temp, 'output'), summary: join(ws.temp, 'summary'), env: join(ws.temp, 'env'), log: join(ws.temp, 'calls.jsonl'), npx: join(ws.temp, 'npx.log') };
+  const files = { output: join(ws.temp, 'output'), summary: join(ws.temp, 'summary'), env: join(ws.temp, 'env'), log: join(ws.temp, 'calls.jsonl'), cdk: join(ws.temp, 'cdk.log') };
   for (const f of Object.values(files)) writeFileSync(f, '');
   const script = join(ws.temp, 'step.sh');
   writeFileSync(script, s.run);
@@ -424,11 +491,11 @@ async function runStep(ws: Workspace, doc: Loose, jobId: string, name: string, e
       GITHUB_STEP_SUMMARY: files.summary,
       GITHUB_ENV: files.env,
       RUNNER_TEMP: ws.temp,
-      SHUKKA_NODE: fakeNode,
       FAKE_LOG: files.log,
-      FAKE_NPX_LOG: files.npx,
+      FAKE_CDK_LOG: files.cdk,
       AWS_EC2_METADATA_DISABLED: 'true',
       ...env,
+      ...(env.CDK ? { CDK: fakeCdk } : {}),
       ...extraEnv,
     },
   });
@@ -445,7 +512,7 @@ async function runStep(ws: Workspace, doc: Loose, jobId: string, name: string, e
     out,
     outputs,
     summary: readFileSync(files.summary, 'utf8'),
-    npx: readFileSync(files.npx, 'utf8').split('\n').filter(Boolean),
+    cdk: readFileSync(files.cdk, 'utf8').split('\n').filter(Boolean),
     calls: readFileSync(files.log, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)),
   };
 }
@@ -569,13 +636,13 @@ test('shu-9zr: infra changes decides with changed.mjs --part infra over the synt
 });
 
 const diffFixture = (name: string) => join(root, 'test', 'fixtures', 'diff', name);
-const deployExprs = (allow: string, event: string) => ({ 'steps.config.outputs.infra_dir': 'infra', 'inputs.allow_replacement': allow, 'github.event_name': event });
+const deployExprs = (allow: string, event: string) => ({ 'inputs.allow_replacement': allow, 'github.event_name': event });
 
 test('shu-9zr: infra deploy writes ### Infrastructure changes and ### Guard, prints guard.mjs unchanged and stops on a destructive diff', async () => {
   const ws = workspace();
   const r = await runStep(ws, infra, 'deploy', 'Diff and guard', deployExprs('false', 'push'), { FAKE_DIFF: diffFixture('removed.txt') });
   assert.equal(r.code, 1, r.out);
-  assert.deepEqual(r.npx, [`--no-install cdk diff --app ${ws.temp}/cdk.out --no-color`]);
+  assert.deepEqual(r.cdk, [`diff --app ${ws.temp}/cdk.out --no-color`], 'shukka\'s cdk on the synthesized assembly');
   const printed = lines(r.out);
   const header = printed.indexOf('guard: these changes delete or replace a resource:');
   assert.ok(header >= 0, r.out);
@@ -615,34 +682,50 @@ test('shu-9zr: infra deploy tags every stack shukka:revision=<sha>, keeping each
     },
   });
   writeFileSync(join(assembly, 'manifest.json'), manifest(() => ({ Project: 'shukkatest' })));
-  const same = await runStep(ws, infra, 'deploy', 'Deploy', { 'steps.config.outputs.infra_dir': 'infra' });
+  const same = await runStep(ws, infra, 'deploy', 'Deploy', {});
   assert.equal(same.code, 0, same.out);
   assert.equal(same.outputs.deployed, 'true');
-  assert.deepEqual(same.npx, [`--no-install cdk deploy --app ${assembly} --require-approval never --no-color --all --tags Project=shukkatest --tags shukka:revision=${head}`]);
+  assert.deepEqual(same.cdk, [`deploy --app ${assembly} --require-approval never --no-color --all --tags Project=shukkatest --tags shukka:revision=${head}`]);
 
   writeFileSync(join(assembly, 'manifest.json'), manifest((id) => ({ Project: 'shukkatest', Part: id })));
-  const each = await runStep(ws, infra, 'deploy', 'Deploy', { 'steps.config.outputs.infra_dir': 'infra' });
+  const each = await runStep(ws, infra, 'deploy', 'Deploy', {});
   assert.equal(each.code, 0, each.out);
-  assert.deepEqual(each.npx, [
-    `--no-install cdk deploy --app ${assembly} --require-approval never --no-color --exclusively Shukkatest-Box --tags Project=shukkatest --tags Part=Box --tags shukka:revision=${head}`,
-    `--no-install cdk deploy --app ${assembly} --require-approval never --no-color --exclusively Shukkatest-Ci --tags Project=shukkatest --tags Part=Ci --tags shukka:revision=${head}`,
+  assert.deepEqual(each.cdk, [
+    `deploy --app ${assembly} --require-approval never --no-color --exclusively Shukkatest-Box --tags Project=shukkatest --tags Part=Box --tags shukka:revision=${head}`,
+    `deploy --app ${assembly} --require-approval never --no-color --exclusively Shukkatest-Ci --tags Project=shukkatest --tags Part=Ci --tags shukka:revision=${head}`,
   ], 'dependencies first');
 
-  const failed = await runStep(ws, infra, 'deploy', 'Deploy', { 'steps.config.outputs.infra_dir': 'infra' }, { FAKE_DEPLOY_STATUS: '1' });
+  const failed = await runStep(ws, infra, 'deploy', 'Deploy', {}, { FAKE_DEPLOY_STATUS: '1' });
   assert.equal(failed.code, 1);
   assert.equal(failed.outputs.deployed, undefined);
 });
 
-test('shu-9zr: the pull-request diff uses --method=template (or --no-change-set) and never fails for a destructive diff', async () => {
+test('shu-9zr: the pull-request diff uses --method=template, never fails for a destructive diff, and leaves its text for the comment job', async () => {
   const ws = workspace();
-  const r = await runStep(ws, infra, 'diff', 'Diff and guard', { 'steps.config.outputs.infra_dir': 'infra' }, { FAKE_DIFF: diffFixture('removed.txt'), FAKE_CDK_METHOD: '1' });
+  const r = await runStep(ws, infra, 'diff', 'Diff and guard', {}, { FAKE_DIFF: diffFixture('removed.txt') });
   assert.equal(r.code, 0, r.out);
-  assert.equal(r.npx[1], `--no-install cdk diff --app ${ws.temp}/cdk.out --no-color --method=template`);
-  assert.equal(r.outputs.guard_status, '1');
+  assert.deepEqual(r.cdk, [`diff --app ${ws.temp}/cdk.out --no-color --method=template`]);
+  const out = join(ws.temp, 'shukka-pr-diff');
+  assert.equal(readFileSync(join(out, 'guard-status'), 'utf8').trim(), '1');
+  assert.match(readFileSync(join(out, 'diff.txt'), 'utf8'), /GoneRetain/);
+  assert.match(readFileSync(join(out, 'guard.txt'), 'utf8'), /^guard: stopping\./m);
   assert.match(r.summary, /### Infrastructure changes[\s\S]*### Guard/);
-  const old = await runStep(ws, infra, 'diff', 'Diff and guard', { 'steps.config.outputs.infra_dir': 'infra' }, { FAKE_DIFF: diffFixture('same.txt') });
-  assert.equal(old.npx[1], `--no-install cdk diff --app ${ws.temp}/cdk.out --no-color --no-change-set`);
-  assert.equal(old.outputs.guard_status, '0');
+  const safe = await runStep(ws, infra, 'diff', 'Diff and guard', {}, { FAKE_DIFF: diffFixture('same.txt') });
+  assert.equal(safe.code, 0);
+  assert.equal(readFileSync(join(out, 'guard-status'), 'utf8').trim(), '0');
+  assert.equal(step(infra, 'diff', 'Upload the diff for the comment').with.path, '${{ runner.temp }}/shukka-pr-diff');
+});
+
+test('shu-9zr: a pull request without an OIDC token (fork, Dependabot) skips the diff with a notice', async () => {
+  const ws = workspace();
+  const none = await runStep(ws, infra, 'diff', 'Check for an OIDC token', {}, { ACTIONS_ID_TOKEN_REQUEST_URL: '' });
+  assert.equal(none.code, 0);
+  assert.deepEqual(none.outputs, { available: 'false' });
+  assert.match(none.out, /^::notice::shukka: this pull request gets no OIDC token/m);
+  const some = await runStep(ws, infra, 'diff', 'Check for an OIDC token', {}, { ACTIONS_ID_TOKEN_REQUEST_URL: 'https://token.example/x' });
+  assert.deepEqual(some.outputs, { available: 'true' });
+  for (const st of steps(infra.jobs.diff).slice(1)) assert.equal(st.if, "steps.token.outputs.available == 'true'", st.name ?? st.uses);
+  assert.equal(infra.jobs.comment.if, "inputs.mode == 'diff' && needs.diff.outputs.available == 'true'");
 });
 
 async function fakeApi(handler: (req: IncomingMessage, body: string, res: ServerResponse) => void) {
@@ -660,8 +743,11 @@ async function fakeApi(handler: (req: IncomingMessage, body: string, res: Server
 
 test('shu-9zr: the PR comment is marked <!-- shukka:diff -->, says the merge will stop, and is updated in place', async () => {
   const ws = workspace();
-  writeFileSync(join(ws.temp, 'shukka-diff.txt'), readFileSync(diffFixture('removed.txt'), 'utf8'));
-  writeFileSync(join(ws.temp, 'shukka-guard.txt'), 'guard: these changes delete or replace a resource:\n[-] AWS::DynamoDB::Table GoneRetain orphan\n');
+  const dir = join(ws.temp, 'shukka-pr-diff');
+  mkdirSync(dir);
+  writeFileSync(join(dir, 'diff.txt'), readFileSync(diffFixture('removed.txt'), 'utf8'));
+  writeFileSync(join(dir, 'guard.txt'), 'guard: these changes delete or replace a resource:\n[-] AWS::DynamoDB::Table GoneRetain orphan\n');
+  writeFileSync(join(dir, 'guard-status'), '1\n');
   const comments: Loose[] = [{ id: 7, user: { login: 'someone' }, body: '<!-- shukka:diff --> planted by a person' }];
   const requests: string[] = [];
   const api = await fakeApi((req, body, res) => {
@@ -681,9 +767,9 @@ test('shu-9zr: the PR comment is marked <!-- shukka:diff -->, says the merge wil
     }
   });
   try {
-    const exprs = { 'github.token': 't0ken', 'github.event.pull_request.number': '12', 'steps.guard.outputs.guard_status': '1' };
+    const exprs = { 'github.token': 't0ken', 'github.event.pull_request.number': '12' };
     const env = { GITHUB_API_URL: api.url, GITHUB_REPOSITORY: 'acme/site' };
-    const first = await runStep(ws, infra, 'diff', 'Comment on the pull request', exprs, env);
+    const first = await runStep(ws, infra, 'comment', 'Comment on the pull request', exprs, env);
     assert.equal(first.code, 0, first.out);
     const ours = comments.filter((c) => c.user.login === 'github-actions[bot]');
     assert.equal(ours.length, 1);
@@ -692,7 +778,8 @@ test('shu-9zr: the PR comment is marked <!-- shukka:diff -->, says the merge wil
     assert.match(ours[0]?.body, /### Guard/);
     assert.equal(comments[0]?.body, '<!-- shukka:diff --> planted by a person', 'another user\'s comment is never edited');
 
-    const second = await runStep(ws, infra, 'diff', 'Comment on the pull request', { ...exprs, 'steps.guard.outputs.guard_status': '0' }, env);
+    writeFileSync(join(dir, 'guard-status'), '0\n');
+    const second = await runStep(ws, infra, 'comment', 'Comment on the pull request', exprs, env);
     assert.equal(second.code, 0, second.out);
     assert.equal(comments.length, 2, 'updated, not posted again');
     assert.doesNotMatch(comments[1]?.body, /stop/);
@@ -747,16 +834,84 @@ test('shu-9zr: ec2 changes decides every app with changed.mjs --part app:<name> 
   assert.match(broken.out, /::warning::shukka: could not decide which apps changed; releasing every app/);
 });
 
-test('shu-9zr: ec2 config resolves the deploy bucket from the input or <project>-deploy-<account>', async () => {
+test('shu-9zr: ec2 takes the deploy bucket from shukka.json: aws.deployBucket, default <project>-deploy-<account>', async () => {
   const ws = workspace();
-  const r = await runStep(ws, ec2, 'changes', 'Read shukka.json', { 'inputs.config': 'shukka.json', 'inputs.deploy_bucket': '' }, { SHUKKA_NODE: process.execPath });
+  const r = await runStep(ws, ec2, 'changes', 'Read shukka.json', { 'inputs.config': 'shukka.json' });
   assert.equal(r.code, 0, r.out);
   assert.equal(r.outputs.bucket, 'shukkatest-deploy-123456789012');
   assert.equal(r.outputs.apps, '["web","api"]');
-  const given = await runStep(ws, ec2, 'changes', 'Read shukka.json', { 'inputs.config': 'shukka.json', 'inputs.deploy_bucket': 'my-bucket' }, { SHUKKA_NODE: process.execPath });
-  assert.equal(given.outputs.bucket, 'my-bucket');
-  const bad = await runStep(ws, ec2, 'changes', 'Read shukka.json', { 'inputs.config': 'shukka.json', 'inputs.deploy_bucket': 'Bad Bucket' }, { SHUKKA_NODE: process.execPath });
+  writeFileSync(join(ws.project, 'shukka.json'), JSON.stringify({ ...fixtureConfig, aws: { ...fixtureConfig.aws, deployBucket: 'shukkatest-prod-deploy-123456789012' } }));
+  const given = await runStep(ws, ec2, 'changes', 'Read shukka.json', { 'inputs.config': 'shukka.json' });
+  assert.equal(given.outputs.bucket, 'shukkatest-prod-deploy-123456789012');
+  assert.ok(!('deploy_bucket' in (ec2.on.workflow_call.inputs as Loose)) && !('deploy_bucket' in (pipeline.on.workflow_call.inputs as Loose)));
+});
+
+test('shu-9zr: a release of an older commit than the servers run is skipped with a notice (quick merges)', async () => {
+  const ws = workspace();
+  const { c1, c2, c3 } = ws.commits as { c1: string; c2: string; c3: string };
+  sh(ws.project, 'checkout', '-q', c2);
+  const exprs = { 'matrix.app': 'web', 'inputs.config': 'shukka.json' };
+  const ahead = await runStep(ws, ec2, 'release', 'Check the servers are not ahead of this commit', exprs, { FAKE_WORLD: JSON.stringify({ revisions: { web: c3 } }) });
+  assert.equal(ahead.code, 0, ahead.out);
+  assert.deepEqual(ahead.outputs, { skip: 'true' });
+  assert.match(ahead.out, new RegExp(`^::notice::shukka: web already runs ${c3}, a later commit than this run's ${c2}`, 'm'));
+  assert.deepEqual((ahead.calls[0] as Loose).args, ['project/shukka.json', '--repo', 'project', '--part', 'app:web']);
+  for (const [rev, why] of [[c2, 'same commit'], [c1, 'older commit']] as const) {
+    const r = await runStep(ws, ec2, 'release', 'Check the servers are not ahead of this commit', exprs, { FAKE_WORLD: JSON.stringify({ revisions: { web: rev } }) });
+    assert.deepEqual(r.outputs, { skip: 'false' }, why);
+  }
+  const unknown = await runStep(ws, ec2, 'release', 'Check the servers are not ahead of this commit', exprs, { FAKE_WORLD: JSON.stringify({ awsError: 'AccessDenied' }) });
+  assert.deepEqual(unknown.outputs, { skip: 'false' });
+});
+
+test('shu-9zr: a deploy of an older commit than the stacks carry is skipped, reading them with the deploy role handed to changed.mjs only', async () => {
+  const ws = workspace();
+  const { c1, c2, c3 } = ws.commits as { c1: string; c2: string; c3: string };
+  sh(ws.project, 'checkout', '-q', c2);
+  const exprs = { 'inputs.config': 'shukka.json', 'steps.assembly.outputs.stacks': 'Shukkatest-Box', 'steps.config.outputs.account': '123456789012', 'steps.config.outputs.qualifier': 'shukkatest', 'steps.config.outputs.region': 'us-east-1' };
+  const tagged = (sha: string) => JSON.stringify({ stacks: [{ StackName: 'Shukkatest-Box', Tags: [{ Key: 'shukka:revision', Value: sha }] }] });
+  const ahead = await runStep(ws, infra, 'deploy', 'Check the stacks are not ahead of this commit', exprs, { FAKE_WORLD: tagged(c3) });
+  assert.equal(ahead.code, 0, ahead.out);
+  assert.deepEqual(ahead.outputs, { skip: 'true' });
+  assert.match(ahead.out, /^::notice::shukka: the stacks are already at [0-9a-f]{40}, a later commit/m);
+  assert.ok(ahead.cdk.includes('aws sts assume-role --role-arn arn:aws:iam::123456789012:role/cdk-shukkatest-deploy-role-123456789012-us-east-1 --role-session-name shukka-infra-order --query Credentials --output json'));
+  const call = ahead.calls[0] as Loose;
+  assert.equal(call.key, 'AKIAORDERCHECK');
+  assert.deepEqual(call.args, ['project/shukka.json', '--part', 'infra', '--repo', 'project', '--stacks', 'Shukkatest-Box']);
+  assert.match(ahead.out, /^::add-mask::order-secret$/m);
+  assert.deepEqual((await runStep(ws, infra, 'deploy', 'Check the stacks are not ahead of this commit', exprs, { FAKE_WORLD: tagged(c1) })).outputs, { skip: 'false' });
+  const denied = await runStep(ws, infra, 'deploy', 'Check the stacks are not ahead of this commit', exprs, { FAKE_AWS_FAIL: '1' });
+  assert.deepEqual(denied.outputs, { skip: 'false' });
+  assert.match(denied.out, /could not read the stacks' revisions; deploying/);
+});
+
+test('shu-9zr: synth runs the project\'s npm ci and cdk synth with no credentials and tars the assembly; its settings are checked', async () => {
+  const ws = workspace();
+  const read = await runStep(ws, infra, 'synth', 'Read the infra settings', { 'inputs.config': 'shukka.json' });
+  assert.equal(read.code, 0, read.out);
+  assert.deepEqual(read.outputs, { infra_dir: 'infra', node: '22', account: '123456789012', region: 'us-east-1' });
+  const exprs = { 'steps.config.outputs.infra_dir': 'infra', 'steps.config.outputs.account': '123456789012', 'steps.config.outputs.region': 'us-east-1' };
+  const r = await runStep(ws, infra, 'synth', 'Synthesize', exprs);
+  assert.equal(r.code, 0, r.out);
+  assert.deepEqual(r.cdk, [`npm ci in ${realpathSync(join(ws.project, 'infra'))}`, `--no-install cdk synth --quiet --output ${ws.temp}/cdk.out`]);
+  const listing = execFileSync('tar', ['-tzf', join(ws.temp, 'shukka-assembly', 'cdk.out.tgz')], { encoding: 'utf8' });
+  assert.match(listing, /manifest\.json/);
+  writeFileSync(join(ws.project, 'shukka.json'), JSON.stringify({ ...fixtureConfig, infra: { dir: '../x', paths: ['infra/**'] } }));
+  const bad = await runStep(ws, infra, 'synth', 'Read the infra settings', { 'inputs.config': 'shukka.json' });
   assert.equal(bad.code, 1);
+});
+
+test('shu-9zr: only pushes to main and runs by hand on main deploy; by hand elsewhere skips with a notice', async () => {
+  const ws = workspace();
+  const decide = (event: string, ref: string) => runStep(ws, pipeline, 'plan', 'Decide whether this run deploys', { 'github.event_name': event, 'github.ref': ref });
+  assert.deepEqual((await decide('push', 'refs/heads/main')).outputs, { deploy: 'true' });
+  assert.deepEqual((await decide('workflow_dispatch', 'refs/heads/main')).outputs, { deploy: 'true' });
+  const pr = await decide('pull_request', 'refs/pull/3/merge');
+  assert.deepEqual(pr.outputs, { deploy: 'false' });
+  assert.doesNotMatch(pr.out, /::notice::/);
+  const branch = await decide('workflow_dispatch', 'refs/heads/feature');
+  assert.deepEqual(branch.outputs, { deploy: 'false' });
+  assert.match(branch.out, /^::notice::shukka: deploys run only on main; workflow_dispatch on refs\/heads\/feature runs plan and checks only$/m);
 });
 
 test('shu-9zr: ec2 release unpacks the artifact outside both checkouts, uploads it and releases with the hook from git', async () => {

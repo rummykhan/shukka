@@ -12,25 +12,30 @@
 #   config             path of shukka.json in the project (default shukka.json)
 #   allow_replacement  let the infrastructure deploy delete or replace resources (workflow_dispatch only)
 #   force              deploy every part whatever changed
-#   deploy_bucket      the bucket bundles go to; default <project>-deploy-<account>
 #   shukka_ref         only when the caller file cannot be read: the shukka ref this run uses (see plan)
 #
 # Jobs, by id and by the name a run shows (prefixed with the caller's job, e.g. "shukka / plan"; a
 # nested workflow's jobs show as "<caller> / <job>", and its skipped jobs are listed too):
 #   plan     plan                      reads and validates shukka.json; no AWS access, does not decide what changed
 #   checks   check <name>              one per shukka.json check (pull requests and merges); no AWS access
-#   build    build <app>               one per app (merges only): build, bundle, upload bundle-<app>; no AWS access
-#   diff     pull request / diff       pull requests: infra.yml in diff mode, the read-only diff role, one PR
-#                                      comment marked <!-- shukka:diff --> updated in place
-#   infra    stacks / changes          merges: infra.yml decides whether the stacks changed (infra role, read only)
-#            stacks / deploy           merges: synth, diff, guard, cdk deploy; skipped when the stacks did not change
+#   build    build <app>               one per app (deploying runs only): build, bundle, upload bundle-<app>; no AWS access
+#   diff     pull request / synth      pull requests: the project's cdk synth, without credentials
+#            pull request / diff       the read-only diff role diffs the synthesized assembly
+#            pull request / comment    one PR comment marked <!-- shukka:diff --> updated in place
+#   infra    stacks / synth            deploying runs: the project's cdk synth, without credentials
+#            stacks / changes          infra.yml decides whether the stacks changed (infra role, read only)
+#            stacks / deploy           check the assembly, diff, guard, cdk deploy; skipped when the stacks did not change
 #   app      servers / changes         merges: ec2.yml decides which apps changed (app role, read only)
 #            servers / release <app>   merges: one per changed app: upload the bundle and release it through SSM
 #   smoke    smoke                     the project's smoke command, when anything was deployed; no AWS access
 # Only the deploy job says "deploy", only the pull-request diff says "diff", only the release jobs say
 # "release": the caller jobs are named "pull request", "stacks" and "servers" so that the read-only
 # "changes" jobs and the skipped jobs of the other mode never carry those words.
-# A docs-only merge runs plan, check, build and the two read-only "changes" jobs; no deploy job runs.
+# A docs-only merge runs plan, check, build, synth and the two read-only "changes" jobs; no deploy job runs.
+# Deploying runs are pushes to main and runs started by hand on main; elsewhere the deploy jobs are
+# skipped with a notice from plan.
+# The project's own code (checks, builds, cdk synth, smoke) runs only in jobs that cannot obtain
+# AWS credentials; the credentialed jobs in infra.yml and ec2.yml run shukka's code only.
 #
 # Only infra.yml and ec2.yml get id-token: write (design D3); every job sets its own permissions.
 # No ${{ }} expression from inputs, events or matrix is written into a run: script; they go through env:.
@@ -54,10 +59,6 @@ on:
         description: Deploy every part, whatever changed
         type: boolean
         default: false
-      deploy_bucket:
-        description: Bucket for app bundles; default <project>-deploy-<account>
-        type: string
-        default: ''
       shukka_ref:
         description: The shukka ref this run uses, when plan cannot read it from the caller file
         type: string
@@ -82,9 +83,28 @@ jobs:
       has_checks: ${{ steps.config.outputs.has_checks }}
       has_apps: ${{ steps.config.outputs.has_apps }}
       has_smoke: ${{ steps.config.outputs.has_smoke }}
+      deploy: ${{ steps.deploy.outputs.deploy }}
       shukka_repository: ${{ steps.shukka.outputs.repository }}
       shukka_sha: ${{ steps.sha.outputs.sha }}
     steps:
+      # Deploys happen only from main: pushes there, and runs started by hand on main. A run started
+      # by hand on another branch checks and builds nothing to deploy and says so, instead of going red
+      # at the roles' trust policies.
+      - name: Decide whether this run deploys
+        id: deploy
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          deploy=false
+          if [[ "$EVENT_NAME" != pull_request && "$REF" == refs/heads/main ]]; then
+            deploy=true
+          elif [[ "$EVENT_NAME" != pull_request ]]; then
+            printf '::notice::shukka: deploys run only on main; %s on %s runs plan and checks only\n' "$EVENT_NAME" "${REF//%/%25}"
+          fi
+          echo "deploy=$deploy" >>"$GITHUB_OUTPUT"
+
       - name: Check out the project
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -241,7 +261,7 @@ jobs:
   build:
     name: build ${{ matrix.app.name }}
     needs: plan
-    if: github.event_name != 'pull_request' && needs.plan.outputs.has_apps == 'true'
+    if: needs.plan.outputs.deploy == 'true' && needs.plan.outputs.has_apps == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
@@ -356,7 +376,7 @@ jobs:
     name: stacks
     needs: [plan, checks, build]
     if: >-
-      !cancelled() && github.event_name != 'pull_request'
+      !cancelled() && needs.plan.outputs.deploy == 'true'
       && needs.plan.result == 'success'
       && contains(fromJSON('["success","skipped"]'), needs.checks.result)
       && contains(fromJSON('["success","skipped"]'), needs.build.result)
@@ -385,7 +405,6 @@ jobs:
     with:
       config: ${{ inputs.config }}
       force: ${{ inputs.force }}
-      deploy_bucket: ${{ inputs.deploy_bucket }}
 
   smoke:
     name: smoke
