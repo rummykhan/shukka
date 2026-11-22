@@ -111,14 +111,14 @@ Acceptance:
 | # | What | Needed by | Why | Status | If unavailable |
 |---|---|---|---|---|---|
 | P1 | Repository name, owner and package name | all | Public home | provided: rummykhan/shukka (2026-11-22) | — |
-| P2 | Leave to create the public repository rummykhan/shukka and push to it | R1, R2 | Projects pull from it | provided by the owner's choice of home (2026-11-22); confirmed before the first push | — |
+| P2 | Leave to create the public repository rummykhan/shukka and push to it | R1, R2 | Projects pull from it | provided; first push confirmed 2026-11-22 | — |
 | P3 | Leave to deploy Trendigle's Ci stack by hand once when its roles change (as on 2026-11-22) | R2, R3 | A pipeline cannot create the role it runs as | provided (2026-11-22) | — |
 | P4 | Leave to change Trendigle's CDK bootstrap: a new, limited execution role for its deploys | R3 | The fence | provided (2026-11-22) | — |
 | P5 | Leave to create and delete a throwaway stack in the shared account to prove the fence | R3 | Prove the fence | provided (2026-11-22) | — |
-| P6 | Leave to create a private test repository `rummykhan/shukka-consumer-test` and throwaway roles and stacks (`shukkatest-*`) in the shared account, all deleted at the end | R1, R2, R4, S1 | Prove the trust rules with real GitHub tokens before touching Trendigle | pending (added by design) | Trust rules proven only on Trendigle's switch-over merge |
-| P7 | Leave to change Trendigle's GitHub OIDC subject template (`include_claim_keys`), which changes the subject for every workflow in that repo | R2 | Workflow-scoped trust | pending (added by design) | Trust by `job_workflow_ref` condition alone, if spike S1 shows AWS accepts it |
-| P8 | Leave for one deliberately unhealthy release of Trendigle's admin panel in a quiet moment, to see the rollback on the real box | R5 | Rollback observed, not only in a container | pending (added by design) | Rollback observed in the container and the test consumer only |
-| P9 | `LEGAL_ENTITY` and `CONTACT_EMAIL` copied from Parameter Store to Trendigle's GitHub repository variables | R9 | Build without credentials (D9) | pending (added by design) | The factory copies them with leave; they are public page text |
+| P6 | Leave to create a private test repository `rummykhan/shukka-consumer-test` and throwaway roles and stacks (`shukkatest-*`) in the shared account, all deleted at the end | R1, R2, R4, S1 | Prove the trust rules with real GitHub tokens before touching Trendigle | provided (2026-11-22) | Trust rules proven only on Trendigle's switch-over merge |
+| P7 | Leave to change Trendigle's GitHub OIDC subject template (`include_claim_keys`), which changes the subject for every workflow in that repo | R2 | Workflow-scoped trust | provided (2026-11-22) | Trust by `job_workflow_ref` condition alone, if spike S1 shows AWS accepts it |
+| P8 | Leave for one deliberately unhealthy release of Trendigle's admin panel in a quiet moment, to see the rollback on the real box | R5 | Rollback observed, not only in a container | provided (2026-11-22) | Rollback observed in the container and the test consumer only |
+| P9 | `LEGAL_ENTITY` and `CONTACT_EMAIL` copied from Parameter Store to Trendigle's GitHub repository variables | R9 | Build without credentials (D9) | provided (2026-11-22) | The factory copies them with leave; they are public page text |
 
 ## Open questions
 
