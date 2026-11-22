@@ -1,0 +1,23 @@
+AI agent detected
+stacks/instance-stack.ts:27:16
+WARNING VpcId: 'vpc-12345' does not match format 'AWS::EC2::VPC.Id' (CloudFormation Validate)
+   Trendigle-prod-Instance/Sg/Resource (SgD4954771) aws-cdk-lib.aws_ec2.CfnSecurityGroup
+   Acknowledge with 'CloudFormation-Validate::E1151'
+stacks/instance-stack.ts:125:22
+WARNING SubnetId: 's-12345' does not match format 'AWS::EC2::Subnet.Id' (CloudFormation Validate)
+   Trendigle-prod-Instance/Box/Resource (BoxA0510527) aws-cdk-lib.aws_ec2.CfnInstance
+   Acknowledge with 'CloudFormation-Validate::E1154'
+stacks/instance-stack.ts:125:22
+WARNING ImageId: Hardcoded AMI ID - use a parameter or mapping for portability (CloudFormation Validate)
+   Trendigle-prod-Instance/Box/Resource (BoxA0510527) aws-cdk-lib.aws_ec2.CfnInstance
+   Acknowledge with 'CloudFormation-Validate::W9010'
+WARNING No cross-stack-reference strength configured, defaulting to "strong". We recommend you set feature flag "@aws-cdk/core:defaultCrossStackReferences" to "both", then deploy everywhere, then set it to "weak". Alternatively, set it to "strong" explicitly to lock in the current producer-protecting behavior. (See: https://github.com/aws/aws-cdk/blob/main/packages/aws-cdk-lib/README.md#reference-strength) (Construct Annotations)
+   Trendigle-prod-Instance
+   Acknowledge with 'Annotation::@aws-cdk/core:crossStackReferencesDefaultStrong'
+Stack [1mTrendigle-prod-Instance[22m
+[0m[4m[1mResources[22m[24m[0m
+[0m[33m[~][39m [36mAWS::EC2::Instance[39m Box [90mBoxA0510527[39m [3m[1m[31mreplace[39m[22m[23m[0m
+[0m └─ [33m[~][39m ImageId (requires replacement)[0m
+[0m     ├─ [31m[-][39m [31mami-old[39m[0m
+[0m     └─ [32m[+][39m [32mami-0c79d740d6667195a[39m[0m
+✨  Number of stacks with differences: 1
