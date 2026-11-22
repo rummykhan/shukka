@@ -87,6 +87,11 @@ export function checkArgs(args) {
   if (args.units.length === 0) problems.push('units: at least one unit is needed');
   for (const unit of args.units) if (!UNIT_RE.test(unit)) problems.push(`units: "${unit}" is not a unit name`);
   if (!HEALTH_RE.test(args.health)) problems.push(`health: "${args.health}" is not an http(s) URL`);
+  // Run Command resolves {{ssm:...}} in its parameters with the caller's role: a value carrying
+  // one would put a parameter (possibly a secret) on the server's command line.
+  for (const [name, value] of [['health', args.health], ['units', args.units.join(' ')]]) {
+    if (/[{}]/.test(/** @type {string} */ (value))) problems.push(`${name}: must not contain { or }`);
+  }
   if (args.keep !== undefined && !(Number.isInteger(args.keep) && args.keep >= 1 && args.keep <= 99)) {
     problems.push('keep: must be 1 to 99');
   }
@@ -124,17 +129,23 @@ function git(checkout, args) {
 /**
  * Read the configure hook from the commit checked out at `checkout` (its HEAD), not from the
  * working tree, so nothing written into the checkout after it (a downloaded artifact, a build) can
- * stand in for it. The path must name a regular file in that commit.
+ * stand in for it. The path must name a regular file in that commit, and the commit must be the one
+ * being released (HEAD equals `sha`, or starts with it when `sha` is abbreviated).
  * @param {string} checkout root of a git checkout
  * @param {string} configure path relative to the repository root (shukka.json server.configure)
+ * @param {string} sha the commit being released
  * @returns {Buffer}
  */
-export function readHook(checkout, configure) {
+export function readHook(checkout, configure, sha) {
   if (!CONFIGURE_RE.test(configure) || isAbsolute(configure) || configure.split('/').some((s) => s === '..' || s === '.' || s === '')) {
     throw new Error(`configure: "${configure}" must be a relative path inside the repository`);
   }
   const prefix = git(checkout, ['rev-parse', '--show-prefix']).toString().trim();
   if (prefix !== '') throw new Error(`checkout: ${checkout} is not the root of its git repository`);
+  const head = git(checkout, ['rev-parse', 'HEAD']).toString().trim();
+  if (!SHA_RE.test(sha) || !head.startsWith(sha)) {
+    throw new Error(`checkout: ${checkout} is at ${head}, not at the commit being released (${sha})`);
+  }
   const listing = git(checkout, ['ls-tree', '-z', 'HEAD', '--', configure]).toString();
   const match = /^(\d+) (\w+) ([0-9a-f]+)\t([^\0]*)\0$/.exec(listing);
   if (!match || match[4] !== configure) {
@@ -254,12 +265,14 @@ async function waitFor(ssm, commandId, instanceId, pollMs, deadline) {
 }
 
 /**
+ * The release script's result line, if the output still ends with it (SSM truncates long output).
  * @param {string} text
  * @returns {string}
  */
-function lastLine(text) {
+export function resultLine(text) {
   const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
-  return lines[lines.length - 1] ?? '';
+  const last = lines[lines.length - 1] ?? '';
+  return /^shukka: /.test(last) ? last : 'output truncated';
 }
 
 /**
@@ -279,7 +292,7 @@ export async function release(options) {
   const pollMs = options.pollMs ?? 3000;
 
   const script = readFileSync(options.script ?? DEFAULT_SCRIPT, 'utf8');
-  const hook = readHook(options.checkout, options.configure);
+  const hook = readHook(options.checkout, options.configure, options.sha);
   const instanceIds = await findInstances(ec2, options.project);
   if (instanceIds.length === 0) throw new Error(`no running instance is tagged Project=${options.project}`);
 
@@ -321,8 +334,7 @@ export async function release(options) {
 
   const failed = results.filter((r) => r.message !== null);
   for (const r of failed) {
-    const last = lastLine(r.stdout);
-    out(`shukka: release failed on ${r.instanceId}: ${r.message}${last ? ` (${last})` : ''}\n`);
+    out(`shukka: release failed on ${r.instanceId}: ${r.message} (${resultLine(r.stdout)})\n`);
   }
   const first = failed[0];
   const code = !first ? 0 : (first.code >= 10 && first.code <= 13 ? first.code : 1);

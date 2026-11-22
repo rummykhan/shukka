@@ -7,9 +7,9 @@ import { gunzipSync } from 'node:zlib';
 import { DescribeInstancesCommand } from '@aws-sdk/client-ec2';
 import { PutObjectCommand } from '@aws-sdk/client-s3';
 import { GetCommandInvocationCommand, SendCommandCommand } from '@aws-sdk/client-ssm';
-import { buildCommands, EXIT_MESSAGES, hookKey, main, readHook, release, scriptArgs } from '../scripts/release.mjs';
+import { buildCommands, checkArgs, EXIT_MESSAGES, hookKey, main, readHook, release, resultLine, scriptArgs } from '../scripts/release.mjs';
 import { upload } from '../scripts/upload.mjs';
-import { bundleDir, GOOD_HOOK, gitCheckout, HOOK, SHA, stubClient, tarEntries, withTmp, write } from './helpers/release-fixtures.js';
+import { bundleDir, GOOD_HOOK, gitCheckout, headOf, HOOK, SHA, stubClient, tarEntries, withTmp, write } from './helpers/release-fixtures.js';
 
 const SCRIPT = '#!/usr/bin/env bash\n# stand-in for box/shukka-release.sh\nprintf "%s\\n" "$@"\n';
 
@@ -153,16 +153,17 @@ test('shu-mf3: the configure hook is read from the git checkout, uploaded beside
 
 test('shu-mf3: a hook that is not a committed regular file at the checkout root is refused', withTmp(async (root) => {
   const checkout = gitCheckout(root, { 'README.md': 'x\n', 'implementation/keep.txt': 'x\n' });
-  assert.throws(() => readHook(checkout, HOOK), /not committed/);
+  const head = headOf(checkout);
+  assert.throws(() => readHook(checkout, HOOK, head), /not committed/);
   write(join(checkout, HOOK), GOOD_HOOK); // on disk but not committed
-  assert.throws(() => readHook(checkout, HOOK), /not committed/);
-  assert.throws(() => readHook(checkout, '../outside.sh'), /relative path inside the repository/);
-  assert.throws(() => readHook(checkout, '/etc/passwd'), /relative path inside the repository/);
+  assert.throws(() => readHook(checkout, HOOK, head), /not committed/);
+  assert.throws(() => readHook(checkout, '../outside.sh', head), /relative path inside the repository/);
+  assert.throws(() => readHook(checkout, '/etc/passwd', head), /relative path inside the repository/);
   spawnSync('ln', ['-s', '/etc/hosts', join(checkout, 'link.sh')]);
   spawnSync('git', ['-C', checkout, 'add', 'link.sh']);
   spawnSync('git', ['-C', checkout, 'commit', '-q', '-m', 'link']);
-  assert.throws(() => readHook(checkout, 'link.sh'), /not a regular file/);
-  assert.throws(() => readHook(join(checkout, 'implementation'), 'x.sh'), /not the root/);
+  assert.throws(() => readHook(checkout, 'link.sh', headOf(checkout)), /not a regular file/);
+  assert.throws(() => readHook(join(checkout, 'implementation'), 'x.sh', headOf(checkout)), /not the root/);
 }));
 
 test('shu-mf3: shell quoting keeps odd argument values intact', () => {
@@ -194,4 +195,38 @@ test('shu-mf3: release CLI takes project, hook path, units and health from shukk
   const commands = (ssm.calls.find((c) => c instanceof SendCommandCommand)!.input.Parameters as { commands: string[] }).commands;
   const run = spawnSync('sh', ['-c', commands.join('\n')], { encoding: 'utf8' });
   assert.ok(run.stdout.includes('shukkatest-web\n--health\nhttp://127.0.0.1:3000/\n'), run.stdout);
+}));
+
+test('shu-mf3: the hook is refused when the checkout is not at the commit being released', withTmp((root) => {
+  const checkout = gitCheckout(root);
+  const head = headOf(checkout);
+  assert.equal(readHook(checkout, HOOK, head).toString(), GOOD_HOOK);
+  assert.equal(readHook(checkout, HOOK, head.slice(0, 12)).toString(), GOOD_HOOK);
+  const other = head.startsWith('0') ? `1${head.slice(1)}` : `0${head.slice(1)}`;
+  assert.throws(() => readHook(checkout, HOOK, other), /not at the commit being released/);
+  assert.throws(() => readHook(checkout, HOOK, 'HEAD'), /not at the commit being released/);
+}));
+
+test('shu-mf3: health and units carrying { or } are refused, so no {{ssm:...}} reaches Run Command', withTmp(async (root) => {
+  const options = baseOptions(root, scriptFile(root));
+  const secret = 'http://127.0.0.1:3000/?{{ssm:/shukkatest/prod/SECRET}}';
+  assert.ok(checkArgs({ ...options, health: secret }).some((p) => /health: must not contain \{ or \}/.test(p)));
+  assert.ok(checkArgs({ ...options, units: ['web', '{{ssm:/x}}'] }).some((p) => /units:/.test(p)));
+  assert.deepEqual(checkArgs(options), []);
+  const ssm = stubSsm(() => ({ Status: 'Success', ResponseCode: 0 }));
+  const s3 = stubClient();
+  await assert.rejects(release({ ...options, health: secret, ec2: stubEc2().client, ssm: ssm.client, s3: s3.client, out: () => {} }), /health/);
+  assert.equal(ssm.calls.length, 0);
+  assert.equal(s3.calls.length, 0);
+}));
+
+test('shu-mf3: the failure message shows the last line only when it is the release script result line', withTmp(async (root) => {
+  assert.equal(resultLine(`x\nshukka: shukkatest/web none -> ${SHA} rolled-back\n`), `shukka: shukkatest/web none -> ${SHA} rolled-back`);
+  assert.equal(resultLine('lots of output cut off in the mid'), 'output truncated');
+  assert.equal(resultLine(''), 'output truncated');
+  const options = baseOptions(root, scriptFile(root));
+  let printed = '';
+  await release({ ...options, ec2: stubEc2(['i-0aaa']).client, s3: stubClient().client, out: (t) => { printed += t; },
+    ssm: stubSsm(() => ({ Status: 'Failed', ResponseCode: 12, StandardOutputContent: 'a long log, cut off by SSM, ends mid-li' })).client });
+  assert.ok(printed.includes(`shukka: release failed on i-0aaa: ${EXIT_MESSAGES[12]} (output truncated)`), printed);
 }));

@@ -4,7 +4,6 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
-export const SHA = 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678';
 export const HOOK = 'implementation/infra/box/configure-app.sh';
 export const GOOD_HOOK = '#!/usr/bin/env bash\necho configured from git\n';
 
@@ -43,11 +42,18 @@ export function write(path: string, content: string) {
   writeFileSync(path, content);
 }
 
+/** HEAD of `checkout`. */
+export function headOf(checkout: string): string {
+  return execFileSync('git', ['-C', checkout, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+}
+
 /** A git checkout at root/checkout whose HEAD holds the given files (by default the configure hook). */
 export function gitCheckout(root: string, files: Record<string, string> = { [HOOK]: GOOD_HOOK }): string {
   const dir = join(root, 'checkout');
   mkdirSync(dir, { recursive: true });
-  const git = (...args: string[]) => execFileSync('git', ['-C', dir, ...args], { stdio: 'pipe' });
+  // Fixed identity and dates: the same files always give the same commit, so SHA below matches.
+  const env = { ...process.env, GIT_AUTHOR_DATE: '2026-01-01T00:00:00Z', GIT_COMMITTER_DATE: '2026-01-01T00:00:00Z' };
+  const git = (...args: string[]) => execFileSync('git', ['-C', dir, ...args], { stdio: 'pipe', env });
   git('init', '-q');
   git('config', 'user.email', 'test@example.com');
   git('config', 'user.name', 'test');
@@ -96,3 +102,13 @@ export function withTmp(fn: (root: string) => Promise<void> | void) {
     }
   };
 }
+
+/** The commit of the default fixture checkout (gitCheckout with no files given): the sha being released. */
+export const SHA = (() => {
+  const root = mkdtempSync(join(tmpdir(), 'shu-mf3-sha-'));
+  try {
+    return headOf(gitCheckout(root));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+})();

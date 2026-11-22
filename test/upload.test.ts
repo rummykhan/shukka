@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { gunzipSync } from 'node:zlib';
 import { PutObjectCommand } from '@aws-sdk/client-s3';
@@ -88,4 +88,69 @@ test('shu-mf3: upload CLI reads the project from shukka.json and prints the s3 U
   assert.equal(code, 0);
   assert.equal(calls[0]!.input.Key, `shukkatest/web/${SHA}.tgz`);
   assert.equal(stdout.trim().split('\n').pop(), `s3://b-bucket/shukkatest/web/${SHA}.tgz`);
+}));
+
+test('shu-mf3: symbolic links that are absolute or lead outside the bundle are refused; links inside are kept', withTmp(async (root) => {
+  const outside = join(root, 'outside.txt');
+  write(outside, 'outside');
+  const cases: Array<[string, string]> = [
+    ['abs', '/etc/passwd'],
+    ['up', '../outside.txt'],
+    ['public/up2', '../../outside.txt'],
+    ['roundtrip', '../bundle/server.js'], // inside on this machine, outside once the release dir is named differently
+    ['dangling', 'missing.txt'],
+  ];
+  for (const [name, target] of cases) {
+    const dir = bundleDir(join(root, name.replace('/', '-')));
+    symlinkSync(target, join(dir, name));
+    const { calls, client } = stubClient();
+    await assert.rejects(upload({ dir, bucket: 'b-bucket', project: 'shukkatest', app: 'web', sha: SHA, s3: client }),
+      (error: Error) => error.message.includes(`refused: ${name} is a symbolic link`), `${name} -> ${target}`);
+    assert.equal(calls.length, 0);
+  }
+  // A link through an internal link that points at the root, then up: escapes once followed.
+  const sneaky = bundleDir(join(root, 'sneaky'));
+  symlinkSync('.', join(sneaky, 'self'));
+  symlinkSync('self/../outside.txt', join(sneaky, 'esc'));
+  await assert.rejects(upload({ dir: sneaky, bucket: 'b-bucket', project: 'shukkatest', app: 'web', sha: SHA, s3: stubClient().client }),
+    /refused: esc is a symbolic link that leads outside/);
+
+  const dir = bundleDir(join(root, 'ok'));
+  mkdirSync(join(dir, 'node_modules', '.bin'), { recursive: true });
+  symlinkSync('../../server.js', join(dir, 'node_modules', '.bin', 'server'));
+  const { calls, client } = stubClient();
+  await upload({ dir, bucket: 'b-bucket', project: 'shukkatest', app: 'web', sha: SHA, s3: client });
+  const link = tarEntries(gunzipSync(calls[0]!.input.Body as Buffer)).find((e) => e.name === 'node_modules/.bin/server');
+  assert.equal(link?.type, '2');
+}));
+
+test('shu-mf3: special files and setuid or setgid files are refused', withTmp(async (root) => {
+  const fifoDir = bundleDir(join(root, 'fifo'));
+  execFileSync('mkfifo', [join(fifoDir, 'pipe')]);
+  await assert.rejects(upload({ dir: fifoDir, bucket: 'b-bucket', project: 'shukkatest', app: 'web', sha: SHA, s3: stubClient().client }),
+    /refused: pipe is not a regular file, directory or symbolic link/);
+  for (const mode of [0o4755, 0o2755]) {
+    const dir = bundleDir(join(root, `mode-${mode.toString(8)}`));
+    write(join(dir, 'tool'), '#!/bin/sh\n');
+    chmodSync(join(dir, 'tool'), mode);
+    const { calls, client } = stubClient();
+    await assert.rejects(upload({ dir, bucket: 'b-bucket', project: 'shukkatest', app: 'web', sha: SHA, s3: client }),
+      /refused: tool is setuid or setgid/);
+    assert.equal(calls.length, 0);
+  }
+}));
+
+test('shu-mf3: every tarball entry is owned by 0:0 and carries no setuid or setgid bit', withTmp(async (root) => {
+  const dir = bundleDir(root);
+  chmodSync(join(dir, 'server.js'), 0o755);
+  const { calls, client } = stubClient();
+  await upload({ dir, bucket: 'b-bucket', project: 'shukkatest', app: 'web', sha: SHA, s3: client });
+  const entries = tarEntries(gunzipSync(calls[0]!.input.Body as Buffer)).filter((e) => e.type !== 'x' && e.type !== 'g');
+  assert.ok(entries.length >= 4);
+  for (const e of entries) {
+    assert.equal(e.uid, 0, `${e.name} uid`);
+    assert.equal(e.gid, 0, `${e.name} gid`);
+    assert.equal(e.mode & 0o6000, 0, `${e.name} mode`);
+  }
+  assert.equal(entries.find((e) => e.name === 'server.js')!.mode & 0o777, 0o755);
 }));

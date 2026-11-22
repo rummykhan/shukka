@@ -3,7 +3,9 @@
 // box/shukka-release.sh downloads it from.
 //
 // A bundle holding any .env* file (at any depth) is refused: local settings must never reach the
-// server. The tarball carries no macOS extended attributes, ACLs or AppleDouble (._*) files.
+// server. The server unpacks it as root, so only regular files, directories and symbolic links
+// that stay inside the bundle are accepted, and nothing setuid or setgid. Every entry in the
+// tarball is owned by 0:0, and it carries no macOS extended attributes, ACLs or AppleDouble (._*) files.
 // The configure hook is not part of this: release.mjs takes it from the git checkout.
 //
 // CLI:
@@ -14,9 +16,9 @@
 //   exit 0: uploaded; exit 1: refused or failed (one line per problem on stderr); exit 2: usage error
 
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync } from 'node:fs';
+import { lstatSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, relative } from 'node:path';
+import { isAbsolute, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { loadConfig } from './config.mjs';
@@ -74,14 +76,75 @@ export function findEnvFiles(dir) {
 }
 
 /**
- * Write a gzipped tarball of dir's contents without extended attributes, ACLs or AppleDouble files.
+ * Whether a relative link target, followed from the link's directory `depth` levels below the
+ * bundle root, ever climbs above the root.
+ * @param {string} target
+ * @param {number} depth
+ * @returns {boolean}
+ */
+function climbsOut(target, depth) {
+  let level = depth;
+  for (const part of target.split('/')) {
+    if (part === '..') level--;
+    else if (part !== '' && part !== '.') level++;
+    if (level < 0) return true;
+  }
+  return false;
+}
+
+/**
+ * Everything in the bundle the server must not unpack as root: .env* entries, symbolic links that
+ * are absolute or lead outside the bundle (or nowhere), anything that is not a regular file,
+ * directory or such a link, and setuid or setgid files. One line per problem, paths relative to dir.
+ * @param {string} dir
+ * @returns {string[]}
+ */
+export function checkBundle(dir) {
+  const root = realpathSync(dir);
+  /** @type {string[]} */
+  const problems = [];
+  for (const rel of findEnvFiles(dir)) problems.push(`refused: ${rel} is a .env file; local settings must never reach the server`);
+  const entries = readdirSync(dir, { recursive: true, withFileTypes: true });
+  for (const entry of entries) {
+    const path = join(entry.parentPath, entry.name);
+    const rel = relative(dir, path);
+    const stat = lstatSync(path);
+    if (stat.isSymbolicLink()) {
+      const target = readlinkSync(path);
+      const depth = rel.split(sep).length - 1;
+      let real;
+      try {
+        real = realpathSync(path);
+      } catch {
+        real = '';
+      }
+      if (isAbsolute(target)) {
+        problems.push(`refused: ${rel} is a symbolic link to an absolute path`);
+      } else if (climbsOut(target, depth) || real === '' || (real !== root && !real.startsWith(root + sep))) {
+        problems.push(`refused: ${rel} is a symbolic link that leads outside the bundle`);
+      }
+    } else if (!stat.isFile() && !stat.isDirectory()) {
+      problems.push(`refused: ${rel} is not a regular file, directory or symbolic link`);
+    } else if (stat.isFile() && (stat.mode & 0o6000) !== 0) {
+      problems.push(`refused: ${rel} is setuid or setgid`);
+    }
+  }
+  return problems;
+}
+
+/**
+ * Write a gzipped tarball of dir's contents, every entry owned by 0:0, without extended attributes,
+ * ACLs or AppleDouble files.
  * @param {string} dir
  * @param {string} outFile
  */
 export function makeTarball(dir, outFile) {
   const version = spawnSync('tar', ['--version'], { encoding: 'utf8' });
   const bsd = /bsdtar/.test(version.stdout ?? '');
-  const flags = ['--no-xattrs', '--no-acls', ...(bsd ? ['--no-mac-metadata', '--no-fflags'] : [])];
+  const flags = ['--no-xattrs', '--no-acls'];
+  if (bsd) flags.push('--no-mac-metadata', '--no-fflags', '--uid', '0', '--gid', '0', '--uname', 'root', '--gname', 'root');
+  // GNU tar: setuid and setgid files are refused by checkBundle; --mode clears the bits anyway.
+  else flags.push('--owner=0', '--group=0', '--numeric-owner', '--mode=u-s,g-s');
   const result = spawnSync('tar', ['-czf', outFile, ...flags, '-C', dir, '.'], {
     encoding: 'utf8',
     // Stops macOS tar from adding AppleDouble (._*) entries for extended attributes.
@@ -109,10 +172,8 @@ export async function upload(options) {
   }
   if (!isDir) throw new Error(`dir: ${dir} is not a directory`);
 
-  const envFiles = findEnvFiles(dir);
-  if (envFiles.length > 0) {
-    throw new Error(envFiles.map((f) => `refused: ${f} is a .env file; local settings must never reach the server`).join('\n'));
-  }
+  const refused = checkBundle(dir);
+  if (refused.length > 0) throw new Error(refused.join('\n'));
 
   const work = mkdtempSync(join(tmpdir(), 'shukka-bundle-'));
   try {
