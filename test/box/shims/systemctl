@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# Fake systemctl for the release-script tests: there is no systemd in the container.
+# Understands daemon-reload, start, stop, restart and is-active for units written to
+# /etc/systemd/system/<unit>.service, reading only ExecStart, WorkingDirectory and User.
+# Each unit runs in its own session so stop can kill the whole process group.
+set -uo pipefail
+units_dir=/etc/systemd/system
+run_dir=/run/fake-systemd
+log_dir=/var/log/fake-systemd
+mkdir -p "$run_dir" "$log_dir"
+
+unit_name() { local u=$1; echo "${u%.service}"; }
+field() { sed -n "s/^$2=//p" "$units_dir/$1.service" | tail -n 1; }
+
+alive() {
+  local pid
+  pid=$(cat "$run_dir/$1.pid" 2>/dev/null) || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+stop_unit() {
+  local u=$1 pid
+  pid=$(cat "$run_dir/$u.pid" 2>/dev/null) || return 0
+  kill -TERM -- "-$pid" 2>/dev/null
+  for _ in $(seq 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+  kill -KILL -- "-$pid" 2>/dev/null
+  rm -f "$run_dir/$u.pid"
+}
+
+start_unit() {
+  local u=$1 exec_start wd user
+  [ -f "$units_dir/$u.service" ] || { echo "Unit $u.service not found." >&2; return 5; }
+  alive "$u" && return 0
+  exec_start=$(field "$u" ExecStart)
+  wd=$(field "$u" WorkingDirectory)
+  user=$(field "$u" User)
+  (
+    cd "${wd:-/}" || exit 1
+    if [ -n "$user" ]; then
+      exec setsid runuser -u "$user" -- bash -c "exec $exec_start"
+    else
+      exec setsid bash -c "exec $exec_start"
+    fi
+  ) >>"$log_dir/$u.log" 2>&1 </dev/null &
+  echo $! >"$run_dir/$u.pid"
+  sleep 0.2
+}
+
+cmd=${1:-}; shift || true
+quiet=0
+args=()
+for a in "$@"; do
+  case $a in
+    --quiet|-q) quiet=1 ;;
+    -*) ;;
+    *) args+=("$(unit_name "$a")") ;;
+  esac
+done
+
+case $cmd in
+  daemon-reload) exit 0 ;;
+  start) rc=0; for u in "${args[@]}"; do start_unit "$u" || rc=$?; done; exit $rc ;;
+  stop) for u in "${args[@]}"; do stop_unit "$u"; done; exit 0 ;;
+  restart) rc=0; for u in "${args[@]}"; do stop_unit "$u"; start_unit "$u" || rc=$?; done; exit $rc ;;
+  is-active)
+    rc=0
+    for u in "${args[@]}"; do
+      if alive "$u"; then state=active; else state=inactive; rc=3; fi
+      [ "$quiet" = 1 ] || echo "$state"
+    done
+    exit $rc ;;
+  *) echo "fake systemctl: unsupported command '$cmd'" >&2; exit 1 ;;
+esac
