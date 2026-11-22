@@ -3,3 +3,5 @@ export { ShukkaAccess, type ShukkaAccessProps } from './access.js';
 export * from './boundary.js';
 export * from './account-stack.js';
 export * from './synthesizer.js';
+export * from './bootstrap.js';
+export * from './unbounded-roles.js';

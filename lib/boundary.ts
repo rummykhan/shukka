@@ -79,13 +79,37 @@ const DOMAIN_RE = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-
 const HOSTED_ZONE_RE = /^Z[A-Z0-9]{1,32}$/;
 const AMI_OWNER_RE = /^(?:amazon|aws-marketplace|\d{12})$/;
 
+/** Project names shukka refuses outright: they name shukka's own stacks, CDK's, or AWS's. */
+export const RESERVED_PROJECT_NAMES: readonly string[] = ['shukka', 'cdk', 'cdktoolkit', 'aws'];
+
+/** Stack names shukka itself owns in an account (Shukka-Boundary-<project>, CDKToolkit-<qualifier>), as prefixes. */
+const SHUKKA_OWNED_STACKS = ['Shukka-Account', 'Shukka-Boundary-', 'CDKToolkit'];
+
+/**
+ * Throws on a project name the fence cannot hold: not matching `^[a-z][a-z0-9-]{1,20}$`, reserved, or one whose
+ * fence (`<project>*`, `<Project>*`, compared without case) would reach a stack shukka owns (Shukka-Account, a
+ * boundary stack, a bootstrap stack). Prefix clashes with other projects are refused by the CLI against the
+ * account's project list.
+ */
+export function validateProjectName(project: string): void {
+  if (!PROJECT_RE.test(project)) {
+    throw new Error(`shukka: project name ${JSON.stringify(project)} must match ${PROJECT_RE}`);
+  }
+  for (const r of RESERVED_PROJECT_NAMES) {
+    if (project === r || project.startsWith(`${r}-`)) throw new Error(`shukka: project name ${JSON.stringify(project)} is reserved (${r})`);
+  }
+  for (const owned of SHUKKA_OWNED_STACKS) {
+    if (owned.toLowerCase().startsWith(project)) {
+      throw new Error(`shukka: project name ${JSON.stringify(project)} would reach shukka's own stack ${owned}${owned.endsWith('-') ? '*' : ''}`);
+    }
+  }
+}
+
 /** Throws when an input would widen or break the fence (a wildcard, a name that is not a plain prefix). */
 export function validateFenceInputs(
   inputs: Pick<FenceInputs, 'project' | 'qualifier' | 'sesDomains' | 'amiOwners' | 'hostedZoneId'> & { account?: string },
 ): void {
-  if (!PROJECT_RE.test(inputs.project)) {
-    throw new Error(`shukka: project name ${JSON.stringify(inputs.project)} must match ${PROJECT_RE}`);
-  }
+  validateProjectName(inputs.project);
   if (!QUALIFIER_RE.test(inputs.qualifier)) {
     throw new Error(`shukka: qualifier ${JSON.stringify(inputs.qualifier)} must match ${QUALIFIER_RE}`);
   }
@@ -272,6 +296,9 @@ export function fenceDocuments(inputs: FenceInputs): FenceDocuments {
   const all: PolicyStatementJson[] = [
     ...resourceStatements,
     { Sid: 'BootstrapVersion', Effect: 'Allow', Action: ['ssm:GetParameter', 'ssm:GetParameters'], Resource: `arn:aws:ssm:${region}:${account}:parameter/cdk-bootstrap/${qualifier}/version` },
+    // Lambda code (the project's and CDK's custom-resource handlers) is read from the project's bootstrap asset bucket
+    // when CloudFormation creates the function. Execution role only; bounded roles do not need it.
+    { Sid: 'AssetBucketRead', Effect: 'Allow', Action: ['s3:GetObject', 's3:GetObjectVersion'], Resource: `arn:aws:s3:::cdk-${qualifier}-assets-${account}-${region}/*` },
   ];
 
   // The boundary grants no IAM or EC2 management, so a bounded role cannot make a role without the boundary or
