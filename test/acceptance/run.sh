@@ -13,6 +13,7 @@
 #   SHUKKATEST_TRENDIGLE_BUCKET, SHUKKATEST_GITHUB_REPO_SUBJECT, SHUKKATEST_INFRA_MODE_INPUT, JOB_RE_* (job names).
 # Needs: gh (signed in as the owner), aws, jq, git, node 22, npm, curl, perl.
 # Exit 0 only if every case passed and teardown left nothing behind.
+# shellcheck source-path=SCRIPTDIR
 set -uo pipefail
 
 ACCEPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -35,10 +36,12 @@ ALL_PHASES="A B C D E F G H I J K"
 header() { sed -n "s/^# $2: *//p" "$1" | head -n 1; }
 
 list_cases() {
-  local f
+  local f n=0
   for f in "$ACCEPT_DIR"/cases/*.sh; do
     printf '%s %-46s %-28s %s\n' "$SUITE_TASK" "$(header "$f" case)" "[$(header "$f" covers)]" "$(header "$f" title)"
+    n=$((n + 1))
   done
+  printf '%s: %d acceptance cases (not run: --list only names them)\n' "$SUITE_TASK" "$n" >&2
 }
 
 usage() { sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; }
