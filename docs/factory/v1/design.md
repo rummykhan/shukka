@@ -120,7 +120,9 @@ jobs:
 export interface ShukkaAccessProps {
   project: string;                 // matches shukka.json
   githubRepo: string;              // subject repo segment, e.g. 'trendigle@220634492/trendigle@1462395046' or 'org/repo'
-  shukkaVersions?: string;         // default 'v1*' → job_workflow_ref must match rummykhan/shukka/.github/workflows/<file>@refs/tags/v1*
+  shukkaVersions?: string;         // release line, default 'v1' → job_workflow_ref must match .../<file>@refs/tags/v1 or .../<file>@refs/tags/v1.*
+  qualifier?: string;              // bootstrap qualifier, default project when valid
+  allowBranch?: string;            // rc testing only: also trust .../<file>@refs/heads/<branch> (literal)
   oidcProviderArn?: string;        // import instead of create when the account already has one
   deployBucket: s3.IBucket;
   instanceTag?: { key: string; value: string }; // default { Project: project }
@@ -134,7 +136,8 @@ export class ShukkaAccess extends Construct {
 Trust, for each role, all conditions together:
 - `aud = sts.amazonaws.com`;
 - `sub` StringEquals `repo:<githubRepo>:ref:refs/heads/main` (infra, app) or `repo:<githubRepo>:pull_request` (diff); the default subject is used, no customisation (spike S1);
-- `job_workflow_ref` StringLike `rummykhan/shukka/.github/workflows/infra.yml@refs/tags/<shukkaVersions>` (infra, diff) or `.../ec2.yml@...` (app).
+- `job_workflow_ref` StringLike either of `rummykhan/shukka/.github/workflows/infra.yml@refs/tags/<line>` and `...@refs/tags/<line>.*` (infra, diff), or the same for `ec2.yml` (app). shukka must never be renamed or moved: this claim carries names, not ids.
+- Diff role stack resources: `stack/<project>-*/*` and `stack/<Project>-*/*` (a hyphen after the name, so a project named with this one as a prefix is not reachable).
 
 Permissions:
 - **infra**: `sts:AssumeRole` on the project-qualifier bootstrap roles `cdk-<qualifier>-{deploy,file-publishing}-role-*` only. Not the lookup role: the stock one has account-wide ReadOnlyAccess, and `cdk.context.json` is committed so deploys need no live lookup (security review of shu-7nw, 2026-11-22). The bootstrap itself is shukka's own template, whose deploy role can change only the project's stacks with the project's own execution role (shu-9bj.2).
