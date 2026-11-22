@@ -29,7 +29,7 @@
         "account": { "type": "string", "pattern": "^[0-9]{12}$" },
         "region": { "type": "string", "pattern": "^[a-z]{2}(-[a-z]+)+-[0-9]+$" },
         "deployBucket": {
-          "description": "S3 bucket app bundles are uploaded to. Default <project>-deploy-<account>.",
+          "description": "S3 bucket app bundles are uploaded to. Must start with the project name (the fence allows only <project>* buckets). Default <project>-deploy-<account>.",
           "type": "string",
           "pattern": "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
         }

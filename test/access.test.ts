@@ -1,5 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { App, Stack } from 'aws-cdk-lib';
 import { Template } from 'aws-cdk-lib/assertions';
 import * as s3 from 'aws-cdk-lib/aws-s3';
@@ -105,7 +110,8 @@ for (const [kind, r] of Object.entries(ROLES)) {
   test(`shu-7nw: ${kind} role trust requires sub StringEquals ${r.sub.replace(REPO, '<repo>')}`, () => {
     const st = trust(synth().template, r.name);
     assert.equal(((st.Condition as Json).StringEquals as Json)[SUB], r.sub);
-    assert.equal(Object.keys(st.Condition as Json).length, 2, 'only StringEquals and StringLike');
+    // shu-9bj.9: StringNotLike refuses pre-release tags unless allowPrerelease is set.
+    assert.deepEqual(Object.keys(st.Condition as Json).sort(), ['StringEquals', 'StringLike', 'StringNotLike'], 'only StringEquals, StringLike and StringNotLike');
     assert.deepEqual(Object.keys((st.Condition as Json).StringEquals as Json).sort(), [AUD, SUB].sort());
   });
 
@@ -131,17 +137,53 @@ function like(pattern: string, value: string): boolean {
   return new RegExp(`^${re}$`).test(value);
 }
 const likeAny = (patterns: unknown, value: string) => ([patterns].flat() as string[]).some((p) => like(p, value));
+// Whether a trust statement's job_workflow_ref conditions let this ref through (StringLike and not StringNotLike).
+const trustsRef = (st: Statement, ref: string) => {
+  const cond = st.Condition as Record<string, Json | undefined>;
+  return likeAny(cond.StringLike?.[WF], ref) && !(cond.StringNotLike && likeAny(cond.StringNotLike[WF], ref));
+};
 
 test('shu-7nw: the default version patterns match v1 and its releases, not v10 or v1foo', () => {
   const { template } = synth();
   for (const r of Object.values(ROLES)) {
-    const pats = ((trust(template, r.name).Condition as Json).StringLike as Json)[WF];
+    const st = trust(template, r.name);
     const ref = (tag: string) => `rummykhan/shukka/.github/workflows/${r.file}@refs/tags/${tag}`;
-    for (const ok of ['v1', 'v1.0.0', 'v1.4.2', 'v1.0.0-rc.3']) assert.ok(likeAny(pats, ref(ok)), `${r.name} trusts ${ok}`);
-    for (const no of ['v10', 'v10.0.0', 'v1foo', 'v1-rc', 'v2', 'v2.0.0', 'v']) assert.ok(!likeAny(pats, ref(no)), `${r.name} refuses ${no}`);
+    for (const ok of ['v1', 'v1.0.0', 'v1.4.2']) assert.ok(trustsRef(st, ref(ok)), `${r.name} trusts ${ok}`);
+    // shu-9bj.9: v1.0.0-rc.3 is refused by default (pre-release).
+    for (const no of ['v10', 'v10.0.0', 'v1foo', 'v1-rc', 'v1.0.0-rc.3', 'v2', 'v2.0.0', 'v']) assert.ok(!trustsRef(st, ref(no)), `${r.name} refuses ${no}`);
     const other = r.file === 'infra.yml' ? 'ec2.yml' : 'infra.yml';
-    assert.ok(!likeAny(pats, `rummykhan/shukka/.github/workflows/${other}@refs/tags/v1`), `${r.name} refuses ${other}`);
-    assert.ok(!likeAny(pats, `rummykhan/shukka/.github/workflows/${r.file}@refs/heads/main`), `${r.name} refuses branches`);
+    assert.ok(!trustsRef(st, `rummykhan/shukka/.github/workflows/${other}@refs/tags/v1`), `${r.name} refuses ${other}`);
+    assert.ok(!trustsRef(st, `rummykhan/shukka/.github/workflows/${r.file}@refs/heads/main`), `${r.name} refuses branches`);
+  }
+});
+
+test('shu-9bj.9: trust refuses pre-release tags by StringNotLike <workflow>@refs/tags/*-* unless allowPrerelease is set', () => {
+  const ref = (file: string, tag: string) => `rummykhan/shukka/.github/workflows/${file}@refs/tags/${tag}`;
+  const def = synth().template;
+  for (const r of Object.values(ROLES)) {
+    const st = trust(def, r.name);
+    assert.deepEqual((st.Condition as Json).StringNotLike, { [WF]: `rummykhan/shukka/.github/workflows/${r.file}@refs/tags/*-*` });
+    for (const tag of ['v1.0.0-rc.1', 'v1.2.0-beta', 'v1-rc']) assert.ok(!trustsRef(st, ref(r.file, tag)), `${r.name} refuses ${tag} by default`);
+    for (const tag of ['v1', 'v1.0.0', 'v1.2.3']) assert.ok(trustsRef(st, ref(r.file, tag)), `${r.name} trusts ${tag}`);
+  }
+  for (const props of [{ allowPrerelease: false }, {}]) {
+    for (const r of Object.values(ROLES)) assert.ok((trust(synth(props).template, r.name).Condition as Json).StringNotLike, 'refused unless opted in');
+  }
+  const rc = synth({ allowPrerelease: true, allowBranch: 'rc-test' }).template;
+  for (const r of Object.values(ROLES)) {
+    const st = trust(rc, r.name);
+    assert.equal((st.Condition as Json).StringNotLike, undefined, `${r.name}: no StringNotLike with allowPrerelease`);
+    assert.ok(trustsRef(st, ref(r.file, 'v1.0.0-rc.1')), `${r.name} trusts v1.0.0-rc.1 with allowPrerelease`);
+    assert.ok(trustsRef(st, ref(r.file, 'v1.0.0')));
+    assert.ok(!trustsRef(st, ref(r.file, 'v10.0.0-rc.1')), `${r.name} still refuses another release line`);
+    assert.ok(trustsRef(st, `rummykhan/shukka/.github/workflows/${r.file}@refs/heads/rc-test`), `${r.name} trusts the allowed branch`);
+  }
+  // With allowBranch only, the branch ref passes the pre-release refusal (it is not a tag).
+  const branch = synth({ allowBranch: 'rc-test' }).template;
+  for (const r of Object.values(ROLES)) {
+    const st = trust(branch, r.name);
+    assert.ok(trustsRef(st, `rummykhan/shukka/.github/workflows/${r.file}@refs/heads/rc-test`));
+    assert.ok(!trustsRef(st, ref(r.file, 'v1.0.0-rc.1')));
   }
 });
 
@@ -283,19 +325,47 @@ test('shu-7nw: app role has exactly the permissions in the design', () => {
     },
     { Effect: 'Allow', Action: ['ec2:DescribeInstances', 'ssm:GetCommandInvocation'], Resource: '*' },
     { Effect: 'Allow', Action: 'ssm:DescribeInstanceInformation', Resource: '*' },
-    { Effect: 'Allow', Action: 'ssm:GetParameter', Resource: `arn:aws:ssm:${REGION}:${ACCOUNT}:parameter/demo/prod/*` },
   ]));
 });
 
-test('shu-7nw: app role follows instanceTag and ssmPath', () => {
-  const { template } = synth({ instanceTag: { key: 'Stack', value: 'demo-box' }, ssmPath: '/demo/live' });
+test('shu-7nw: app role follows instanceTag', () => {
+  const { template } = synth({ instanceTag: { key: 'Stack', value: 'demo-box' } });
   const json = JSON.stringify(flat(permissions(template, 'demo-shukka-app')));
   assert.ok(json.includes('"ssm:resourceTag/Stack":"demo-box"'));
-  assert.ok(json.includes(`parameter/demo/live/*`));
-  assert.ok(!json.includes('parameter/demo/prod'));
-  assert.throws(() => synth({ ssmPath: 'demo/prod' }), /ssmPath/);
-  assert.throws(() => synth({ ssmPath: '/' }), /ssmPath/);
-  assert.throws(() => synth({ ssmPath: '/demo/*' }), /ssmPath/);
+});
+
+test('shu-9bj.9: the app role has no ssm:GetParameter (nothing it runs reads the project parameters)', () => {
+  const { template } = synth();
+  const statements = normalise(permissions(template, 'demo-shukka-app'));
+  assert.ok(!statements.some((st) => (st.Action as string[]).some((a) => a.startsWith('ssm:GetParameter'))), JSON.stringify(statements));
+  assert.ok(!JSON.stringify(statements).includes(':parameter/'), 'no parameter resource');
+  // The prop that chose the path is gone with the grant.
+  assert.ok(!readFileSync(new URL('../lib/access.ts', import.meta.url), 'utf8').includes('ssmPath'));
+});
+
+test('shu-9bj.9: import { ShukkaAccess } from \'shukka\' and from \'shukka/lib/index.ts\' work under tsx in a consumer', () => {
+  // A consumer's node_modules as a GitHub dependency installs it: a copy of the package (not a link into this
+  // checkout), next to the consumer's own aws-cdk-lib and constructs.
+  const root = fileURLToPath(new URL('..', import.meta.url));
+  const dir = mkdtempSync(join(tmpdir(), 'shukka-consumer-'));
+  try {
+    const mods = join(dir, 'node_modules');
+    mkdirSync(join(mods, 'shukka'), { recursive: true });
+    cpSync(join(root, 'package.json'), join(mods, 'shukka', 'package.json'));
+    cpSync(join(root, 'lib'), join(mods, 'shukka', 'lib'), { recursive: true });
+    for (const dep of ['aws-cdk-lib', 'constructs']) symlinkSync(join(root, 'node_modules', dep), join(mods, dep), 'dir');
+    cpSync(join(root, 'test', 'fixtures', 'consumer', 'app.mjs'), join(dir, 'app.mjs'));
+    const tsx = import.meta.resolve('tsx');
+    const r = spawnSync(process.execPath, ['--import', tsx, 'app.mjs'], { cwd: dir, encoding: 'utf8', timeout: 120_000 });
+    assert.equal(r.status, 0, `consumer failed:\n${r.stderr}`);
+    assert.deepEqual(JSON.parse(r.stdout.trim().split('\n').pop() as string), {
+      roles: ['consumer-shukka-app', 'consumer-shukka-diff', 'consumer-shukka-infra'],
+      boundary: 'function',
+      deepPathSameClass: true,
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('shu-7nw: diff role may only read templates and stacks of the project and the bootstrap version', () => {

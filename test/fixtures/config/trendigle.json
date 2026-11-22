@@ -2,7 +2,7 @@
   "$schema": "https://raw.githubusercontent.com/rummykhan/shukka/v1/schema/shukka.schema.json",
   "project": "trendigle",
   "qualifier": "trendigle",
-  "aws": { "account": "818221194501", "region": "us-east-1" },
+  "aws": { "account": "123456789012", "region": "us-east-1" },
   "node": "22",
   "checks": [
     { "name": "app",   "dir": "implementation/app",   "run": ["npm ci", "npm run lint", "npm run typecheck", "npm test", "npm run build"], "services": ["dynamodb-local"] },

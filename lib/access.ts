@@ -10,7 +10,8 @@ export interface ShukkaAccessProps {
   readonly githubRepo: string;
   /**
    * shukka release line to trust: a literal tag such as `v1` (default) or `v1.2`. The workflow ref must be that tag or
-   * a release under it (`<tag>` or `<tag>.*`, so `v1.0.0-rc.1` matches and `v10` does not).
+   * a release under it (`<tag>` or `<tag>.*`, so `v1.4.2` matches and `v10` does not). Pre-release tags (any tag with
+   * a hyphen, such as `v1.0.0-rc.1`) are refused unless `allowPrerelease` is set.
    */
   readonly shukkaVersions?: string;
   /** ARN of the account's GitHub OIDC provider (output of the Shukka-Account stack). Default: that provider's ARN in this account. Never created here. */
@@ -18,8 +19,6 @@ export interface ShukkaAccessProps {
   readonly deployBucket: s3.IBucket;
   /** Tag that marks the project's servers. Default `{ key: 'Project', value: project }`. */
   readonly instanceTag?: { key: string; value: string };
-  /** Parameter Store path the app role may read below. Default `/<project>/prod`. */
-  readonly ssmPath?: string;
   /** CDK bootstrap qualifier, as in shukka.json. Default: the project name, when it is a valid qualifier. */
   readonly qualifier?: string;
   /**
@@ -27,6 +26,11 @@ export interface ShukkaAccessProps {
    * Off by default; never set it in a production project.
    */
   readonly allowBranch?: string;
+  /**
+   * Release-candidate testing only: also trust shukka's pre-release tags (`<tag>.*` with a hyphen, such as
+   * `v1.0.0-rc.1`). Off by default, so a production project runs only final releases; never set it there.
+   */
+  readonly allowPrerelease?: boolean;
 }
 
 const PROVIDER_HOST = 'token.actions.githubusercontent.com';
@@ -42,7 +46,6 @@ const GITHUB_REPO_RE = new RegExp(`^(?:${OWNER}/${REPO}|${OWNER}@[0-9]+/${REPO}@
 const VERSIONS_RE = /^v[0-9]+(?:\.[0-9]+)*$/;
 // A branch name, literal (no wildcards).
 const BRANCH_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
-const SSM_PATH_RE = /^(?:\/[A-Za-z0-9._-]+)+$/;
 const PROVIDER_ARN_RE = /^arn:aws[a-z-]*:iam::[0-9]{12}:oidc-provider\/token\.actions\.githubusercontent\.com$/;
 
 function check(ok: boolean, message: string): void {
@@ -64,7 +67,6 @@ export class ShukkaAccess extends Construct {
     const { project, githubRepo } = props;
     const versions = props.shukkaVersions ?? 'v1';
     const qualifier = props.qualifier ?? project;
-    const ssmPath = props.ssmPath ?? `/${project}/prod`;
     const tag = props.instanceTag ?? { key: 'Project', value: project };
 
     check(PROJECT_RE.test(project), `project must match ${PROJECT_RE}, got ${JSON.stringify(project)}`);
@@ -72,7 +74,6 @@ export class ShukkaAccess extends Construct {
       `githubRepo must be owner/repo or owner@id/repo@id, got ${JSON.stringify(githubRepo)}`);
     check(VERSIONS_RE.test(versions), `shukkaVersions must be a literal release line such as v1 or v1.2 (no wildcards), got ${JSON.stringify(versions)}`);
     check(QUALIFIER_RE.test(qualifier), `qualifier must match ${QUALIFIER_RE} (pass one when the project name is not a valid qualifier), got ${JSON.stringify(qualifier)}`);
-    check(SSM_PATH_RE.test(ssmPath), `ssmPath must be an absolute literal parameter path such as /project/prod, got ${JSON.stringify(ssmPath)}`);
     check(/^[A-Za-z0-9._:/=+@-]{1,128}$/.test(tag.key) && /^[A-Za-z0-9._:/=+@ -]{1,256}$/.test(tag.value),
       'instanceTag key and value must be literal tag strings');
     if (props.allowBranch !== undefined) {
@@ -92,12 +93,18 @@ export class ShukkaAccess extends Construct {
     const principal = (subject: 'main' | 'pull_request', file: 'infra.yml' | 'ec2.yml'): iam.IPrincipal => {
       const refs = [`${SHUKKA_WORKFLOWS}/${file}@refs/tags/${versions}`, `${SHUKKA_WORKFLOWS}/${file}@refs/tags/${versions}.*`];
       if (props.allowBranch !== undefined) refs.push(`${SHUKKA_WORKFLOWS}/${file}@refs/heads/${props.allowBranch}`);
+      // Pre-release tags (`v1.0.0-rc.1` matches `v1.*`) are refused unless allowPrerelease is set. The pattern starts
+      // with the literal workflow path: IAM refuses a job_workflow_ref pattern that starts with `*` (spike S1).
+      const prerelease = props.allowPrerelease === true
+        ? {}
+        : { StringNotLike: { [`${PROVIDER_HOST}:job_workflow_ref`]: `${SHUKKA_WORKFLOWS}/${file}@refs/tags/*-*` } };
       return new iam.WebIdentityPrincipal(provider.openIdConnectProviderArn, {
         StringEquals: {
           [`${PROVIDER_HOST}:aud`]: 'sts.amazonaws.com',
           [`${PROVIDER_HOST}:sub`]: subject === 'main' ? `repo:${githubRepo}:ref:refs/heads/main` : `repo:${githubRepo}:pull_request`,
         },
         StringLike: { [`${PROVIDER_HOST}:job_workflow_ref`]: refs },
+        ...prerelease,
       });
     };
 
@@ -140,13 +147,12 @@ export class ShukkaAccess extends Construct {
               conditions: { StringEquals: { [`ssm:resourceTag/${tag.key}`]: tag.value } },
             }),
             // Resource '*': neither action supports a resource type (GetCommandInvocation reads by command id,
-            // DescribeInstances is list-only).
+            // DescribeInstances is list-only). The boundary grants them to this role only (AppRoleReleaseReads).
             new iam.PolicyStatement({ actions: ['ssm:GetCommandInvocation', 'ec2:DescribeInstances'], resources: ['*'] }),
             // Resource '*': DescribeInstanceInformation has no resource type either. release.mjs uses it to wait for the
             // instances' SSM agent to come online before SendCommand (a first deploy right after boot).
             new iam.PolicyStatement({ actions: ['ssm:DescribeInstanceInformation'], resources: ['*'] }),
-            // Read the project's settings.
-            new iam.PolicyStatement({ actions: ['ssm:GetParameter'], resources: [arn('ssm', 'parameter', `${ssmPath.slice(1)}/*`)] }),
+            // No ssm:GetParameter: nothing the app role runs reads the project's settings (the servers read them).
           ],
         }),
       },

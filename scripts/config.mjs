@@ -268,6 +268,11 @@ export function validateConfig(raw, options = {}) {
     const object = /** @type {Record<string, unknown>} */ (raw);
     checkUnique(object.apps, 'apps', 'app', problems);
     checkUnique(object.checks, 'checks', 'check', problems);
+    // The fence's S3 statement covers only buckets named <project>*, and every role (the app role too) carries it.
+    const aws = /** @type {Record<string, unknown> | undefined} */ (typeOf(object.aws) === 'object' ? object.aws : undefined);
+    if (typeof object.project === 'string' && typeof aws?.deployBucket === 'string' && !aws.deployBucket.startsWith(object.project)) {
+      problems.push(`aws.deployBucket: "${aws.deployBucket}" must start with the project name "${object.project}" (the fence allows only the project's buckets)`);
+    }
     if (options.knownProjects && typeof object.project === 'string') {
       problems.push(...checkProjectName(object.project, options.knownProjects));
     }

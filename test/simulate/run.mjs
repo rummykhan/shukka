@@ -7,6 +7,7 @@
 //   AWS_PROFILE=stelking node test/simulate/run.mjs
 //
 // Account-neutral: the simulator evaluates ARNs as strings, so a placeholder account works as well as the real one.
+// Every account, instance, security group, hosted zone and role id here is a dummy (shu-9bj.9).
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { tsImport } from 'tsx/esm/api';
@@ -23,7 +24,7 @@ const d = synthFence({
   account: A,
   region: R,
   qualifier: 'trendigle',
-  hostedZoneId: 'Z0369023VBLJHX9H3LHA',
+  hostedZoneId: 'Z0123456789EXAMPLE',
   sesDomains: ['trendigle.com', 'mail.trendigle.com'],
 });
 const BOUNDARY = `arn:aws:iam::${A}:policy/trendigle-shukka-boundary`;
@@ -36,7 +37,10 @@ const ALLOW_ALL = { Version: '2012-10-17', Statement: [{ Effect: 'Allow', Action
 const T = { 'aws:ResourceTag/Project': 'trendigle' };
 const O = { 'aws:ResourceTag/Project': 'orbitary' };
 const INFRA = { 'aws:PrincipalArn': `arn:aws:iam::${A}:role/trendigle-shukka-infra` };
-const SERVER = { 'aws:PrincipalArn': `arn:aws:iam::${A}:role/Trendigle-prod-Instance-Role1ABCC5F0-5uGLbHErVSKT` };
+const stack = (name) => `arn:aws:cloudformation:${R}:${A}:stack/${name}/0a1b2c3d-1111-2222-3333-444455556666`;
+const DIFF = { 'aws:PrincipalArn': `arn:aws:iam::${A}:role/trendigle-shukka-diff` };
+const APP = { 'aws:PrincipalArn': `arn:aws:iam::${A}:role/trendigle-shukka-app` };
+const SERVER = { 'aws:PrincipalArn': `arn:aws:iam::${A}:role/Trendigle-prod-Instance-Role0EXAMPLE-AbCdEfGhIjKl` };
 
 // [who, expected, action, resource, context]
 const cases = [
@@ -45,26 +49,26 @@ const cases = [
   ['exec', 'allowed', 'dynamodb:DeleteTable', `arn:aws:dynamodb:${R}:${A}:table/trendigle-prod`],
   ['exec', 'allowed', 's3:PutBucketPolicy', `arn:aws:s3:::trendigle-prod-deploy-${A}`],
   ['exec', 'allowed', 's3:PutLifecycleConfiguration', `arn:aws:s3:::trendigle-prod-media-${A}`],
-  ['exec', 'allowed', 'iam:CreateRole', `arn:aws:iam::${A}:role/Trendigle-prod-Instance-Role1ABCC5F0-5uGLbHErVSKT`, { 'iam:PermissionsBoundary': BOUNDARY }],
-  ['exec', 'allowed', 'iam:PutRolePolicy', `arn:aws:iam::${A}:role/Trendigle-prod-Instance-Role1ABCC5F0-5uGLbHErVSKT`, { 'iam:PermissionsBoundary': BOUNDARY }],
+  ['exec', 'allowed', 'iam:CreateRole', `arn:aws:iam::${A}:role/Trendigle-prod-Instance-Role0EXAMPLE-AbCdEfGhIjKl`, { 'iam:PermissionsBoundary': BOUNDARY }],
+  ['exec', 'allowed', 'iam:PutRolePolicy', `arn:aws:iam::${A}:role/Trendigle-prod-Instance-Role0EXAMPLE-AbCdEfGhIjKl`, { 'iam:PermissionsBoundary': BOUNDARY }],
   ['exec', 'allowed', 'iam:PutRolePermissionsBoundary', `arn:aws:iam::${A}:role/trendigle-prod-github-deploy`, { 'iam:PermissionsBoundary': BOUNDARY }],
-  ['exec', 'allowed', 'iam:PassRole', `arn:aws:iam::${A}:role/Trendigle-prod-Instance-Role1ABCC5F0-5uGLbHErVSKT`, { 'iam:PassedToService': 'ec2.amazonaws.com' }],
-  ['exec', 'allowed', 'iam:AddRoleToInstanceProfile', `arn:aws:iam::${A}:instance-profile/Trendigle-prod-Instance-BoxInstanceProfile638444A1-TnKxws6n6v13`],
-  ['exec', 'allowed', 'ec2:ModifyInstanceAttribute', `arn:aws:ec2:${R}:${A}:instance/i-07c0a9b38ff703056`, T],
+  ['exec', 'allowed', 'iam:PassRole', `arn:aws:iam::${A}:role/Trendigle-prod-Instance-Role0EXAMPLE-AbCdEfGhIjKl`, { 'iam:PassedToService': 'ec2.amazonaws.com' }],
+  ['exec', 'allowed', 'iam:AddRoleToInstanceProfile', `arn:aws:iam::${A}:instance-profile/Trendigle-prod-Instance-BoxInstanceProfile0EXAMPLE-MnOpQrStUvWx`],
+  ['exec', 'allowed', 'ec2:ModifyInstanceAttribute', `arn:aws:ec2:${R}:${A}:instance/i-0123456789abcdef0`, T],
   ['exec', 'allowed', 'ec2:RunInstances', `arn:aws:ec2:${R}:${A}:instance/*`, { 'aws:RequestTag/Project': 'trendigle' }],
-  ['exec', 'allowed', 'ec2:AuthorizeSecurityGroupIngress', `arn:aws:ec2:${R}:${A}:security-group/sg-0abbdc99f01a29c9e`, T],
-  ['exec', 'allowed', 'route53:ChangeResourceRecordSets', 'arn:aws:route53:::hostedzone/Z0369023VBLJHX9H3LHA'],
+  ['exec', 'allowed', 'ec2:AuthorizeSecurityGroupIngress', `arn:aws:ec2:${R}:${A}:security-group/sg-0123456789abcdef0`, T],
+  ['exec', 'allowed', 'route53:ChangeResourceRecordSets', 'arn:aws:route53:::hostedzone/Z0123456789EXAMPLE'],
   ['exec', 'allowed', 'lambda:CreateFunction', `arn:aws:lambda:${R}:${A}:function:Trendigle-prod-Notify-Worker`],
   ['exec', 'allowed', 'sqs:CreateQueue', `arn:aws:sqs:${R}:${A}:trendigle-prod-events`],
   ['exec', 'allowed', 'ssm:GetParameter', `arn:aws:ssm:${R}:${A}:parameter/cdk-bootstrap/trendigle/version`],
   ['exec', 'implicitDeny', 'dynamodb:DeleteTable', `arn:aws:dynamodb:${R}:${A}:table/orbitary-prod-entities`],
   ['exec', 'implicitDeny', 's3:DeleteBucket', `arn:aws:s3:::orbitary-prod-media-${A}`],
-  ['exec', 'implicitDeny', 'iam:UpdateAssumeRolePolicy', `arn:aws:iam::${A}:role/Orbitary-prod-Instance-OrbitaryRole3A86A241-ivuB5uMdphsm`],
+  ['exec', 'implicitDeny', 'iam:UpdateAssumeRolePolicy', `arn:aws:iam::${A}:role/Orbitary-prod-Instance-OrbitaryRole0EXAMPLE-YzAbCdEfGhIj`],
   ['exec', 'implicitDeny', 'iam:CreateRole', `arn:aws:iam::${A}:role/trendigle-escape`],
   ['exec', 'implicitDeny', 'iam:CreateRole', `arn:aws:iam::${A}:role/trendigle-escape`, { 'iam:PermissionsBoundary': `arn:aws:iam::${A}:policy/other` }],
-  ['exec', 'explicitDeny', 'iam:DeleteRolePermissionsBoundary', `arn:aws:iam::${A}:role/Trendigle-prod-Instance-Role1ABCC5F0-5uGLbHErVSKT`],
+  ['exec', 'explicitDeny', 'iam:DeleteRolePermissionsBoundary', `arn:aws:iam::${A}:role/Trendigle-prod-Instance-Role0EXAMPLE-AbCdEfGhIjKl`],
   ['exec', 'explicitDeny', 'iam:CreatePolicyVersion', BOUNDARY],
-  ['exec', 'implicitDeny', 'iam:PassRole', `arn:aws:iam::${A}:role/Orbitary-prod-Instance-OrbitaryRole3A86A241-ivuB5uMdphsm`, { 'iam:PassedToService': 'ec2.amazonaws.com' }],
+  ['exec', 'implicitDeny', 'iam:PassRole', `arn:aws:iam::${A}:role/Orbitary-prod-Instance-OrbitaryRole0EXAMPLE-YzAbCdEfGhIj`, { 'iam:PassedToService': 'ec2.amazonaws.com' }],
   ['exec', 'implicitDeny', 'ec2:TerminateInstances', `arn:aws:ec2:${R}:${A}:instance/i-0orbitary`, O],
   ['exec', 'implicitDeny', 'ec2:RunInstances', `arn:aws:ec2:${R}:${A}:instance/*`, { 'aws:RequestTag/Project': 'orbitary' }],
   ['exec', 'implicitDeny', 'route53:ChangeResourceRecordSets', 'arn:aws:route53:::hostedzone/ZOTHERZONE'],
@@ -84,10 +88,10 @@ const cases = [
   ['bounded', 'allowed', 'kms:Decrypt', `arn:aws:kms:${R}:${A}:key/abc`, { 'kms:ViaService': `ssm.${R}.amazonaws.com` }],
   ['bounded', 'allowed', 'ssmmessages:CreateControlChannel', '*'],
   // Changed from the spike: the instance carries the Project tag (instance-scoped agent calls now need it).
-  ['bounded', 'allowed', 'ssm:UpdateInstanceInformation', `arn:aws:ec2:${R}:${A}:instance/i-07c0a9b38ff703056`, T],
+  ['bounded', 'allowed', 'ssm:UpdateInstanceInformation', `arn:aws:ec2:${R}:${A}:instance/i-0123456789abcdef0`, T],
   ['bounded', 'allowed', 'ec2messages:GetMessages', '*'],
   ['bounded', 'allowed', 'ssm:SendCommand', `arn:aws:ssm:${R}::document/AWS-RunShellScript`],
-  ['bounded', 'allowed', 'ssm:SendCommand', `arn:aws:ec2:${R}:${A}:instance/i-07c0a9b38ff703056`, T],
+  ['bounded', 'allowed', 'ssm:SendCommand', `arn:aws:ec2:${R}:${A}:instance/i-0123456789abcdef0`, T],
   // Changed from the spike: the caller is the pipeline's infra role (only it may assume bootstrap roles now).
   ['bounded', 'allowed', 'sts:AssumeRole', `arn:aws:iam::${A}:role/cdk-trendigle-deploy-role-${A}-${R}`, INFRA],
   ['bounded', 'allowed', 'ses:SendRawEmail', `arn:aws:ses:${R}:${A}:identity/mail.trendigle.com`, { 'ses:FromAddress': 'no-reply@mail.trendigle.com' }],
@@ -97,7 +101,7 @@ const cases = [
   ['bounded', 'implicitDeny', 'ssm:GetParameter', `arn:aws:ssm:${R}:${A}:parameter/orbitary/prod/SECRET`],
   ['bounded', 'implicitDeny', 'ssm:SendCommand', `arn:aws:ec2:${R}:${A}:instance/i-0orbitary`, O],
   ['bounded', 'implicitDeny', 'iam:CreateRole', `arn:aws:iam::${A}:role/trendigle-x`],
-  ['bounded', 'implicitDeny', 'iam:PutRolePolicy', `arn:aws:iam::${A}:role/Trendigle-prod-Instance-Role1ABCC5F0-5uGLbHErVSKT`],
+  ['bounded', 'implicitDeny', 'iam:PutRolePolicy', `arn:aws:iam::${A}:role/Trendigle-prod-Instance-Role0EXAMPLE-AbCdEfGhIjKl`],
   ['bounded', 'implicitDeny', 'ec2:RunInstances', `arn:aws:ec2:${R}:${A}:instance/*`],
   ['bounded', 'implicitDeny', 'sts:AssumeRole', `arn:aws:iam::${A}:role/cdk-hnb659fds-deploy-role-${A}-${R}`],
   ['bounded', 'implicitDeny', 'iam:CreateOpenIDConnectProvider', `arn:aws:iam::${A}:oidc-provider/token.actions.githubusercontent.com`],
@@ -142,17 +146,17 @@ const extra = [
   ['exec', 'allowed', 'ec2:CreateVolume', `arn:aws:ec2:${R}::snapshot/snap-0trendigle`, T],
   ['exec', 'allowed', 'ec2:CreateSecurityGroup', `arn:aws:ec2:${R}:${A}:vpc/vpc-0abc`],
   // 7. The Project tag can only be the project's, and cannot be removed.
-  ['exec', 'explicitDeny', 'ec2:CreateTags', `arn:aws:ec2:${R}:${A}:instance/i-07c0a9b38ff703056`, { ...T, 'aws:TagKeys': ['Project'], 'aws:RequestTag/Project': 'orbitary' }],
-  ['exec', 'explicitDeny', 'ec2:DeleteTags', `arn:aws:ec2:${R}:${A}:instance/i-07c0a9b38ff703056`, { ...T, 'aws:TagKeys': ['Project'] }],
-  ['exec', 'allowed', 'ec2:CreateTags', `arn:aws:ec2:${R}:${A}:instance/i-07c0a9b38ff703056`, { ...T, 'aws:TagKeys': ['Project'], 'aws:RequestTag/Project': 'trendigle' }],
-  ['exec', 'allowed', 'ec2:CreateTags', `arn:aws:ec2:${R}:${A}:instance/i-07c0a9b38ff703056`, { ...T, 'aws:TagKeys': ['Name'], 'aws:RequestTag/Name': 'box' }],
+  ['exec', 'explicitDeny', 'ec2:CreateTags', `arn:aws:ec2:${R}:${A}:instance/i-0123456789abcdef0`, { ...T, 'aws:TagKeys': ['Project'], 'aws:RequestTag/Project': 'orbitary' }],
+  ['exec', 'explicitDeny', 'ec2:DeleteTags', `arn:aws:ec2:${R}:${A}:instance/i-0123456789abcdef0`, { ...T, 'aws:TagKeys': ['Project'] }],
+  ['exec', 'allowed', 'ec2:CreateTags', `arn:aws:ec2:${R}:${A}:instance/i-0123456789abcdef0`, { ...T, 'aws:TagKeys': ['Project'], 'aws:RequestTag/Project': 'trendigle' }],
+  ['exec', 'allowed', 'ec2:CreateTags', `arn:aws:ec2:${R}:${A}:instance/i-0123456789abcdef0`, { ...T, 'aws:TagKeys': ['Name'], 'aws:RequestTag/Name': 'box' }],
   // 8. The second and third execution policies cannot be rewritten.
   ['exec', 'explicitDeny', 'iam:CreatePolicyVersion', `arn:aws:iam::${A}:policy/trendigle-shukka-execution-infra`],
   ['exec', 'explicitDeny', 'iam:CreatePolicyVersion', `arn:aws:iam::${A}:policy/trendigle-shukka-execution-iam`],
   // 9. No user data from other projects' instances (DescribeInstanceAttribute), nor from spot requests.
   ['exec', 'explicitDeny', 'ec2:DescribeInstanceAttribute', `arn:aws:ec2:${R}:${A}:instance/i-0orbitary`, O],
   ['exec', 'explicitDeny', 'ec2:DescribeInstanceAttribute', `arn:aws:ec2:${R}:${A}:instance/i-0untagged`],
-  ['exec', 'allowed', 'ec2:DescribeInstanceAttribute', `arn:aws:ec2:${R}:${A}:instance/i-07c0a9b38ff703056`, T],
+  ['exec', 'allowed', 'ec2:DescribeInstanceAttribute', `arn:aws:ec2:${R}:${A}:instance/i-0123456789abcdef0`, T],
   ['exec', 'explicitDeny', 'ec2:DescribeSpotInstanceRequests', '*'],
   ['exec', 'allowed', 'ec2:DescribeInstances', '*'],
   // 10. RunInstances: launch templates only the project's; existing network interfaces only the project's.
@@ -160,11 +164,38 @@ const extra = [
   ['exec', 'allowed', 'ec2:RunInstances', `arn:aws:ec2:${R}:${A}:launch-template/lt-0trendigle`, T],
   ['exec', 'implicitDeny', 'ec2:RunInstances', `arn:aws:ec2:${R}:${A}:network-interface/eni-0orbitary`, O],
   ['exec', 'allowed', 'ec2:RunInstances', `arn:aws:ec2:${R}:${A}:network-interface/*`],
+  // 11. shu-9bj.9: listing the account's instances and reading any command's output only for the app role, never
+  // servers, Lambdas or another project's app role.
+  ['bounded', 'allowed', 'ec2:DescribeInstances', '*', APP],
+  ['bounded', 'allowed', 'ssm:GetCommandInvocation', '*', APP],
+  ['bounded', 'implicitDeny', 'ec2:DescribeInstances', '*', SERVER],
+  ['bounded', 'implicitDeny', 'ssm:GetCommandInvocation', '*', SERVER],
+  ['bounded', 'implicitDeny', 'ec2:DescribeInstances', '*'],
+  ['bounded', 'implicitDeny', 'ssm:GetCommandInvocation', '*', { 'aws:PrincipalArn': `arn:aws:iam::${A}:role/orbitary-shukka-app` }],
+  ['bounded', 'implicitDeny', 'ssm:GetCommandInvocation', '*', INFRA],
+  // 12. shu-9bj.9: the pipeline roles carry the boundary, so each action ShukkaAccess grants them must pass it.
+  // Diff role: its project's templates, stacks and bootstrap version, nobody else's, and no other role.
+  ['bounded', 'allowed', 'cloudformation:GetTemplate', stack('Trendigle-prod'), DIFF],
+  ['bounded', 'allowed', 'cloudformation:DescribeStacks', stack('trendigle-ci'), DIFF],
+  ['bounded', 'allowed', 'ssm:GetParameter', `arn:aws:ssm:${R}:${A}:parameter/cdk-bootstrap/trendigle/version`, DIFF],
+  ['bounded', 'implicitDeny', 'cloudformation:GetTemplate', stack('Orbitary-prod-Data'), DIFF],
+  ['bounded', 'implicitDeny', 'ssm:GetParameter', `arn:aws:ssm:${R}:${A}:parameter/cdk-bootstrap/orbitary/version`, DIFF],
+  ['bounded', 'implicitDeny', 'cloudformation:GetTemplate', stack('Trendigle-prod'), SERVER],
+  ['bounded', 'implicitDeny', 'cloudformation:DescribeStacks', stack('Trendigle-prod'), APP],
+  // Infra role: the project's deploy and file-publishing roles.
+  ['bounded', 'allowed', 'sts:AssumeRole', `arn:aws:iam::${A}:role/cdk-trendigle-deploy-role-${A}-${R}`, INFRA],
+  ['bounded', 'allowed', 'sts:AssumeRole', `arn:aws:iam::${A}:role/cdk-trendigle-file-publishing-role-${A}-${R}`, INFRA],
+  // App role: upload, run on its tagged servers, wait for agents, find instances, read results.
+  ['bounded', 'allowed', 's3:PutObject', `arn:aws:s3:::trendigle-prod-deploy-${A}/trendigle/app/abc.tgz`, APP],
+  ['bounded', 'allowed', 'ssm:SendCommand', `arn:aws:ssm:${R}::document/AWS-RunShellScript`, APP],
+  ['bounded', 'allowed', 'ssm:SendCommand', `arn:aws:ec2:${R}:${A}:instance/i-0123456789abcdef0`, { ...APP, ...T }],
+  ['bounded', 'allowed', 'ssm:DescribeInstanceInformation', '*', APP],
+  // A deploy bucket not named for the project is outside the fence (shukka.json refuses it).
+  ['bounded', 'implicitDeny', 's3:PutObject', `arn:aws:s3:::shared-deploy-${A}/trendigle/app/abc.tgz`, APP],
 ];
 
 // shu-9bj.2: the project's bootstrap (lib/bootstrap.ts). The deploy role changes only the project's stacks, and only
 // with the project's own execution role; the file-publishing role writes only the project's asset bucket.
-const stack = (name) => `arn:aws:cloudformation:${R}:${A}:stack/${name}/0a1b2c3d-1111-2222-3333-444455556666`;
 const OWN_EXEC = `arn:aws:iam::${A}:role/cdk-trendigle-cfn-exec-role-${A}-${R}`;
 const ROLE = (arn) => ({ 'cloudformation:RoleArn': arn });
 const OWN = ROLE(OWN_EXEC);

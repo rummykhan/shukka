@@ -73,9 +73,20 @@ export function infraRoleName(project: string): string {
   return `${project}-shukka-infra`;
 }
 
-/** Name of the pipeline's app role (ShukkaAccess creates it). Only this role may list the SSM agents' status. */
+/**
+ * Name of the pipeline's app role (ShukkaAccess creates it). Only this role may list the SSM agents' status, the
+ * account's instances and command results.
+ */
 export function appRoleName(project: string): string {
   return `${project}-shukka-app`;
+}
+
+/**
+ * Name of the pipeline's pull-request diff role (ShukkaAccess creates it). Only this role may read the project's
+ * stack templates and bootstrap version through the boundary.
+ */
+export function diffRoleName(project: string): string {
+  return `${project}-shukka-diff`;
 }
 
 const PROJECT_RE = /^[a-z][a-z0-9-]{1,20}$/;
@@ -325,13 +336,15 @@ export function fenceDocuments(inputs: FenceInputs): FenceDocuments {
     // instance-scoped calls need the project's tag on the instance; document-scoped calls name the documents.
     // Resource "*": what is left has no resource type (Systems Manager's service authorization reference lists
     // none for DescribeInstanceProperties, GetDeployablePatchSnapshotForInstance, ListAssociations, PutInventory,
-    // GetCommandInvocation, and none at all for GetManifest and PutConfigurePackageResult).
+    // and none at all for GetManifest and PutConfigurePackageResult). ec2:DescribeInstances and
+    // ssm:GetCommandInvocation (every instance's configuration and every command's output in the account) are not
+    // here: only the app role gets them (AppRoleReleaseReads).
     {
       Sid: 'RuntimeAgents', Effect: 'Allow',
       Action: [
         'ssm:DescribeInstanceProperties', 'ssm:GetDeployablePatchSnapshotForInstance', 'ssm:GetManifest', 'ssm:ListAssociations', 'ssm:PutInventory',
-        'ssm:PutConfigurePackageResult', 'ssm:GetCommandInvocation', 'ssmmessages:*', 'ec2messages:*', 'cloudwatch:PutMetricData',
-        'sts:GetCallerIdentity', 'ec2:DescribeInstances', 'ec2:DescribeTags',
+        'ssm:PutConfigurePackageResult', 'ssmmessages:*', 'ec2messages:*', 'cloudwatch:PutMetricData',
+        'sts:GetCallerIdentity', 'ec2:DescribeTags',
       ],
       Resource: '*',
     },
@@ -344,7 +357,9 @@ export function fenceDocuments(inputs: FenceInputs): FenceDocuments {
       Sid: 'AgentDocuments', Effect: 'Allow', Action: ['ssm:GetDocument', 'ssm:DescribeDocumentParameters', 'ssm:UpdateAssociationStatus'],
       Resource: [`arn:aws:ssm:${region}::document/*`, ...arns((n) => `arn:aws:ssm:${region}:${account}:document/${n}`)],
     },
-    // Association ids carry no project name; this is the account's associations in the region.
+    // Association ids carry no project name; this is the account's associations in the region. DescribeAssociation
+    // returns an association's parameters, so every bounded role can read the parameters of every association in the
+    // account: never put a secret in an association's parameters.
     { Sid: 'AgentAssociations', Effect: 'Allow', Action: 'ssm:DescribeAssociation', Resource: `arn:aws:ssm:${region}:${account}:association/*` },
     // Resource "*": the key behind SecureString parameters (often the AWS-managed aws/ssm key); fenced by
     // kms:ViaService to decryption through SSM, whose parameters are themselves fenced above.
@@ -372,6 +387,23 @@ export function fenceDocuments(inputs: FenceInputs): FenceDocuments {
     {
       Sid: 'AppRoleAgentStatus', Effect: 'Allow', Action: 'ssm:DescribeInstanceInformation', Resource: '*',
       Condition: { ArnEquals: { 'aws:PrincipalArn': `arn:aws:iam::${account}:role/${appRoleName(P)}` } },
+    },
+    // Resource "*": neither action has a resource type (DescribeInstances is list-only, GetCommandInvocation reads by
+    // command id). They read every instance and every command's output in the account, so only the pipeline's app
+    // role may (it finds the project's instances and reads the release script's result), never servers or Lambdas.
+    {
+      Sid: 'AppRoleReleaseReads', Effect: 'Allow', Action: ['ec2:DescribeInstances', 'ssm:GetCommandInvocation'], Resource: '*',
+      Condition: { ArnEquals: { 'aws:PrincipalArn': `arn:aws:iam::${account}:role/${appRoleName(P)}` } },
+    },
+    // The pull-request diff role carries the boundary too: it reads the project's stack templates and status and the
+    // bootstrap version, exactly what ShukkaAccess grants it, and only it (servers and Lambdas never read templates).
+    {
+      Sid: 'DiffRoleReads', Effect: 'Allow', Action: ['cloudformation:GetTemplate', 'cloudformation:DescribeStacks', 'ssm:GetParameter'],
+      Resource: [
+        ...[P, Pc].map((n) => `arn:aws:cloudformation:${region}:${account}:stack/${n}-*/*`),
+        `arn:aws:ssm:${region}:${account}:parameter/cdk-bootstrap/${qualifier}/version`,
+      ],
+      Condition: { ArnEquals: { 'aws:PrincipalArn': `arn:aws:iam::${account}:role/${diffRoleName(P)}` } },
     },
   ];
 

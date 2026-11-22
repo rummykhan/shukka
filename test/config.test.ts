@@ -464,3 +464,17 @@ test('shu-9zr: aws.deployBucket defaults to <project>-deploy-<account> and can b
   assert.equal(bad.config, null);
   assert.ok(bad.problems.some((p) => p.startsWith('shukka.json: aws.deployBucket')), bad.problems.join('\n'));
 });
+
+test('shu-9bj.9: aws.deployBucket must start with the project name (the fence covers only <project>* buckets)', () => {
+  const raw = JSON.parse(readFileSync(join(here, 'fixtures', 'config', 'trendigle.json'), 'utf8'));
+  for (const ok of ['trendigle-deploy-123456789012', 'trendigle-prod-deploy', 'trendigledeploy']) {
+    raw.aws.deployBucket = ok;
+    assert.deepEqual(validateConfig(raw).problems, [], ok);
+  }
+  for (const bad of ['orbitary-deploy-123456789012', 'deploy-trendigle', 'shared-artifacts', 'trendigl-deploy']) {
+    raw.aws.deployBucket = bad;
+    const r = validateConfig(raw);
+    assert.equal(r.config, null, bad);
+    assert.ok(r.problems.some((p) => p.startsWith('shukka.json: aws.deployBucket') && p.includes('must start with the project name')), r.problems.join('\n'));
+  }
+});

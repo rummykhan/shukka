@@ -15,6 +15,8 @@ import {
   executionPolicyNames,
   fenceDocuments,
   infraRoleName,
+  appRoleName,
+  diffRoleName,
   applyBoundary,
   shukkaSynthesizer,
   type PolicyDocumentJson,
@@ -102,6 +104,8 @@ const SPIKE_EXCEPTIONS: Record<'executionA' | 'executionB' | 'boundary', { chang
       'AgentAssociations', // DescribeAssociation on the account's associations
       'RunOnOwnServersDocument', // SendCommand's document by ARN (finding 4)
       'AppRoleAgentStatus', // DescribeInstanceInformation for the app role only (shu-9zr)
+      'AppRoleReleaseReads', // DescribeInstances and GetCommandInvocation for the app role only (shu-9bj.9)
+      'DiffRoleReads', // the diff role's template, stack and bootstrap-version reads, for that role only (shu-9bj.9)
     ],
   },
 };
@@ -357,7 +361,7 @@ const STAR_ALLOWED: Record<string, StarReason> = {
     ].map((a) => [`ec2:${a}`, { condition: 'aws:ResourceTag/Project' }]),
   ),
   // Agents on the server. No resource type in the Systems Manager reference: DescribeInstanceProperties,
-  // GetDeployablePatchSnapshotForInstance, ListAssociations, PutInventory, GetCommandInvocation; GetManifest and
+  // GetDeployablePatchSnapshotForInstance, ListAssociations, PutInventory; GetManifest and
   // PutConfigurePackageResult are internal agent calls the reference does not list at all.
   'ssm:DescribeInstanceProperties': 'none',
   'ssm:GetDeployablePatchSnapshotForInstance': 'none',
@@ -365,7 +369,8 @@ const STAR_ALLOWED: Record<string, StarReason> = {
   'ssm:ListAssociations': 'none',
   'ssm:PutInventory': 'none',
   'ssm:PutConfigurePackageResult': 'none',
-  'ssm:GetCommandInvocation': 'none',
+  // No resource type; reads any command's output in the account, so only the app role (shu-9bj.9).
+  'ssm:GetCommandInvocation': { condition: 'aws:PrincipalArn' },
   // No resource type; lists the account's managed instances, so only the app role (aws:PrincipalArn) may.
   'ssm:DescribeInstanceInformation': { condition: 'aws:PrincipalArn' },
   // Session Manager and the agent's message channels have no resource types.
@@ -373,7 +378,8 @@ const STAR_ALLOWED: Record<string, StarReason> = {
   'ec2messages:*': 'none',
   'cloudwatch:PutMetricData': 'none',
   'sts:GetCallerIdentity': 'none',
-  'ec2:DescribeInstances': 'none',
+  // No resource type; lists every instance in the account, so only the app role (shu-9bj.9).
+  'ec2:DescribeInstances': { condition: 'aws:PrincipalArn' },
   'ec2:DescribeTags': 'none',
   // The key behind SecureString parameters; fenced to decryption through SSM.
   'kms:Decrypt': { condition: 'kms:ViaService' },
@@ -512,5 +518,112 @@ test('shu-9zr: only the app role may call ssm:DescribeInstanceInformation throug
     const arn = (st?.Condition as Record<string, Record<string, string>>).ArnEquals?.['aws:PrincipalArn'];
     assert.match(String(arn), /^arn:aws:iam::[0-9]{12}:role\/[a-z][a-z0-9-]*-shukka-app$/);
     assert.ok(!list(fence.boundary.Statement.find((s) => s.Sid === 'RuntimeAgents')?.Action ?? []).includes('ssm:DescribeInstanceInformation'));
+  }
+});
+
+test('shu-9bj.9: ec2:DescribeInstances and ssm:GetCommandInvocation reach only the app role through the boundary', () => {
+  for (const fence of [trendigle, neutral]) {
+    const runtime = fence.boundary.Statement.find((s) => s.Sid === 'RuntimeAgents');
+    assert.ok(runtime, 'RuntimeAgents is still there');
+    for (const action of ['ec2:DescribeInstances', 'ssm:GetCommandInvocation']) {
+      assert.ok(!list(runtime.Action).includes(action), `RuntimeAgents no longer grants ${action}`);
+      // Every allow that can grant it (by name or wildcard) is scoped to the app role by aws:PrincipalArn. The action
+      // has no resource type, so only a statement on Resource "*" can grant it.
+      const grants: PolicyStatementJson[] = fence.boundary.Statement.filter((s: PolicyStatementJson) => s.Effect === 'Allow' && list(s.Resource).includes('*') && list(s.Action).some((a: string) => new RegExp(`^${a.replace(/\*/g, '.*')}$`).test(action)));
+      assert.deepEqual(grants.map((s) => s.Sid), ['AppRoleReleaseReads'], action);
+      const st = grants[0];
+      const arn = (st?.Condition as Record<string, Record<string, string>>).ArnEquals?.['aws:PrincipalArn'];
+      assert.match(String(arn), /^arn:aws:iam::[0-9]{12}:role\/[a-z][a-z0-9-]*-shukka-app$/);
+    }
+    assert.deepEqual(list(fence.boundary.Statement.find((s) => s.Sid === 'AppRoleReleaseReads')?.Action ?? []), ['ec2:DescribeInstances', 'ssm:GetCommandInvocation']);
+  }
+});
+
+test('shu-9bj.9: the boundary notes that association parameters are readable account-wide', () => {
+  const src = readFileSync(new URL('../lib/boundary.ts', import.meta.url), 'utf8');
+  const at = src.indexOf("Sid: 'AgentAssociations'");
+  assert.ok(at > 0);
+  assert.match(src.slice(Math.max(0, at - 600), at), /association's parameters[\s\S]*every association in the[\s/]*account/);
+});
+
+test('shu-9bj.9: the diff role may read its project templates, stacks and bootstrap version through the boundary, nothing else may', () => {
+  for (const [fence, P, Pc, q, region, account] of [
+    [trendigle, 'trendigle', 'Trendigle', 'trendigle', 'us-east-1', spikeAccount],
+    [neutral, 'shukkatest', 'Shukkatest', 'shukkatest', 'eu-west-1', '123456789012'],
+  ] as const) {
+    const st = fence.boundary.Statement.find((s) => s.Sid === 'DiffRoleReads');
+    assert.ok(st);
+    assert.equal(st.Effect, 'Allow');
+    assert.deepEqual(list(st.Action), ['cloudformation:DescribeStacks', 'cloudformation:GetTemplate', 'ssm:GetParameter']);
+    assert.deepEqual(list(st.Resource), [
+      `arn:aws:cloudformation:${region}:${account}:stack/${Pc}-*/*`,
+      `arn:aws:cloudformation:${region}:${account}:stack/${P}-*/*`,
+      `arn:aws:ssm:${region}:${account}:parameter/cdk-bootstrap/${q}/version`,
+    ]);
+    assert.deepEqual(st.Condition, { ArnEquals: { 'aws:PrincipalArn': `arn:aws:iam::${account}:role/${diffRoleName(P)}` } });
+    // No other boundary statement grants a CloudFormation read.
+    const cfn = fence.boundary.Statement.filter((s) => s.Effect === 'Allow' && list(s.Action).some((a) => a.startsWith('cloudformation:')));
+    assert.deepEqual(cfn.map((s) => s.Sid), ['DiffRoleReads']);
+  }
+});
+
+// IAM-style glob: '*' any run, '?' one character.
+const glob = (pattern: string, value: string) =>
+  new RegExp(`^${pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.')}$`).test(value);
+// Resolve CloudFormation joins and pseudo parameters to plain strings.
+function resolveCfn(value: unknown, account: string, region: string): unknown {
+  if (Array.isArray(value)) return value.map((v) => resolveCfn(v, account, region));
+  if (value && typeof value === 'object') {
+    const obj = value as Record<string, unknown>;
+    if ('Fn::Join' in obj) {
+      const [sep, parts] = obj['Fn::Join'] as [string, unknown[]];
+      return parts.map((p) => resolveCfn(p, account, region)).join(sep);
+    }
+    if (obj.Ref === 'AWS::Partition') return 'aws';
+    if (obj.Ref === 'AWS::AccountId') return account;
+    if (obj.Ref === 'AWS::Region') return region;
+    return Object.fromEntries(Object.entries(obj).map(([k, v]) => [k, resolveCfn(v, account, region)]));
+  }
+  return value;
+}
+
+test('shu-9bj.9: every action ShukkaAccess grants its roles is also allowed for that role by the boundary', () => {
+  const account = '123456789012';
+  const region = 'eu-west-1';
+  const app = new App();
+  const stack = new Stack(app, 'Shukkatest-Ci', { env: { account, region } });
+  new ShukkaAccess(stack, 'Access', {
+    project: 'shukkatest',
+    githubRepo: 'owner/repo',
+    oidcProviderArn: `arn:aws:iam::${account}:oidc-provider/token.actions.githubusercontent.com`,
+    deployBucket: s3.Bucket.fromBucketName(stack, 'Bucket', 'shukkatest-deploy-123456789012'),
+  });
+  const roles = Template.fromStack(stack).findResources('AWS::IAM::Role');
+  const boundary = neutral.boundary.Statement;
+  const names = Object.values(roles).map((r) => (r as { Properties: { RoleName: string } }).Properties.RoleName).sort();
+  assert.deepEqual(names, [appRoleName('shukkatest'), diffRoleName('shukkatest'), infraRoleName('shukkatest')]);
+  for (const r of Object.values(roles)) {
+    const props = resolveCfn((r as { Properties: unknown }).Properties, account, region) as {
+      RoleName: string; Policies: { PolicyDocument: { Statement: PolicyStatementJson[] } }[];
+    };
+    const principal = `arn:aws:iam::${account}:role/${props.RoleName}`;
+    for (const granted of props.Policies.flatMap((p) => p.PolicyDocument.Statement)) {
+      for (const action of list(granted.Action)) {
+        for (const resource of list(granted.Resource)) {
+          // A concrete resource the grant covers: wildcards in the grant become a sample name.
+          const sample = resource.replace(/\*/g, 'x');
+          const allowed = boundary.some((b) => {
+            if (b.Effect !== 'Allow') return false;
+            if (!list(b.Action).some((a) => glob(a, action))) return false;
+            if (!list(b.Resource).some((res) => glob(res, sample))) return false;
+            const who = (b.Condition?.ArnEquals as Record<string, string> | undefined)?.['aws:PrincipalArn'];
+            return who === undefined || who === principal;
+          });
+          const denied = boundary.some((b) => b.Effect === 'Deny' && b.Condition === undefined
+            && list(b.Action).some((a) => glob(a, action)) && list(b.Resource).some((res) => glob(res, sample)));
+          assert.ok(allowed && !denied, `${props.RoleName}: ${action} on ${sample} is refused by the boundary`);
+        }
+      }
+    }
   }
 });

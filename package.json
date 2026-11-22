@@ -4,6 +4,16 @@
   "description": "Reusable deployment pipeline for AWS CDK projects on GitHub Actions",
   "license": "MIT",
   "type": "module",
+  "main": "./lib/index.ts",
+  "types": "./lib/index.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.ts",
+      "default": "./lib/index.ts"
+    },
+    "./package.json": "./package.json",
+    "./lib/*": "./lib/*"
+  },
   "bin": {
     "shukka": "bin/shukka"
   },

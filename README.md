@@ -164,13 +164,13 @@ npm install --save-dev --save-exact aws-cdk@2.1148.0
 
 Use an exact tag for the constructs (see [Versioning](#versioning-and-pins)). `aws-cdk` at shukka's pinned version (2.1148.0 in this release) keeps your local `cdk` reading the same cloud assembly as the pipeline's.
 
-shukka's constructs are TypeScript source, so run your CDK app with `tsx` (`cdk.json`: `"app": "npx tsx bin/app.ts"`; it works for a `.mjs` app too). Import them from `shukka/lib/index.ts`. Commit `package-lock.json`: the pipeline runs `npm ci`.
+shukka's constructs are TypeScript source, so run your CDK app with `tsx` (`cdk.json`: `"app": "npx tsx bin/app.ts"`; it works for a `.mjs` app too). Import them from `shukka` (the package entry point; `shukka/lib/index.ts` also works). Commit `package-lock.json`: the pipeline runs `npm ci`.
 
 ```ts
 // infra/bin/app.ts
 import { App, Stack, Tags } from 'aws-cdk-lib';
 import * as s3 from 'aws-cdk-lib/aws-s3';
-import { ShukkaAccess, applyBoundary, shukkaSynthesizer } from 'shukka/lib/index.ts';
+import { ShukkaAccess, applyBoundary, shukkaSynthesizer } from 'shukka';
 
 const app = new App();
 const env = { account: '123456789012', region: 'us-east-1' };
@@ -195,7 +195,7 @@ What each piece is for:
 
 - **`shukkaSynthesizer(qualifier)`** makes every stack deploy through your project's own bootstrap (the fenced execution role) instead of the account's default one.
 - **`applyBoundary(app, project)`** puts your permissions boundary on every IAM role in the app, including the ones CDK makes for custom resources. Without it, the execution role refuses to create the role.
-- **`ShukkaAccess`** creates `acme-shukka-infra`, `acme-shukka-app` and `acme-shukka-diff`. Options: `oidcProviderArn` (default: the account's GitHub provider ARN), `shukkaVersions` (the release line the roles trust, default `v1`; `v1.2` narrows it), `instanceTag` (default `Project=<project>`), `ssmPath` (default `/<project>/prod`), `qualifier` (default the project name), and `allowBranch` (release-candidate testing only; never in production).
+- **`ShukkaAccess`** creates `acme-shukka-infra`, `acme-shukka-app` and `acme-shukka-diff`. Options: `oidcProviderArn` (default: the account's GitHub provider ARN), `shukkaVersions` (the release line the roles trust, default `v1`; `v1.2` narrows it), `instanceTag` (default `Project=<project>`), `qualifier` (default the project name), and `allowPrerelease` and `allowBranch` (release-candidate testing only: trust pre-release tags such as `v1.0.0-rc.1`, which are refused by default, or a branch of shukka; never in production).
 - To get your repository's immutable subject: `gh api repos/acme-org/acme --jq '"\(.owner.login)@\(.owner.id)/\(.name)@\(.id)"'`.
 
 Rules your stacks must follow:

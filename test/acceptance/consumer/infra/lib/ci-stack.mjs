@@ -13,6 +13,9 @@ export class CiStack extends Stack {
       githubRepo: e.githubRepoSubject,
       oidcProviderArn: e.oidcProviderArn,
       deployBucket: s3.Bucket.fromBucketName(this, 'DeployBucket', `shukkatest-deploy-${e.account}`),
+      // The suite calls shukka at a release-candidate tag (v1.0.0-rc.N), which production trust refuses. Its runs
+      // reference shukka's workflows only by that tag, so no allowBranch.
+      allowPrerelease: true,
     });
   }
 }

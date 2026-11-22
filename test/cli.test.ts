@@ -549,10 +549,11 @@ test('shu-5ix: deploy runs the guard on the cdk diff, deploys with the revision 
 }));
 
 test('shu-5ix: deploy reads aws.deployBucket from shukka.json when it is set', withTmp(async (tmp) => {
-  const { dir } = consumer(tmp, (c) => { c.aws.deployBucket = 'custom-bundles'; });
+  // The bucket starts with the project name: shukka.json refuses any other (shu-9bj.9).
+  const { dir } = consumer(tmp, (c) => { c.aws.deployBucket = 'shukkatest-custom-bundles'; });
   const r = await cli(['deploy', '--dry-run'], { cwd: dir });
   // Until the workflows task's schema field lands, the schema refuses the key; after it, the bucket is used.
-  if (r.code === 0) assert.match(r.out, /s3:\/\/custom-bundles\/shukkatest\/web\//);
+  if (r.code === 0) assert.match(r.out, /s3:\/\/shukkatest-custom-bundles\/shukkatest\/web\//);
   else assert.match(r.err, /aws\.deployBucket: unknown key/);
 }));
 
