@@ -18,14 +18,14 @@
 // redeploys a commit that is already live without harm, and an unchanged stack is a no-op for cdk.
 
 import { randomBytes } from 'node:crypto';
-import { copyFileSync, existsSync, lstatSync, mkdtempSync, readFileSync, realpathSync } from 'node:fs';
+import { copyFileSync, cpSync, existsSync, lstatSync, mkdtempSync, readFileSync, realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from '../config.mjs';
 import { guard, report } from '../guard.mjs';
 import { githubRepoFromUrl, policyGuard, report as policyReport } from '../policy-guard.mjs';
 import { release } from '../release.mjs';
-import { upload } from '../upload.mjs';
+import { checkBundle, upload } from '../upload.mjs';
 import {
   CliError, HOST_CODE_WARNING, NPM_SAFE, cdkBin, cdkPlace, containerArgs, dockerAvailable, ensureProjectImage, mustRun, projectEnv, refuseSymlink,
   startServices, tempDir,
@@ -487,7 +487,28 @@ async function build(io, steps, aws, tree, config, app, env) {
   if (io.dryRun) return `<directory printed by ${app.build.bundle}>`;
   const dir = r.stdout.split('\n').map((l) => l.trim()).filter(Boolean).pop();
   if (!dir) throw new CliError(`build ${app.name}: the bundle script did not print a directory`);
-  return checkBundlePath(tree, resolve(cwd, dir), app.name);
+  return snapshotBundle(checkBundlePath(tree, resolve(cwd, dir), app.name), app.name);
+}
+
+/**
+ * A copy of the checked bundle in a shukka temp directory outside the tree, made before any further project step
+ * runs: later steps (the next app's build, npm ci, synth) still have the tree mounted read-write and could swap the
+ * bundle for a link to ~/.aws, so the upload reads only this copy. Links are copied as links, never followed; the
+ * bundle is checked as upload.mjs checks it (no link leaving it, nothing but files, directories and such links)
+ * before the copy, so nothing special is read, and again after, on the copy.
+ * @param {string} bundle
+ * @param {string} app
+ * @returns {string}
+ */
+function snapshotBundle(bundle, app) {
+  const refuse = (/** @type {string[]} */ problems) => {
+    if (problems.length > 0) throw new CliError(`build ${app}: refusing the bundle ${bundle}:\n${problems.join('\n')}`);
+  };
+  refuse(checkBundle(bundle));
+  const copy = join(tempDir('bundle'), 'bundle');
+  cpSync(bundle, copy, { recursive: true, dereference: false, verbatimSymlinks: true, errorOnExist: true });
+  refuse(checkBundle(copy));
+  return copy;
 }
 
 /**

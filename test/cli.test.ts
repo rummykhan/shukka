@@ -1549,3 +1549,57 @@ test('shu-9bj.8: the fence-clash refusal says a stack in another region or a ret
   assert.equal(r.code, 1);
   assert.match(r.err, /stack of orb in another region, or a resource a deleted stack retained, also causes this refusal/);
 }));
+
+test('shu-9bj.8: a later project step that swaps the checked bundle in the tree for a link to ~/.aws uploads nothing from there: the upload reads a host-only copy', withTmp(async (tmp) => {
+  const fakeHome = join(tmp, 'home');
+  write(join(fakeHome, '.aws', 'credentials'), '[default]\naws_secret_access_key = caller-secret\n');
+  const { dir } = consumer(tmp);
+  let inTree = '';
+  const s = recordingSpawn(({ cmd, args, options }) => {
+    if (cmd === 'bash' && args[0]?.endsWith('bundle.sh')) {
+      const r = bundleInTree(bundleDir(tmp), options.cwd);
+      inTree = join(options.cwd, '.next', 'shukka-bundle');
+      return r;
+    }
+    if (cmd === 'npx' && args.includes('synth')) {
+      // synth runs after the bundle was checked, with the tree mounted read-write: it swaps the bundle for a link.
+      rmSync(inTree, { recursive: true, force: true });
+      symlinkSync(fakeHome, inTree);
+      const out = args[args.indexOf('--output') + 1]!;
+      write(join(out, 'manifest.json'), JSON.stringify({ artifacts: { 'shukkatest-App': { type: 'aws:cloudformation:stack', properties: { tags: { Project: 'shukkatest' } } } } }));
+      return { status: 0, stdout: '' };
+    }
+    if (cmd === process.execPath && args[1] === 'diff') return { status: 0, stdout: CLEAN_DIFF };
+    return { status: 0, stdout: '' };
+  });
+  const c = releaseClients();
+  const r = await cli(['deploy', '--skip-checks'], { cwd: dir, spawn: s.spawn, aws: awsWith(c).aws, checkAssembly: NO_ASSETS });
+  assert.equal(r.code, 0, r.out + r.err);
+  assert.ok(inTree !== '', 'the bundle script ran');
+  const put = c.s3.calls.find((x) => String(x.input.Key).endsWith('.tgz'))!;
+  const tgz = join(tmp, 'uploaded.tgz');
+  writeFileSync(tgz, put.input.Body);
+  const listing = execFileSync('tar', ['-tzf', tgz], { encoding: 'utf8' });
+  const content = execFileSync('tar', ['-xzOf', tgz], { encoding: 'utf8' });
+  assert.match(listing, /server\.js/, 'the bundle that was checked is the one uploaded');
+  assert.ok(!/credentials|\.aws/.test(listing) && !content.includes('caller-secret'), `nothing from the fake home: ${listing}`);
+}));
+
+test('shu-9bj.8: a bundle holding a link that leaves it is refused before it is copied', withTmp(async (tmp) => {
+  const fakeHome = join(tmp, 'home');
+  write(join(fakeHome, '.aws', 'credentials'), 'secret\n');
+  const { dir } = consumer(tmp);
+  const s = recordingSpawn(({ cmd, args, options }) => {
+    if (cmd === 'bash' && args[0]?.endsWith('bundle.sh')) {
+      const r = bundleInTree(bundleDir(tmp), options.cwd);
+      symlinkSync(join(fakeHome, '.aws'), join(options.cwd, '.next', 'shukka-bundle', 'aws'));
+      return r;
+    }
+    return { status: 0, stdout: '' };
+  });
+  const c = releaseClients();
+  const r = await cli(['deploy', '--skip-checks'], { cwd: dir, spawn: s.spawn, aws: awsWith(c).aws, checkAssembly: NO_ASSETS });
+  assert.equal(r.code, 1);
+  assert.match(r.err, /refusing the bundle .*:\nshukka: refused: aws is a symbolic link to an absolute path/);
+  assert.equal(c.s3.calls.length, 0);
+}));
