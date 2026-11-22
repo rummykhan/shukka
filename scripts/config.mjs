@@ -3,6 +3,7 @@
 // The rules live in schema/shukka.schema.json; this file interprets the subset of
 // JSON Schema that schema uses, adds the rules a schema cannot say (unique app and
 // check names, project-name prefixes), fills defaults and derives role names.
+// Every problem line is prefixed and escaped (formatProblem): values reach CI logs.
 //
 // CLI: node scripts/config.mjs <path> [--json] [--known name1,name2]
 //   exit 0: valid (with --json, prints the normalised config)
@@ -36,6 +37,24 @@ import { fileURLToPath } from 'node:url';
  */
 
 const DEFAULT_NODE = '22';
+
+/** Every problem line starts with this, so none begins with text from the file. */
+export const PROBLEM_PREFIX = 'shukka.json: ';
+
+/**
+ * Make a problem safe to print in a CI log: one line, prefixed, control characters
+ * escaped and `::` broken up, so text from the file can never form a workflow command.
+ * @param {string} problem
+ * @returns {string}
+ */
+export function formatProblem(problem) {
+  const oneLine = problem.replace(
+    // eslint-disable-next-line no-control-regex -- finding control characters is the point
+    /[\u0000-\u001f\u007f\u2028\u2029]/gu,
+    (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`,
+  );
+  return `${PROBLEM_PREFIX}${oneLine.replace(/:(?=:)/g, ': ')}`;
+}
 
 /** @type {Schema} */
 export const schema = JSON.parse(
@@ -243,7 +262,7 @@ export function validateConfig(raw, options = {}) {
       problems.push(...checkProjectName(object.project, options.knownProjects));
     }
   }
-  if (problems.length > 0) return { config: null, problems };
+  if (problems.length > 0) return { config: null, problems: problems.map(formatProblem) };
   return { config: normalise(/** @type {Record<string, any>} */ (raw)), problems };
 }
 
@@ -258,13 +277,13 @@ export function loadConfig(path, options = {}) {
   try {
     text = readFileSync(path, 'utf8');
   } catch (error) {
-    return { config: null, problems: [`cannot read ${path}: ${/** @type {Error} */ (error).message}`] };
+    return { config: null, problems: [formatProblem(`cannot read ${path}: ${/** @type {Error} */ (error).message}`)] };
   }
   let raw;
   try {
     raw = JSON.parse(text);
   } catch (error) {
-    return { config: null, problems: [`not valid JSON: ${/** @type {Error} */ (error).message.split('\n')[0]}`] };
+    return { config: null, problems: [formatProblem(`not valid JSON: ${/** @type {Error} */ (error).message.split('\n')[0]}`)] };
   }
   return validateConfig(raw, options);
 }
