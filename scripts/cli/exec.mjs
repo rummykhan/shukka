@@ -185,6 +185,76 @@ export function projectEnv(extra = {}, from = process.env) {
   return env;
 }
 
+/**
+ * The image the project's own code runs in for `shukka diff` and `shukka deploy`: Node 22 on Debian bookworm (bash,
+ * git, python3 and a compiler for native modules, as on GitHub's runners), pinned by its multi-platform index digest
+ * so a moved tag cannot change what runs.
+ */
+export const PROJECT_IMAGE = 'node:22@sha256:e13726ca604184d7a91fcacab1fc09eefd642dc28e79ac34e85540dd93b78cfb';
+
+/** Variable names never passed into the project's container: credentials and the caller's home. */
+const NOT_PASSED = /^(AWS_|GH_|GITHUB_|HOME$)/i;
+
+/**
+ * What `shukka diff` and `shukka deploy` print, and their --help says, when the project's code runs on this machine.
+ */
+export const HOST_CODE_WARNING = '--trust-project-code: Docker is not available, so the project\'s own code (npm ci, cdk synth, '
+  + 'checks, build, bundle, smoke) runs on this machine as you. It gets no AWS_* variables, but it can read your home '
+  + 'directory: ~/.aws, the AWS SSO cache, gh\'s token. Use this only for code you trust';
+
+/**
+ * Whether a Docker daemon answers (`docker info`, read-only; also run in a dry run).
+ * @param {Io} io
+ * @returns {boolean}
+ */
+export function dockerAvailable(io) {
+  try {
+    return io.run('docker', ['info', '--format', '{{.ServerVersion}}'], { mutates: false, capture: 'merged' }).status === 0;
+  } catch {
+    return false; // no docker program
+  }
+}
+
+let containers = 0;
+
+/**
+ * The `docker run` arguments (after `docker`) that run `cmd args` in a throwaway container of PROJECT_IMAGE: only
+ * `tree` mounted, read-write, at its own path (so paths printed inside mean the same outside); as the caller's user
+ * and group, so files written back are the caller's; HOME=/tmp inside the container (nothing of the caller's home);
+ * no capabilities, no privilege gain; the default network (npm needs it). The container sees no variable of this
+ * process: only HOME, CI=true and `env`, which is written to an --env-file in a shukka temp directory (values stay off
+ * the command line).
+ * @param {{ tree: string, cwd: string, env: Record<string, string>, cmd: string, args: string[], label?: string }} spec
+ * @returns {string[]}
+ */
+export function containerArgs(spec) {
+  const rel = relative(spec.tree, spec.cwd);
+  if (rel.startsWith('..') || isAbsolute(rel)) throw new CliError(`refusing: ${spec.cwd} is outside the checkout ${spec.tree}, which is all the container has`);
+  if (spec.tree.includes(',')) throw new CliError(`refusing: the checkout path ${spec.tree} has a comma, which docker --mount cannot take`);
+  const lines = [];
+  for (const [k, v] of Object.entries(spec.env)) {
+    if (NOT_PASSED.test(k)) throw new CliError(`refusing: ${k} is never passed into the project's container (AWS_*, GH_*, GITHUB_* and HOME are not)`);
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) throw new CliError(`refusing: ${JSON.stringify(k)} is not a variable name`);
+    if (/[\r\n\0]/.test(v)) throw new CliError(`refusing: the value of ${k} has a line break, which docker --env-file cannot carry`);
+    lines.push(`${k}=${v}`);
+  }
+  const envFile = join(tempDir('env'), 'container.env');
+  writeFileSync(envFile, lines.length > 0 ? `${lines.join('\n')}\n` : '', { mode: 0o600 });
+  const uid = process.getuid?.() ?? 1000;
+  const gid = process.getgid?.() ?? 1000;
+  containers += 1;
+  return [
+    'run', '--rm',
+    '--name', `shukka-${spec.label ?? 'step'}-${process.pid}-${containers}`,
+    '--user', `${uid}:${gid}`,
+    '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
+    '--mount', `type=bind,source=${spec.tree},target=${spec.tree}`,
+    '--workdir', spec.cwd,
+    '--env', 'HOME=/tmp', '--env', 'CI=true', '--env-file', envFile,
+    PROJECT_IMAGE, spec.cmd, ...spec.args,
+  ];
+}
+
 /** npm settings for the cdk child: no project .npmrc can choose the shell or the registry. */
 export const NPM_SAFE = Object.freeze({ npm_config_script_shell: '/bin/sh', npm_config_registry: 'https://registry.npmjs.org/' });
 

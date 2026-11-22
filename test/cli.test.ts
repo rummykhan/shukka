@@ -5,13 +5,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { validateConfig } from '../scripts/config.mjs';
 import { COMMANDS, helpText, main } from '../scripts/cli/main.mjs';
-import { cdkBin, quote, realSpawn } from '../scripts/cli/exec.mjs';
+import { CliError, HOST_CODE_WARNING, PROJECT_IMAGE, cdkBin, containerArgs, quote, realSpawn } from '../scripts/cli/exec.mjs';
 import { bundleDir, stubClient } from './helpers/release-fixtures.js';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -108,6 +108,9 @@ function fakeAws(over: Fake = {}) {
     policyDocument: async () => '{}',
     assumeRole: async () => ({ accessKeyId: 'ASIAFENCED', secretAccessKey: 'fenced-secret', sessionToken: 'fenced-token' }),
     clients: () => { throw new Error('no AWS clients in this test'); },
+    accountResources: async () => [],
+    stacksWithTags: async () => [],
+    stackPhysicalIds: async () => [],
     ...over,
   };
   const aws: Fake = {};
@@ -120,15 +123,62 @@ function fakeAws(over: Fake = {}) {
   return { aws, reads };
 }
 
-/** A recording spawn: git runs for real (on test repositories), everything else is answered by `respond`. */
+const DOCKER_VALUE_FLAGS = new Set(['--name', '--user', '--cap-drop', '--security-opt', '--mount', '--workdir', '--env', '--env-file']);
+
+/**
+ * A `docker run [flags] <image> <cmd> <args>` command line taken apart: the command run inside, its workdir, the
+ * container's whole environment (--env values and the --env-file's lines), the image, the mounts and the flags.
+ */
+function unwrapDocker(args: string[]) {
+  const env: Record<string, string> = {};
+  const mounts: string[] = [];
+  const flags: string[] = [];
+  let cwd = '';
+  let i = 1;
+  while (i < args.length && args[i]!.startsWith('-')) {
+    const f = args[i]!;
+    flags.push(f);
+    if (!DOCKER_VALUE_FLAGS.has(f)) { i += 1; continue; }
+    const v = args[i + 1]!;
+    if (f === '--workdir') cwd = v;
+    if (f === '--mount') mounts.push(v);
+    if (f === '--env') { const eq = v.indexOf('='); env[v.slice(0, eq)] = v.slice(eq + 1); }
+    if (f === '--env-file') {
+      for (const line of readFileSync(v, 'utf8').split('\n').filter(Boolean)) { const eq = line.indexOf('='); env[line.slice(0, eq)] = line.slice(eq + 1); }
+    }
+    i += 2;
+  }
+  return { image: args[i]!, cmd: args[i + 1]!, args: args.slice(i + 2), cwd, env, mounts, flags };
+}
+
+/**
+ * A recording spawn: git runs for real (on test repositories), everything else is answered by `respond`. A
+ * `docker run` of a project step is recorded (and answered) as the command run inside the container, with the
+ * container's workdir as `cwd`, its whole environment as `fullEnv` and the real docker argv as `docker`.
+ */
 function recordingSpawn(respond: (call: Call) => { status: number; stdout: string } = () => ({ status: 0, stdout: '' })) {
   const calls: Call[] = [];
   const spawn = (cmd: string, args: string[], options: any) => {
+    if (cmd === 'docker' && args[0] === 'run') {
+      const u = unwrapDocker(args);
+      const call = { cmd: u.cmd, args: u.args, options: { ...options, cwd: u.cwd, fullEnv: u.env, docker: args } };
+      calls.push(call);
+      return respond(call);
+    }
     calls.push({ cmd, args, options });
     if (cmd === 'git') return realSpawn(cmd, args, { ...options, capture: options.capture || 'stdout' });
     return respond({ cmd, args, options });
   };
   return { calls, spawn };
+}
+
+/** The real spawn, except docker: `docker info` answers (Docker is there), and a `docker run` fails the test. */
+function stubDockerSpawn(cmd: string, args: string[], options: any) {
+  if (cmd === 'docker') {
+    if (args[0] === 'info') return { status: 0, stdout: '' };
+    throw new Error(`this test may not run ${cmd} ${args.join(' ')}`);
+  }
+  return realSpawn(cmd, args, options);
 }
 
 async function cli(argv: string[], opts: { aws?: Fake; spawn?: any; cwd?: string; env?: Record<string, string>; checkAssembly?: (dir: string) => string[]; keepTemp?: boolean } = {}) {
@@ -137,7 +187,8 @@ async function cli(argv: string[], opts: { aws?: Fake; spawn?: any; cwd?: string
   const code = await main(argv, {
     out: (t: string) => { out += t; },
     err: (t: string) => { err += t; },
-    ...(opts.spawn ? { spawn: opts.spawn } : {}),
+    // Docker is never called for real: without a recording spawn, `docker info` answers and nothing else may run.
+    spawn: opts.spawn ?? stubDockerSpawn,
     aws: () => (opts.aws ?? fakeAws().aws) as any,
     cwd: opts.cwd ?? root,
     env: opts.env ?? {},
@@ -167,7 +218,7 @@ function templateOf(assembly: string, stack: string): any {
   return JSON.parse(readFileSync(join(assembly, `${stack}.template.json`), 'utf8'));
 }
 
-const MUTATING = (calls: Call[]) => calls.filter((c) => c.cmd !== 'git' && !(c.cmd === 'aws' && c.args[0] === 'sts'));
+const MUTATING = (calls: Call[]) => calls.filter((c) => c.cmd !== 'git' && !(c.cmd === 'aws' && c.args[0] === 'sts') && !(c.cmd === 'docker' && c.args[0] === 'info'));
 
 // ---------- shukka.json fence object ----------
 
@@ -465,13 +516,16 @@ test('shu-5ix: deploy dry run prints the workflow steps in order: checks, build,
   const r = await cli(['deploy', '--profile', 'stelking', '--dry-run'], { cwd: dir, spawn, aws: fakeAws().aws });
   assert.equal(r.code, 0, r.err);
   const lines = printed(r.out).filter((l) => !/^\+ git /.test(l)).map((l) => l.replace(/^\+ /, '').replace(/\s+\[dry run: not run\]$/, ''));
+  // Project code runs in containers (shu-9bj.8): each step is a docker run of the pinned image.
+  const box = `docker run --rm .* ${reEscape(PROJECT_IMAGE)} `;
   const order = [
-    /^bash -eo pipefail -c 'npm test'$/,
-    /^bash -eo pipefail -c 'npm ci'$/,
-    /^bash -eo pipefail -c 'npm run build'$/,
-    /^bash \S+\/scripts\/bundle\.sh$/,
-    /^npm ci$/,
-    /^npx --no-install cdk synth --quiet --output \S+$/,
+    /^docker info --format '\{\{\.ServerVersion\}\}'$/,
+    new RegExp(`^${box}bash -eo pipefail -c 'npm test'$`),
+    new RegExp(`^${box}bash -eo pipefail -c 'npm ci'$`),
+    new RegExp(`^${box}bash -eo pipefail -c 'npm run build'$`),
+    new RegExp(`^${box}bash \\S+/shukka-tree-\\S+/\\.shukka-bundle-\\S+/bundle\\.sh$`), // shukka's script, copied into the tree
+    new RegExp(`^${box}npm ci$`),
+    new RegExp(`^${box}npx --no-install cdk synth --quiet --output \\S+$`),
     /^node scripts\/assembly\.mjs check \S+$/,
     new RegExp(`^node scripts/policy-guard\\.mjs \\S+ --account ${ACCOUNT} --mail-domain example\\.com$`),
     new RegExp(`^assume arn:aws:iam::${ACCOUNT}:role/cdk-shukkatest-deploy-role-${ACCOUNT}-us-east-1 as shukka-emergency; cdk gets only that session$`),
@@ -480,7 +534,7 @@ test('shu-5ix: deploy dry run prints the workflow steps in order: checks, build,
     new RegExp(`^${reEscape(CDK)} deploy --app \\S+ --require-approval never --no-color --all --tags=shukka:revision=${sha}$`),
     new RegExp(`^upload .* to s3://shukkatest-deploy-${ACCOUNT}/shukkatest/web/${sha}\\.tgz \\(scripts/upload\\.mjs\\)$`),
     new RegExp(`^release shukkatest/web ${sha} on instances tagged Project=shukkatest \\(scripts/release\\.mjs\\)$`),
-    /^bash -c 'bash smoke\.sh'$/,
+    new RegExp(`^${box}bash -c 'bash smoke\\.sh'$`),
   ];
   assert.equal(lines.length, order.length, lines.join('\n'));
   order.forEach((re, i) => assert.match(lines[i]!, re));
@@ -488,16 +542,27 @@ test('shu-5ix: deploy dry run prints the workflow steps in order: checks, build,
   assert.deepEqual(MUTATING(calls), [], 'a dry run changes nothing');
 }));
 
-/** A spawn for a real deploy run: commands succeed, cdk synth writes a manifest, cdk diff prints `diff`, the bundle script prints `bundle`. */
+/**
+ * What a bundle script run in the container does: copy `bundle` (when given) to .next/shukka-bundle in its working
+ * directory, inside the checkout (all that outlives the container), and print that path.
+ */
+function bundleInTree(bundle: string, cwd: string) {
+  if (!bundle) return { status: 0, stdout: 'building\n' };
+  const out = join(cwd, '.next', 'shukka-bundle');
+  cpSync(bundle, out, { recursive: true });
+  return { status: 0, stdout: `building\n${out}\n` };
+}
+
+/** A spawn for a real deploy run: commands succeed, cdk synth writes a manifest, cdk diff prints `diff`, the bundle script bundles `bundle`. */
 function deploySpawn(diff: string, bundle: string, diffStatus = 0) {
-  return recordingSpawn(({ cmd, args }) => {
+  return recordingSpawn(({ cmd, args, options }) => {
     if (cmd === 'npx' && args.includes('synth')) {
       const out = args[args.indexOf('--output') + 1]!;
       write(join(out, 'manifest.json'), JSON.stringify({ artifacts: { 'shukkatest-App': { type: 'aws:cloudformation:stack', properties: { tags: { Project: 'shukkatest' } } } } }));
       return { status: 0, stdout: '' };
     }
     if (cmd === process.execPath && args[1] === 'diff') return { status: diffStatus, stdout: diff };
-    if (cmd === 'bash' && args[0]?.endsWith('bundle.sh')) return { status: 0, stdout: `building\n${bundle}\n` };
+    if (cmd === 'bash' && args[0]?.endsWith('bundle.sh')) return bundleInTree(bundle, options.cwd);
     return { status: 0, stdout: '' };
   });
 }
@@ -575,13 +640,12 @@ test('shu-5ix: project code runs without AWS credentials; cdk gets only the depl
   const code = calls.filter((x) => x.cmd === 'bash' || x.cmd === 'npm' || x.cmd === 'npx');
   assert.ok(code.length >= 6, 'checks, build, bundle, npm ci, synth, smoke');
   for (const x of code) {
+    // In a container since shu-9bj.8: fullEnv is the container's whole environment (the recording spawn reads it from
+    // the docker command line); without Docker, --trust-project-code keeps the old environment (tested there).
     const env = x.options.fullEnv;
-    assert.ok(env, `${x.cmd} ${x.args.join(' ')} gets a whole environment, nothing inherited`);
+    assert.ok(x.options.docker, `${x.cmd} ${x.args.join(' ')} runs in a container`);
     const aws = Object.keys(env).filter((k) => /^aws_/i.test(k)).sort();
-    assert.deepEqual(aws, ['AWS_CONFIG_FILE', 'AWS_EC2_METADATA_DISABLED', 'AWS_SHARED_CREDENTIALS_FILE'], `${x.cmd} ${x.args.join(' ')}`);
-    assert.equal(readFileSync(env.AWS_CONFIG_FILE, 'utf8'), '');
-    assert.equal(readFileSync(env.AWS_SHARED_CREDENTIALS_FILE, 'utf8'), '');
-    assert.equal(env.AWS_EC2_METADATA_DISABLED, 'true');
+    assert.deepEqual(aws, [], `${x.cmd} ${x.args.join(' ')}`);
     assert.ok(x.options.cwd.includes('shukka-tree-'), `${x.cmd} runs in the fresh tree, not the checkout: ${x.options.cwd}`);
   }
   assert.deepEqual(assumed, [`arn:aws:iam::${ACCOUNT}:role/cdk-shukkatest-deploy-role-${ACCOUNT}-us-east-1`]);
@@ -645,13 +709,13 @@ test('shu-5ix: deploy refuses an assembly with executable or Docker assets befor
 
 test("shu-5ix: without an injected check, deploy uses the workflows' scripts/assembly.mjs, or refuses while it is absent", withTmp(async (tmp) => {
   const { dir } = consumer(tmp);
-  const s = recordingSpawn(({ cmd, args }) => {
+  const s = recordingSpawn(({ cmd, args, options }) => {
     if (cmd === 'npx' && args.includes('synth')) {
       const out = args[args.indexOf('--output') + 1]!;
       write(join(out, 'manifest.json'), JSON.stringify({ version: '1', artifacts: { 'shukkatest-App.assets': { type: 'cdk:asset-manifest', properties: { file: 'shukkatest-App.assets.json' } } } }));
       write(join(out, 'shukkatest-App.assets.json'), JSON.stringify({ version: '1', files: { a1: { source: { executable: ['sh', '-c', 'touch /tmp/pwned'] }, destinations: {} } } }));
     }
-    if (cmd === 'bash' && args[0]?.endsWith('bundle.sh')) return { status: 0, stdout: `${bundleDir(tmp)}\n` };
+    if (cmd === 'bash' && args[0]?.endsWith('bundle.sh')) return bundleInTree(bundleDir(tmp), options.cwd);
     return { status: 0, stdout: '' };
   });
   const r = await cli(['deploy', '--skip-checks'], { cwd: dir, spawn: s.spawn, aws: awsWith(releaseClients()).aws });
@@ -991,20 +1055,25 @@ test('shu-5ix: bin/shukka --help runs as the npx entry point', () => {
 
 const PLUGIN_FIXTURE = join(root, 'test', 'fixtures', 'assembly', 'plugin-selector');
 
+/** Write the security review's hostile assembly to `out`, its manifest changed by `mutate`. */
+function writeHostileAssembly(out: string, mutate: (artifacts: any, assembly: string) => void) {
+  mkdirSync(out, { recursive: true });
+  for (const f of ['Demo.template.json', 'evil.cjs']) writeFileSync(join(out, f), readFileSync(join(PLUGIN_FIXTURE, f)));
+  const manifest = JSON.parse(readFileSync(join(PLUGIN_FIXTURE, 'manifest.json'), 'utf8').replaceAll('@ASSEMBLY@', out));
+  mutate(manifest.artifacts, out);
+  writeFileSync(join(out, 'manifest.json'), JSON.stringify(manifest));
+}
+
 /** A deploy spawn whose synth writes the security review's hostile assembly, its manifest changed by `mutate`. */
 function hostileSynthSpawn(bundle: string, mutate: (artifacts: any, assembly: string) => void) {
-  return recordingSpawn(({ cmd, args }) => {
+  return recordingSpawn(({ cmd, args, options }) => {
     if (cmd === 'npx' && args.includes('synth')) {
-      const out = args[args.indexOf('--output') + 1]!;
-      mkdirSync(out, { recursive: true });
-      for (const f of ['Demo.template.json', 'evil.cjs']) writeFileSync(join(out, f), readFileSync(join(PLUGIN_FIXTURE, f)));
-      const manifest = JSON.parse(readFileSync(join(PLUGIN_FIXTURE, 'manifest.json'), 'utf8').replaceAll('@ASSEMBLY@', out));
-      mutate(manifest.artifacts, out);
-      writeFileSync(join(out, 'manifest.json'), JSON.stringify(manifest));
+      writeHostileAssembly(args[args.indexOf('--output') + 1]!, mutate);
       return { status: 0, stdout: '' };
     }
     if (cmd === process.execPath && args[1] === 'diff') return { status: 0, stdout: CLEAN_DIFF };
-    if (cmd === 'bash' && args[0]?.endsWith('bundle.sh')) return { status: 0, stdout: `${bundle}\n` };
+    // In the container (shu-9bj.8) the bundle must land inside the checkout.
+    if (cmd === 'bash' && args[0]?.endsWith('bundle.sh')) return bundleInTree(bundle, options.cwd);
     return { status: 0, stdout: '' };
   });
 }
@@ -1030,10 +1099,11 @@ test('shu-9bj.5: deploy re-checks each stack selector before cdk runs: a display
 
 test('shu-9bj.5: deploy passes each tag as one --tags=k=v token; the pinned cdk keeps --tags=--plugin=x as data', withTmp(async (tmp) => {
   const { dir, sha } = consumer(tmp);
-  const { calls, spawn } = hostileSynthSpawn(bundleDir(tmp), (artifacts, out) => {
+  const mutate = (artifacts: any, out: string) => {
     artifacts.Demo.displayName = 'Demo';
     artifacts.Demo.properties.tags = { '--plugin': `${out}/evil.cjs` };
-  });
+  };
+  const { calls, spawn } = hostileSynthSpawn(bundleDir(tmp), mutate);
   const r = await cli(['deploy', '--skip-checks'], { cwd: dir, spawn, aws: awsWith(releaseClients()).aws, checkAssembly: NO_ASSETS });
   assert.equal(r.code, 0, r.out + r.err);
   const deploys = calls.filter((x) => isCdk(x, 'deploy'));
@@ -1042,7 +1112,9 @@ test('shu-9bj.5: deploy passes each tag as one --tags=k=v token; the pinned cdk 
   const assembly = demo.args[demo.args.indexOf('--app') + 1]!;
   assert.deepEqual(demo.args.slice(demo.args.indexOf('--exclusively')), ['--exclusively', 'Demo', `--tags=--plugin=${assembly}/evil.cjs`, `--tags=shukka:revision=${sha}`]);
   assert.ok(!demo.args.includes('--tags'), 'no tag is split from its flag');
-  // The same argv, given to the real pinned cdk offline: it reads the assembly and never loads the plugin.
+  // The same argv, given to the real pinned cdk offline: it reads the assembly and never loads the plugin. The
+  // assembly is written inside the fresh worktree (shu-9bj.8), which deploy removes, so it is written again first.
+  writeHostileAssembly(assembly, mutate);
   const out = offlineCdk(tmp, demo.args);
   assert.match(out, /Synthesis time/, out);
   assert.ok(!existsSync(join(assembly, 'MARKER')), `the planted plugin ran:\n${out}`);
@@ -1091,3 +1163,256 @@ test('shu-9bj.6: shukka deploy runs the policy guard after the assembly check an
   assert.match(r.out, /^policy-guard: allowed by the person who started this run \(--allow\)$/m);
   assert.ok(s.calls.some((x) => isCdk(x, 'deploy')));
 }));
+
+// ---------- shu-9bj.8: project code in a container; bootstrap's fence clashes ----------
+
+const PROJECT_STEPS = ['npm test', 'npm ci', 'npm run build', 'bundle.sh', 'infra npm ci', 'cdk synth', 'bash smoke.sh'];
+
+/** Which project step a recorded call is, or undefined for anything else (git, docker info, shukka's cdk, aws). */
+function stepOf(c: Call): string | undefined {
+  if (c.cmd === 'bash' && c.args[0] === '-eo') return c.args[3];
+  if (c.cmd === 'bash' && c.args[0]?.endsWith('/bundle.sh')) return 'bundle.sh';
+  if (c.cmd === 'bash' && c.args[0] === '-c') return c.args[1];
+  if (c.cmd === 'npm' && c.args[0] === 'ci') return 'infra npm ci';
+  if (c.cmd === 'npx' && c.args.includes('synth')) return 'cdk synth';
+  return undefined;
+}
+
+/** Run `fn` with these variables in this process's environment, then put it back. */
+async function withEnv<T>(vars: Record<string, string>, fn: () => Promise<T>): Promise<T> {
+  const saved: Record<string, string | undefined> = {};
+  for (const k of Object.keys(vars)) saved[k] = process.env[k];
+  Object.assign(process.env, vars);
+  try {
+    return await fn();
+  } finally {
+    for (const [k, v] of Object.entries(saved)) if (v === undefined) delete process.env[k]; else process.env[k] = v;
+  }
+}
+
+const CALLER_SECRETS = {
+  AWS_PROFILE: 'stelking', AWS_ACCESS_KEY_ID: 'AKIAADMIN', AWS_SECRET_ACCESS_KEY: 'admin-secret', AWS_SESSION_TOKEN: 'admin-token',
+  GH_TOKEN: 'gho_caller', GITHUB_TOKEN: 'ghp_caller', NPM_TOKEN: 'npm_caller',
+};
+
+test('shu-9bj.8: deploy runs every project step in a throwaway container of the pinned node:22 image, with only the fresh worktree mounted read-write, as the caller, without home or credentials, network allowed', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  const { calls, spawn } = deploySpawn(CLEAN_DIFF, bundleDir(tmp));
+  const c = releaseClients();
+  const r = await withEnv(CALLER_SECRETS, () => cli(['deploy', '--profile', 'stelking'], { cwd: dir, spawn, aws: awsWith(c).aws, checkAssembly: NO_ASSETS, keepTemp: true }));
+  assert.equal(r.code, 0, r.out + r.err);
+  assert.match(PROJECT_IMAGE, /^node:22@sha256:[0-9a-f]{64}$/, 'node 22 pinned by digest');
+
+  const steps = calls.filter((x) => stepOf(x) !== undefined);
+  assert.deepEqual(steps.map(stepOf), PROJECT_STEPS, 'every project step ran, in order');
+  const tree = steps[0]!.options.cwd.replace(/\/app$/, '');
+  assert.match(tree, /shukka-tree-[^/]+\/tree$/);
+  const allowed = new Set(['HOME', 'CI', 'CDK_DEFAULT_ACCOUNT', 'CDK_DEFAULT_REGION', 'APP_URL', 'LEGAL_ENTITY', 'CONTACT_EMAIL']);
+  for (const x of steps) {
+    const what = stepOf(x);
+    const argv: string[] = x.options.docker;
+    assert.ok(argv, `${what} runs in a container`);
+    const u = unwrapDocker(argv);
+    assert.equal(argv[0], 'run');
+    assert.ok(u.flags.includes('--rm'), `${what}: the container is thrown away`);
+    assert.equal(u.image, PROJECT_IMAGE, what);
+    assert.deepEqual(u.mounts, [`type=bind,source=${tree},target=${tree}`], `${what}: only the fresh worktree, read-write`);
+    assert.ok(!u.flags.some((f) => ['-v', '--volume', '--volumes-from', '--privileged', '--network', '--net', '--env-host', '--ipc', '--pid'].includes(f)), `${what}: ${u.flags.join(' ')}`);
+    assert.equal(argv[argv.indexOf('--user') + 1], `${process.getuid!()}:${process.getgid!()}`, `${what}: files written back are the caller's`);
+    assert.ok(u.flags.includes('--cap-drop') && argv[argv.indexOf('--cap-drop') + 1] === 'ALL', what);
+    assert.ok(u.cwd === tree || u.cwd.startsWith(`${tree}/`), `${what}: works in the tree (${u.cwd})`);
+    assert.equal(u.env.HOME, '/tmp', `${what}: no home directory of the caller`);
+    for (const k of Object.keys(u.env)) assert.ok(allowed.has(k), `${what}: ${k} passed into the container`);
+    for (const secret of Object.values(CALLER_SECRETS)) assert.ok(!JSON.stringify(u.env).includes(secret) && !argv.join(' ').includes(secret), `${what}: ${secret}`);
+    assert.ok(!argv.join(' ').includes(homedir()), `${what}: the caller's home is not on the docker command line`);
+    const envFile = argv[argv.indexOf('--env-file') + 1]!;
+    assert.equal(statSync(envFile).mode & 0o777, 0o600);
+  }
+  const build = steps.find((x) => stepOf(x) === 'npm run build')!;
+  assert.equal(build.options.fullEnv.LEGAL_ENTITY, 'Example Ltd', 'buildEnv values reach the build');
+  assert.ok(!build.options.docker.join(' ').includes('Example Ltd'), 'values go in the env file, not on the command line');
+
+  // shukka's cdk runs on this machine, on the assembly the container wrote inside the tree.
+  for (const verb of ['diff', 'deploy']) {
+    const x = calls.find((y) => isCdk(y, verb))!;
+    assert.ok(x && !x.options.docker, `cdk ${verb} runs on the host`);
+    assert.ok(argAfter(x.args.join(' '), '--app').startsWith(`${tree}/.shukka-cdk-`), x.args.join(' '));
+  }
+  assert.ok(!calls.some((x) => x.cmd === 'docker' && x.args[0] !== 'info'), 'nothing else runs docker');
+}));
+
+test('shu-9bj.8: diff runs npm ci and cdk synth in the container too', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  const { calls, spawn } = deploySpawn(CLEAN_DIFF, '');
+  const r = await withEnv(CALLER_SECRETS, () => cli(['diff'], { cwd: dir, spawn, checkAssembly: NO_ASSETS }));
+  assert.equal(r.code, 0, r.err);
+  const steps = calls.filter((x) => stepOf(x) !== undefined);
+  assert.deepEqual(steps.map(stepOf), ['infra npm ci', 'cdk synth']);
+  for (const x of steps) {
+    assert.ok(x.options.docker, `${stepOf(x)} in a container`);
+    assert.equal(x.options.fullEnv.HOME, '/tmp');
+    assert.deepEqual(Object.keys(x.options.fullEnv).filter((k) => /^(AWS_|GH_|GITHUB_)/i.test(k)), []);
+  }
+  assert.match(r.out, /runs in throwaway containers of node:22@sha256:/);
+}));
+
+/** A spawn with no Docker: `docker info` fails (or, with `missing`, there is no docker program at all). */
+function noDockerSpawn(missing = false, bundle = '') {
+  const s = deploySpawn(CLEAN_DIFF, bundle);
+  return {
+    calls: s.calls,
+    spawn: (cmd: string, args: string[], options: any) => {
+      if (cmd === 'docker' && missing) { s.calls.push({ cmd, args, options }); throw new CliError('cannot run docker: spawnSync docker ENOENT'); }
+      if (cmd === 'docker' && args[0] === 'info') { s.calls.push({ cmd, args, options }); return { status: 1, stdout: 'Cannot connect to the Docker daemon' }; }
+      return s.spawn(cmd, args, options);
+    },
+  };
+}
+
+test('shu-9bj.8: without Docker, diff and deploy refuse before any project code runs, unless --trust-project-code', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  for (const command of ['diff', 'deploy']) {
+    for (const missing of [false, true]) {
+      const s = noDockerSpawn(missing);
+      const r = await cli([command], { cwd: dir, spawn: s.spawn, checkAssembly: NO_ASSETS });
+      assert.equal(r.code, 1, `${command}: ${r.out}${r.err}`);
+      assert.match(r.err, /refusing: Docker is not available[\s\S]*--trust-project-code/);
+      assert.ok(!s.calls.some((x) => stepOf(x) !== undefined || isCdk(x, 'diff') || isCdk(x, 'deploy')), `${command}: nothing ran`);
+      assert.equal(git(dir, 'worktree', 'list').split('\n').length, 1, 'the fresh worktree is removed');
+    }
+  }
+  const dry = await cli(['deploy', '--dry-run'], { cwd: dir, spawn: noDockerSpawn().spawn });
+  assert.equal(dry.code, 1);
+  assert.match(dry.err, /Docker is not available/);
+}));
+
+test('shu-9bj.8: --trust-project-code without Docker runs the project steps here, without AWS variables, and diff and deploy print the same clear warning', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  const warnings: string[] = [];
+  for (const command of ['diff', 'deploy']) {
+    const s = noDockerSpawn(false, bundleDir(tmp));
+    const c = releaseClients();
+    const r = await withEnv(CALLER_SECRETS, () => cli([command, '--trust-project-code', '--skip-checks'].filter((a) => command === 'deploy' || a !== '--skip-checks'), {
+      cwd: dir, spawn: s.spawn, aws: awsWith(c).aws, checkAssembly: NO_ASSETS,
+    }));
+    assert.equal(r.code, 0, r.out + r.err);
+    const warning = r.err.split('\n').find((l) => l.includes('--trust-project-code'));
+    assert.ok(warning, `${command} warns: ${r.err}`);
+    assert.equal(warning, `shukka: warning: ${HOST_CODE_WARNING}`);
+    assert.match(warning!, /runs on this machine as you[\s\S]*~\/\.aws[\s\S]*SSO[\s\S]*gh's token/);
+    warnings.push(warning!);
+    const steps = s.calls.filter((x) => stepOf(x) !== undefined);
+    assert.ok(steps.length >= 2, command);
+    for (const x of steps) {
+      assert.ok(!x.options.docker, `${stepOf(x)} on the host`);
+      assert.deepEqual(Object.keys(x.options.fullEnv).filter((k) => /^aws_/i.test(k)).sort(), ['AWS_CONFIG_FILE', 'AWS_EC2_METADATA_DISABLED', 'AWS_SHARED_CREDENTIALS_FILE']);
+      assert.equal(readFileSync(x.options.fullEnv.AWS_SHARED_CREDENTIALS_FILE, 'utf8'), '');
+    }
+  }
+  assert.equal(warnings[0], warnings[1], 'diff and deploy print the same warning');
+}));
+
+test("shu-9bj.8: diff's help carries the same project-code paragraph and warning as deploy's, and both take --trust-project-code", () => {
+  const diff = COMMANDS.find((c) => c.name === 'diff')!;
+  const deploy = COMMANDS.find((c) => c.name === 'deploy')!;
+  const paragraph = (summary: string) => summary.slice(summary.indexOf('Project code:'), summary.indexOf(`${HOST_CODE_WARNING}.`) + HOST_CODE_WARNING.length + 1);
+  for (const c of [diff, deploy]) {
+    assert.ok(c.summary.includes(HOST_CODE_WARNING), `${c.name} help has the warning`);
+    assert.ok(c.summary.includes(PROJECT_IMAGE), `${c.name} help names the pinned image`);
+    assert.match(paragraph(c.summary), /only the fresh worktree is mounted, read-write[\s\S]*your user and group[\s\S]*HOME=\/tmp[\s\S]*AWS_, GH_ or GITHUB_[\s\S]*network is allowed/i);
+    assert.ok(c.flags.some((f) => f.name === 'trust-project-code'), `${c.name} takes --trust-project-code`);
+    assert.ok(c.usage.includes('--trust-project-code'));
+  }
+  assert.equal(paragraph(diff.summary), paragraph(deploy.summary));
+  assert.ok(helpText().includes(HOST_CODE_WARNING));
+});
+
+test('shu-9bj.8: the container gets no credential or home variable, and a bundle printed outside the checkout is refused', withTmp(async (tmp) => {
+  const tree = join(tmp, 'tree');
+  mkdirSync(tree);
+  for (const name of ['AWS_PROFILE', 'aws_session_token', 'GH_TOKEN', 'GITHUB_TOKEN', 'HOME']) {
+    assert.throws(() => containerArgs({ tree, cwd: tree, env: { [name]: 'x' }, cmd: 'true', args: [] }), /never passed into the project's container/, name);
+  }
+  assert.throws(() => containerArgs({ tree, cwd: tmp, env: {}, cmd: 'true', args: [] }), /outside the checkout/);
+
+  const { dir } = consumer(tmp);
+  const outside = bundleDir(tmp);
+  const s = recordingSpawn(({ cmd, args }) => (cmd === 'bash' && args[0]?.endsWith('bundle.sh') ? { status: 0, stdout: `${outside}\n` } : { status: 0, stdout: '' }));
+  const r = await cli(['deploy', '--skip-checks'], { cwd: dir, spawn: s.spawn, aws: awsWith(releaseClients()).aws, checkAssembly: NO_ASSETS });
+  assert.equal(r.code, 1);
+  assert.match(r.err, /the bundle script printed .*bundle, outside the checkout/);
+}));
+
+// The account as listed for bootstrap: Orbitary's resources (orbitary-prod-*, in Orbitary's stacks), one resource of
+// each kind; orb's own data stack; and something unrelated.
+const SQS = `https://sqs.us-east-1.amazonaws.com/${ACCOUNT}`;
+const SNS = `arn:aws:sns:us-east-1:${ACCOUNT}`;
+const ORBITARY = [
+  { kind: 'dynamodb-table', name: 'orbitary-prod-posts' },
+  { kind: 's3-bucket', name: 'orbitary-prod-media' },
+  { kind: 'sqs-queue', name: `${SQS}/orbitary-prod-jobs` },
+  { kind: 'sns-topic', name: `${SNS}:orbitary-prod-alerts` },
+  { kind: 'lambda-function', name: 'orbitary-prod-worker' },
+  { kind: 'log-group', name: '/aws/lambda/orbitary-prod-worker' },
+  { kind: 'iam-role', name: 'Orbitary-prod-WorkerRole' },
+];
+
+function accountWith(project: string, own: { kind: string; name: string; path?: string }[], ownIds: string[]) {
+  return fakeAws({
+    accountResources: async () => [...ORBITARY, ...own, { kind: 'dynamodb-table', name: 'trendigle-prod-posts' }, { kind: 'log-group', name: '/ecs/other' }],
+    stacksWithTags: async () => [
+      { name: 'OrbitaryProd', tags: { Project: 'orbitary' } },
+      { name: `${project}-data`, tags: { Project: project } },
+      { name: 'Unrelated', tags: {} },
+    ],
+    stackPhysicalIds: async (name: string) => (name === 'OrbitaryProd'
+      ? ['orbitary-prod-posts', 'orbitary-prod-media', `${SQS}/orbitary-prod-jobs`, `${SNS}:orbitary-prod-alerts`, 'orbitary-prod-worker', 'Orbitary-prod-WorkerRole']
+      : name === `${project}-data` ? ownIds : []),
+  });
+}
+
+test('shu-9bj.8: bootstrap orb refuses when orbitary-prod-* tables, buckets, queues, topics, functions, log groups and roles match its fence, before changing anything', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp, (c) => { c.project = 'orb'; c.qualifier = 'orb'; c.apps[0].server.units = ['orb-web']; });
+  const { calls, spawn } = recordingSpawn();
+  const { aws, reads } = accountWith('orb', [{ kind: 'dynamodb-table', name: 'orb-prod-posts' }], ['orb-prod-posts']);
+  const r = await cli(['bootstrap', 'orb', '--repo', 'owner/consumer'], { cwd: dir, spawn, aws });
+  assert.equal(r.code, 1, r.out + r.err);
+  for (const line of [
+    'DynamoDB table orbitary-prod-posts', 'S3 bucket orbitary-prod-media', `SQS queue ${SQS}/orbitary-prod-jobs`, `SNS topic ${SNS}:orbitary-prod-alerts`,
+    'Lambda function orbitary-prod-worker', 'log group /aws/lambda/orbitary-prod-worker', 'IAM role Orbitary-prod-WorkerRole',
+  ]) {
+    assert.ok(r.err.includes(`shukka: ${line} matches the fence (orb*, Orb*) but is in no stack of orb`), `${line} in ${r.err}`);
+  }
+  assert.ok(!r.err.includes('orb-prod-posts '), "orb's own table, in a stack tagged Project=orb, is not a clash");
+  assert.ok(!r.err.includes('trendigle'), 'names outside the fence are not listed');
+  assert.match(r.err, /7 resource\(s\) in this account \(above\) are named like orb but belong to no stack tagged Project=orb/);
+  assert.ok(reads.includes('accountResources()'), 'the account was listed');
+  assert.deepEqual(MUTATING(calls), [], 'nothing ran');
+}));
+
+test("shu-9bj.8: bootstrap goes ahead when everything in the fence is in the project's own stacks (a function's own log group counts)", withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  const own = [
+    { kind: 'dynamodb-table', name: 'shukkatest-prod-posts' },
+    { kind: 'lambda-function', name: 'Shukkatest-Data-Fn12AB' },
+    { kind: 'log-group', name: '/aws/lambda/Shukkatest-Data-Fn12AB' },
+    { kind: 'iam-role', name: 'shukkatest-shukka-infra' },
+  ];
+  const r = await cli(projectArgs(), { cwd: dir, aws: accountWith('shukkatest', own, ['shukkatest-prod-posts', 'Shukkatest-Data-Fn12AB', 'shukkatest-shukka-infra']).aws });
+  assert.equal(r.code, 0, r.err);
+
+  // The same resources outside any stack of the project are refused, a role with a path among them.
+  const stray = await cli(projectArgs(), {
+    cwd: dir,
+    aws: accountWith('shukkatest', [...own, { kind: 'iam-role', name: 'admin', path: '/shukkatest-ops/' }], ['shukkatest-prod-posts', 'Shukkatest-Data-Fn12AB', 'shukkatest-shukka-infra']).aws,
+  });
+  assert.equal(stray.code, 1);
+  assert.match(stray.err, /IAM role \/shukkatest-ops\/admin matches the fence/);
+}));
+
+test('shu-9bj.8: the CLI help no longer says to run bootstrap in the project root', () => {
+  assert.ok(!/project root/i.test(helpText()), 'no "project root" in --help');
+  const bootstrap = COMMANDS.find((c) => c.name === 'bootstrap')!;
+  assert.match(bootstrap.summary, /reading shukka\.json from --config/);
+  assert.match(bootstrap.summary, /DynamoDB table, S3 bucket, SQS queue, SNS topic, Lambda function, log group or IAM role/);
+});
