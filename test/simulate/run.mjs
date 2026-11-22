@@ -1,7 +1,7 @@
 // Runs spike S2's 58 cases (docs/factory/v1/spikes/s2/simulate.py) through the IAM policy simulator against the
 // documents ShukkaBoundary synthesizes, plus cases for each hole in the spike the construct closes. Two spike cases
 // are changed (marked) because the call they model now needs a tag or a principal the spike did not check. Then the
-// project bootstrap's deploy and file-publishing role policies (lib/bootstrap.ts, shu-9bj.2).
+// project bootstrap's deploy and file-publishing role policies (lib/bootstrap.ts, shu-9bj.2, shu-9bj.4).
 // Needs AWS credentials; the only call is `iam simulate-custom-policy`, which is read-only. Not part of the gate.
 //
 //   AWS_PROFILE=stelking node test/simulate/run.mjs
@@ -30,6 +30,7 @@ const BOUNDARY = `arn:aws:iam::${A}:policy/trendigle-shukka-boundary`;
 const SSO_ADMIN = `arn:aws:iam::${A}:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_AdministratorAccess_*`;
 const boot = synthBootstrap({ project: 'trendigle', account: A, region: R });
 const bootAdmin = synthBootstrap({ project: 'trendigle', account: A, region: R, emergencyPrincipals: [SSO_ADMIN] });
+const bootOther = synthBootstrap({ project: 'trendigle', qualifier: 'tq', account: A, region: R });
 const EX = [d.executionA, d.executionB, d.executionC];
 const ALLOW_ALL = { Version: '2012-10-17', Statement: [{ Effect: 'Allow', Action: '*', Resource: '*' }] };
 const T = { 'aws:ResourceTag/Project': 'trendigle' };
@@ -224,9 +225,37 @@ const bootstrap = [
   ['deployTrustAdmin', 'implicitDeny', 'sts:AssumeRole', `arn:aws:iam::${A}:role/cdk-trendigle-deploy-role-${A}-${R}`, { 'aws:PrincipalArn': `arn:aws:iam::${A}:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_ReadOnly_x` }],
 ];
 
+// shu-9bj.4: a deploy-role session (`shukka deploy` from a laptop) may assume its own file-publishing role, and not
+// another qualifier's: the deploy role's identity policy names only its own, and the file-publishing role's trust
+// names only its own deploy role. The deploy role's own trust does not change.
+const DEPLOY_ROLE = (q) => ({ 'aws:PrincipalArn': `arn:aws:iam::${A}:role/cdk-${q}-deploy-role-${A}-${R}` });
+const PUBLISH_ROLE = (q) => `arn:aws:iam::${A}:role/cdk-${q}-file-publishing-role-${A}-${R}`;
+const deployPublishes = [
+  ['deploy', 'allowed', 'sts:AssumeRole', PUBLISH_ROLE('trendigle')],
+  ['deploy', 'allowed', 'sts:TagSession', PUBLISH_ROLE('trendigle')],
+  ['deploy', 'implicitDeny', 'sts:AssumeRole', PUBLISH_ROLE('orbitary')],
+  ['deploy', 'implicitDeny', 'sts:AssumeRole', PUBLISH_ROLE('hnb659fds')],
+  ['deploy', 'implicitDeny', 'sts:AssumeRole', PUBLISH_ROLE('trendiglex')],
+  ['deploy', 'implicitDeny', 'sts:AssumeRole', `arn:aws:iam::${A}:role/cdk-trendigle-deploy-role-${A}-${R}`],
+  ['deploy', 'implicitDeny', 'sts:AssumeRole', `arn:aws:iam::${A}:role/cdk-trendigle-cfn-exec-role-${A}-${R}`],
+  ['publishTrust', 'allowed', 'sts:AssumeRole', PUBLISH_ROLE('trendigle'), DEPLOY_ROLE('trendigle')],
+  ['publishTrust', 'implicitDeny', 'sts:AssumeRole', PUBLISH_ROLE('trendigle'), DEPLOY_ROLE('orbitary')],
+  ['publishTrust', 'implicitDeny', 'sts:AssumeRole', PUBLISH_ROLE('trendigle'), DEPLOY_ROLE('hnb659fds')],
+  ['publishTrust', 'implicitDeny', 'sts:AssumeRole', PUBLISH_ROLE('trendigle'), DEPLOY_ROLE('trendiglex')],
+  ['publishTrust', 'implicitDeny', 'sts:AssumeRole', PUBLISH_ROLE('trendigle'), { 'aws:PrincipalArn': `arn:aws:iam::${A}:role/cdk-trendigle-cfn-exec-role-${A}-${R}` }],
+  // Another qualifier's file-publishing role does not trust this project's deploy role.
+  ['publishTrustOther', 'allowed', 'sts:AssumeRole', PUBLISH_ROLE('tq'), DEPLOY_ROLE('tq')],
+  ['publishTrustOther', 'implicitDeny', 'sts:AssumeRole', PUBLISH_ROLE('tq'), DEPLOY_ROLE('trendigle')],
+  ['publishTrustAdmin', 'allowed', 'sts:AssumeRole', PUBLISH_ROLE('trendigle'), DEPLOY_ROLE('trendigle')],
+  ['publishTrustAdmin', 'allowed', 'sts:AssumeRole', PUBLISH_ROLE('trendigle'), { 'aws:PrincipalArn': SSO_ADMIN.replace('*', 'abc123') }],
+  // The deploy role still may not assume itself (its trust is unchanged).
+  ['deployTrust', 'implicitDeny', 'sts:AssumeRole', `arn:aws:iam::${A}:role/cdk-trendigle-deploy-role-${A}-${R}`, DEPLOY_ROLE('trendigle')],
+];
+
 const POLICIES = {
   exec: EX, bounded: [ALLOW_ALL], deploy: [boot.deploy], publish: [boot.filePublishing],
   deployTrust: [boot.deployTrust], publishTrust: [boot.filePublishingTrust], deployTrustAdmin: [bootAdmin.deployTrust],
+  publishTrustOther: [bootOther.filePublishingTrust], publishTrustAdmin: [bootAdmin.filePublishingTrust],
 };
 
 async function simulate([who, , action, resource, ctx]) {
@@ -272,4 +301,5 @@ async function report(title, list) {
 await report('spike S2 cases', cases);
 await report('spike holes closed', extra);
 await report('project bootstrap (shu-9bj.2)', bootstrap);
+await report('deploy role publishes file assets (shu-9bj.4)', deployPublishes);
 process.exit(failed ? 1 : 0);

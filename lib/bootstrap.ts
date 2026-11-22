@@ -117,6 +117,17 @@ export function bootstrapTemplate(inputs: BootstrapTemplateInputs): CloudFormati
       },
     ],
   };
+  // The file-publishing role also trusts the project's own deploy role: `shukka deploy` hands cdk only a deploy-role
+  // session (no admin credentials in project code), and cdk then assumes this role to publish file assets.
+  const publishingTrust: Json = {
+    Version: '2012-10-17',
+    Statement: [
+      {
+        Effect: 'Allow', Action: ['sts:AssumeRole', 'sts:TagSession'], Principal: { AWS: { Ref: 'AWS::AccountId' } },
+        Condition: { ArnLike: { 'aws:PrincipalArn': [sub(iamArn(`role/${infraRoleName(project)}`)), sub(iamArn(`role/${n.deployRole}`)), ...emergency] } },
+      },
+    ],
+  };
 
   return {
     AWSTemplateFormatVersion: '2010-09-09',
@@ -160,7 +171,7 @@ export function bootstrapTemplate(inputs: BootstrapTemplateInputs): CloudFormati
         Type: 'AWS::IAM::Role',
         Properties: {
           RoleName: sub(n.filePublishingRole),
-          AssumeRolePolicyDocument: accountTrust,
+          AssumeRolePolicyDocument: publishingTrust,
           Policies: [
             {
               PolicyName: 'publish-assets',
@@ -229,6 +240,12 @@ export function bootstrapTemplate(inputs: BootstrapTemplateInputs): CloudFormati
                   {
                     Sid: 'ReadVersion', Effect: 'Allow', Action: ['ssm:GetParameter', 'ssm:GetParameters'],
                     Resource: sub(`arn:\${AWS::Partition}:ssm:\${AWS::Region}:\${AWS::AccountId}:parameter${n.versionParameter}`),
+                  },
+                  {
+                    // Same-account trust naming the account needs this allow too: only the project's own
+                    // file-publishing role, so a laptop deploy (deploy-role session) can publish file assets.
+                    Sid: 'AssumeOwnFilePublishingRole', Effect: 'Allow', Action: ['sts:AssumeRole', 'sts:TagSession'],
+                    Resource: sub(iamArn(`role/${n.filePublishingRole}`)),
                   },
                   // Resource "*": sts:GetCallerIdentity has no resource type.
                   { Sid: 'WhoAmI', Effect: 'Allow', Action: 'sts:GetCallerIdentity', Resource: '*' },
