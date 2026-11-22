@@ -101,7 +101,9 @@ function child(path, key) {
  */
 function resolveRef(ref) {
   const prefix = '#/definitions/';
-  const target = ref.startsWith(prefix) ? schema.definitions?.[ref.slice(prefix.length)] : undefined;
+  const name = ref.slice(prefix.length);
+  const definitions = schema.definitions ?? {};
+  const target = ref.startsWith(prefix) && Object.hasOwn(definitions, name) ? definitions[name] : undefined;
   if (!target) throw new Error(`schema: unresolved $ref ${ref}`);
   return target;
 }
@@ -149,12 +151,12 @@ function check(value, node, path, problems) {
   if (typeOf(value) === 'object') {
     const object = /** @type {Record<string, unknown>} */ (value);
     for (const key of node.required ?? []) {
-      if (!(key in object)) problems.push(`${at}: missing required key "${key}"`);
+      if (!Object.hasOwn(object, key)) problems.push(`${at}: missing required key "${key}"`);
     }
     const properties = node.properties ?? {};
     for (const [key, item] of Object.entries(object)) {
       if (node.propertyNames) check(key, node.propertyNames, `${child(path, key)} (name)`, problems);
-      if (key in properties) {
+      if (Object.hasOwn(properties, key)) {
         check(item, properties[key], child(path, key), problems);
       } else if (node.additionalProperties === false) {
         problems.push(`${child(path, key)}: unknown key`);

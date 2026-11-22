@@ -94,6 +94,17 @@ test('shu-9wa: unknown keys are refused at every level', () => {
   assert.ok(problems.includes('apps[0].server.port: unknown key'), problems.join('\n'));
 });
 
+test('shu-9wa: Object.prototype names are unknown keys, not known ones', () => {
+  const c = example();
+  Object.defineProperty(c, 'constructor', { value: 1, enumerable: true });
+  c.aws.toString = 'x';
+  const { problems } = validateConfig(c);
+  assert.ok(problems.includes('constructor: unknown key'), problems.join('\n'));
+  assert.ok(problems.includes('aws.toString: unknown key'), problems.join('\n'));
+  const parsed = JSON.parse(JSON.stringify(example()).replace('"configure":', '"__proto__": 1, "configure":'));
+  assert.ok(validateConfig(parsed).problems.includes('apps[0].server.__proto__: unknown key'), validateConfig(parsed).problems.join('\n'));
+});
+
 test('shu-9wa: missing commands are refused', () => {
   const cases: Array<[(c: Loose) => void, RegExp]> = [
     [(c) => { delete c.apps[0].build.run; }, /^apps\[0\]\.build: missing required key "run"$/],
