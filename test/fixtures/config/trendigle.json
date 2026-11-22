@@ -1,0 +1,28 @@
+{
+  "$schema": "https://raw.githubusercontent.com/rummykhan/shukka/v1/schema/shukka.schema.json",
+  "project": "trendigle",
+  "qualifier": "trendigle",
+  "aws": { "account": "818221194501", "region": "us-east-1" },
+  "node": "22",
+  "checks": [
+    { "name": "app",   "dir": "implementation/app",   "run": ["npm ci", "npm run lint", "npm run typecheck", "npm test", "npm run build"], "services": ["dynamodb-local"] },
+    { "name": "admin", "dir": "implementation/admin", "run": ["npm ci", "npm run lint", "npm run typecheck", "npm test", "npm run build"], "services": ["dynamodb-local"] }
+  ],
+  "infra": { "dir": "implementation/infra", "paths": ["implementation/infra/**", "implementation/app/src/core/tables.json"] },
+  "apps": [
+    {
+      "name": "app",
+      "paths": ["implementation/app/**"],
+      "build": { "dir": "implementation/app", "run": ["npm ci", "npm run build"], "bundle": "scripts/bundle.sh", "env": { "APP_URL": "https://trendigle.com" }, "buildEnv": ["LEGAL_ENTITY", "CONTACT_EMAIL"] },
+      "server": { "configure": "implementation/infra/box/configure-app.sh", "units": ["trendigle", "trendigle-tick"], "health": "http://127.0.0.1:3200/login" }
+    },
+    {
+      "name": "admin",
+      "paths": ["implementation/admin/**"],
+      "build": { "dir": "implementation/admin", "run": ["npm ci", "npm run build"], "bundle": "scripts/bundle.sh" },
+      "server": { "configure": "implementation/infra/box/configure-admin.sh", "units": ["trendigle-admin"], "health": "http://127.0.0.1:3201/login" }
+    }
+  ],
+  "smoke": { "run": "bash implementation/infra/smoke.sh" },
+  "alwaysDeploy": false
+}

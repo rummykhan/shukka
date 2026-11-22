@@ -14,7 +14,7 @@ Run from the repo root.
 |---|---|
 | Install | `npm ci` (Node 22) |
 | Local services | Docker, for the release-script tests only (`docker info` must work) |
-| Gate | `npm run gate` = `npm run lint && npm run typecheck && npm test && actionlint && shellcheck box/*.sh scripts/*.sh` (the first task defines these scripts; until then the gate is `actionlint` on workflows present) |
+| Gate | `npm run gate` = `npm run lint && npm run typecheck && npm test && npm run actionlint && npm run shellcheck`; shellcheck runs via `find box scripts -name '*.sh' -type f -exec shellcheck {} +`; typecheck covers `lib/`, `test/` and `scripts/**/*.mjs` (JSDoc types, `checkJs`) |
 | Run locally | `node bin/shukka --help`; workflows only run on GitHub |
 | Worktree setup | `npm ci`. Nothing is shared between worktrees except Docker; container names in tests carry the worktree's task id |
 | Deploy | Tag a release (`vX.Y.Z` and move `v1`) after CI is green on main. Consumers pick it up by pin |
