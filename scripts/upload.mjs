@@ -12,10 +12,12 @@
 //   node scripts/upload.mjs --dir <bundle-dir> --bucket <bucket> --sha <sha>
 //        (--config <shukka.json> --app <name> | --project <p> --app <a>) [--region <r>]
 //   With --config, project and region come from the config.
-//   Prints s3://<bucket>/<key> on the last line of stdout.
+//   Prints the tarball's sha256 (for release.mjs --bundle-sha256) as "sha256 <hex>" and
+//   s3://<bucket>/<key> on the last line of stdout.
 //   exit 0: uploaded; exit 1: refused or failed (one line per problem on stderr); exit 2: usage error
 
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { lstatSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, sep } from 'node:path';
@@ -33,7 +35,7 @@ export const REGION_RE = /^[a-z]{2}(-[a-z]+)+-[0-9]+$/;
 /**
  * @typedef {{ send(command: PutObjectCommand): Promise<unknown> }} S3Like
  * @typedef {{ dir: string, bucket: string, project: string, app: string, sha: string, region?: string, s3?: S3Like }} UploadOptions
- * @typedef {{ bucket: string, key: string, url: string, bytes: number }} UploadResult
+ * @typedef {{ bucket: string, key: string, url: string, bytes: number, sha256: string }} UploadResult
  */
 
 /**
@@ -183,7 +185,7 @@ export async function upload(options) {
     const key = bundleKey(project, app, sha);
     const s3 = options.s3 ?? new S3Client(options.region ? { region: options.region } : {});
     await s3.send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: body, ContentType: 'application/gzip' }));
-    return { bucket, key, url: `s3://${bucket}/${key}`, bytes: body.length };
+    return { bucket, key, url: `s3://${bucket}/${key}`, bytes: body.length, sha256: createHash('sha256').update(body).digest('hex') };
   } finally {
     rmSync(work, { recursive: true, force: true });
   }
@@ -262,7 +264,7 @@ export async function main(argv, deps = {}) {
       ...(region !== undefined ? { region } : {}),
       ...(deps.s3 ? { s3: deps.s3 } : {}),
     });
-    (deps.out ?? ((text) => process.stdout.write(text)))(`uploaded ${result.bytes} bytes\n${result.url}\n`);
+    (deps.out ?? ((text) => process.stdout.write(text)))(`uploaded ${result.bytes} bytes\nsha256 ${result.sha256}\n${result.url}\n`);
     return 0;
   } catch (error) {
     process.stderr.write(`${/** @type {Error} */ (error).message}\n`);

@@ -311,6 +311,7 @@ jobs:
           echo "skip=$skip" >>"$GITHUB_OUTPUT"
 
       - name: Upload the bundle
+        id: upload
         if: steps.order.outputs.skip != 'true'
         env:
           APP: ${{ matrix.app }}
@@ -319,8 +320,13 @@ jobs:
         run: |
           set -euo pipefail
           sha=$(git -C project rev-parse HEAD)
-          node .shukka/scripts/upload.mjs --dir "$RUNNER_TEMP/shukka-bundle/$APP" --bucket "$BUCKET" --sha "$sha" \
-            --config "project/$CONFIG" --app "$APP"
+          out=$(node .shukka/scripts/upload.mjs --dir "$RUNNER_TEMP/shukka-bundle/$APP" --bucket "$BUCKET" --sha "$sha" \
+            --config "project/$CONFIG" --app "$APP")
+          printf '%s\n' "$out"
+          # The tarball's sha256, so the server refuses any other object found under its key.
+          bundle_sha256=$(printf '%s\n' "$out" | sed -n 's/^sha256 \([0-9a-f]\{64\}\)$/\1/p')
+          [ -n "$bundle_sha256" ] || { echo "::error::shukka: upload.mjs printed no sha256"; exit 1; }
+          echo "bundle_sha256=$bundle_sha256" >>"$GITHUB_OUTPUT"
 
       # release.mjs sends box/shukka-release.sh from this shukka checkout to the instances tagged
       # Project=<project> (InstanceIds resolved from the tag), waits, prints each server's output and
@@ -331,8 +337,9 @@ jobs:
           APP: ${{ matrix.app }}
           CONFIG: ${{ inputs.config }}
           BUCKET: ${{ needs.changes.outputs.bucket }}
+          BUNDLE_SHA256: ${{ steps.upload.outputs.bundle_sha256 }}
         run: |
           set -euo pipefail
           sha=$(git -C project rev-parse HEAD)
           node .shukka/scripts/release.mjs --bucket "$BUCKET" --sha "$sha" --checkout project \
-            --config "project/$CONFIG" --app "$APP"
+            --config "project/$CONFIG" --app "$APP" --bundle-sha256 "$BUNDLE_SHA256"

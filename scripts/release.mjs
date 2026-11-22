@@ -8,16 +8,20 @@
 // --checkout (git's HEAD, not the working tree, so nothing unpacked over the checkout can stand in
 // for it) at the config's server.configure path, uploaded to
 // s3://<bucket>/<project>/<app>/<sha>.configure.sh, and that key is passed as --configure-key.
+// The script refuses a hook or bundle that is not what was uploaded: the hook's sha256 is passed as
+// --configure-sha256 and the bundle's (from upload.mjs) as --bundle-sha256.
 //
 // CLI:
 //   node scripts/release.mjs --bucket <bucket> --sha <sha> --checkout <git-checkout>
 //        (--config <shukka.json> --app <name>
 //         | --project <p> --app <a> --region <r> --configure <path> --units "u1 u2" --health <url>)
+//        --bundle-sha256 <sha256 of the uploaded tarball, printed by upload.mjs>
 //        [--keep 5] [--health-timeout 60] [--timeout <seconds>] [--script <path>]
 //   exit 0: live on every instance; 10 to 13: the release script's code (see EXIT_MESSAGES);
 //   1: any other failure; 2: usage error
 
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { readFileSync, realpathSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -43,12 +47,13 @@ const TERMINAL = new Set(['Success', 'Failed', 'Cancelled', 'TimedOut']);
 const UNIT_RE = /^[A-Za-z0-9@._:-]+$/;
 const HEALTH_RE = /^https?:\/\/[^\s/?#]+([/?#]\S*)?$/;
 const CONFIGURE_RE = /^[A-Za-z0-9._/-]+$/;
+const SHA256_RE = /^[0-9a-f]{64}$/;
 
 /**
  * @typedef {{ send(command: any): Promise<any> }} AwsLike
  * @typedef {{
  *   project: string, app: string, sha: string, bucket: string, region: string,
- *   units: string[], health: string, keep?: number, healthTimeout?: number,
+ *   units: string[], health: string, keep?: number, healthTimeout?: number, bundleSha256?: string,
  * }} ReleaseArgs
  * @typedef {ReleaseArgs & {
  *   checkout: string, configure: string,
@@ -87,6 +92,7 @@ export function checkArgs(args) {
   if (args.units.length === 0) problems.push('units: at least one unit is needed');
   for (const unit of args.units) if (!UNIT_RE.test(unit)) problems.push(`units: "${unit}" is not a unit name`);
   if (!HEALTH_RE.test(args.health)) problems.push(`health: "${args.health}" is not an http(s) URL`);
+  if (!SHA256_RE.test(args.bundleSha256 ?? '')) problems.push('bundle-sha256: the sha256 of the uploaded bundle must be 64 lowercase hex characters');
   // Run Command resolves {{ssm:...}} in its parameters with the caller's role: a value carrying
   // one would put a parameter (possibly a secret) on the server's command line.
   for (const [name, value] of [['health', args.health], ['units', args.units.join(' ')]]) {
@@ -160,9 +166,10 @@ export function readHook(checkout, configure, sha) {
 /**
  * The arguments for box/shukka-release.sh, in the contract's order.
  * @param {ReleaseArgs} args
+ * @param {string} configureSha256 sha256 (hex) of the hook uploaded to the --configure-key object
  * @returns {string[]}
  */
-export function scriptArgs(args) {
+export function scriptArgs(args, configureSha256) {
   return [
     '--project', args.project,
     '--app', args.app,
@@ -170,6 +177,8 @@ export function scriptArgs(args) {
     '--bucket', args.bucket,
     '--region', args.region,
     '--configure-key', hookKey(args.project, args.app, args.sha),
+    '--configure-sha256', configureSha256,
+    '--bundle-sha256', String(args.bundleSha256),
     '--units', args.units.join(' '),
     '--health', args.health,
     ...(args.keep !== undefined ? ['--keep', String(args.keep)] : []),
@@ -352,7 +361,7 @@ export async function release(options) {
     InstanceIds: instanceIds,
     Comment: `shukka release ${options.project}/${options.app} ${options.sha}`.slice(0, 100),
     Parameters: {
-      commands: buildCommands(script, scriptArgs(options)),
+      commands: buildCommands(script, scriptArgs(options, createHash('sha256').update(hook).digest('hex'))),
       executionTimeout: [String(timeoutSeconds)],
     },
   }));
@@ -390,9 +399,9 @@ export async function release(options) {
 
 const USAGE = 'usage: node scripts/release.mjs --bucket <bucket> --sha <sha> --checkout <git-checkout> '
   + '(--config <shukka.json> --app <name> | --project <p> --app <a> --region <r> --configure <path> --units "u1 u2" --health <url>) '
-  + '[--keep 5] [--health-timeout 60] [--timeout <seconds>] [--script <path>]';
+  + '--bundle-sha256 <hex> [--keep 5] [--health-timeout 60] [--timeout <seconds>] [--script <path>]';
 
-const FLAGS = ['bucket', 'sha', 'checkout', 'config', 'app', 'project', 'region', 'configure', 'units', 'health', 'keep', 'health-timeout', 'timeout', 'script'];
+const FLAGS = ['bucket', 'sha', 'checkout', 'config', 'app', 'project', 'region', 'configure', 'units', 'health', 'keep', 'health-timeout', 'timeout', 'script', 'bundle-sha256'];
 
 /**
  * @param {string | undefined} value
@@ -437,7 +446,7 @@ export async function main(argv, deps = {}) {
     units = app.server.units.join(' ');
     health = app.server.health;
   }
-  const missing = ['bucket', 'sha', 'checkout', 'app'].filter((name) => v[name] === undefined);
+  const missing = ['bucket', 'sha', 'checkout', 'app', 'bundle-sha256'].filter((name) => v[name] === undefined);
   if (project === undefined) missing.push('project');
   if (region === undefined) missing.push('region');
   if (configure === undefined) missing.push('configure');
@@ -465,6 +474,7 @@ export async function main(argv, deps = {}) {
       configure: /** @type {string} */ (configure),
       units: /** @type {string} */ (units).split(/\s+/).filter(Boolean),
       health: /** @type {string} */ (health),
+      bundleSha256: /** @type {string} */ (v['bundle-sha256']),
       ...(keep !== undefined ? { keep } : {}),
       ...(healthTimeout !== undefined ? { healthTimeout } : {}),
       ...(timeoutSeconds !== undefined ? { timeoutSeconds } : {}),

@@ -508,6 +508,7 @@ export async function deployCommand(options) {
       const released = await release({
         project: config.project, app: app.name, sha, bucket, region: config.aws.region,
         checkout: tree, configure: app.server.configure, units: app.server.units, health: app.server.health,
+        bundleSha256: uploaded.sha256,
         s3: clients.s3, ssm: clients.ssm, ec2: clients.ec2, out: io.out,
       });
       if (!released.ok) throw new CliError(`release of ${app.name} failed`, released.code);
