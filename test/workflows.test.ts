@@ -915,7 +915,7 @@ test('shu-9zr: only pushes to main and runs by hand on main deploy; by hand else
   assert.match(branch.out, /^::notice::shukka: deploys run only on main; workflow_dispatch on refs\/heads\/feature runs plan and checks only$/m);
 });
 
-test('shu-9zr: ec2 release unpacks the artifact outside both checkouts, uploads it and releases with the hook from git', async () => {
+test('shu-9zr, shu-9bj.7: ec2 release unpacks the artifact outside both checkouts, uploads it and releases with the hook from git and the upload\'s --bundle-sha256', async () => {
   const ws = workspace();
   // The artifact as build uploads it: a tarball of the bundle directory.
   const bundleDir = join(ws.temp, 'built');

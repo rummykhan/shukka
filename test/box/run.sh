@@ -431,6 +431,23 @@ case_planted_previous_removed() {
   expect_last "shukka: demo/web aaaaaaa -> bbbbbbb live"
 }
 
+case_current_dir_kept() {
+  # current (or previous) as a real directory, as an app user may have it before shukka: never
+  # deleted, the release refuses over it.
+  local l
+  for l in current previous; do
+    x "rm -rf /opt/demo && install -d -o app -g app -m 755 /opt/demo /opt/demo/web /opt/demo/web/$l"
+    x "runuser -u app -- bash -c 'echo app-data >/opt/demo/web/$l/server.js'"
+    bundle demo web aaaaaaa 8101 unhealthy
+    release web aaaaaaa 8101
+    expect_rc 10
+    expect_last "shukka: demo/web none -> aaaaaaa download-failed"
+    printf '%s\n' "$OUT" | grep -q "/opt/demo/web/$l is not a symlink; refusing to release over it" || fail "$l: not reported"
+    expect_eq "$l contents survive" "$(x "cat /opt/demo/web/$l/server.js")" "app-data"
+    x "test ! -e /opt/demo/web/releases/aaaaaaa" || fail "$l: a release was unpacked"
+  done
+}
+
 case_rollback_hook_checked() {
   # A root-owned release whose kept hook is not root:root 0700 (or a symlink, or a group-writable
   # release dir) is restarted as it is, never configured with that hook.
@@ -531,6 +548,7 @@ cases=(
   "shu-766: redeploying the sha previous points at never leaves previous dangling|case_redeploy_previous_kept"
   "shu-766: the app user cannot swap the app directory during the download to run its own hook|case_app_dir_swap_during_download"
   "shu-9bj.7: a release, hook and current/previous planted by the app user are removed before anything runs; the planted hook never runs as root|case_planted_previous_removed"
+  "shu-9bj.7: a current or previous that is a real directory owned by the app user is never deleted; the release refuses with exit 10|case_current_dir_kept"
   "shu-9bj.7: a rollback hook runs only when it is a regular root:root 0700 file and the release dir is root's and not group/other-writable|case_rollback_hook_checked"
   "shu-9bj.7: a rollback target outside releases/<hex sha> is never rolled back to and its hook never runs|case_rollback_target_checked"
   "shu-9bj.7: a hook or bundle swapped in S3 (digest differs) is refused with exit 10 and nothing changes|case_digests_checked"

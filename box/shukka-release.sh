@@ -177,7 +177,9 @@ for l in "$base/current" "$base/previous"; do
   [ -e "$l" ] || [ -L "$l" ] || continue
   t=$(target_of "$l")
   if [ -L "$l" ] && [[ $t =~ ^$releases/[0-9a-f]{7,40}$ ]] && [ -d "$t" ] && [ ! -L "$t" ]; then continue; fi
-  if [ ! -L "$l" ] && [ "$(stat -c '%u' -- "$l")" = 0 ]; then
+  # Whatever is not a symlink (a directory or file, whoever owns it) may hold the app's own data:
+  # never delete it, refuse instead.
+  if [ ! -L "$l" ]; then
     say "$l is not a symlink; refusing to release over it"
     finish 10 download-failed
   fi
