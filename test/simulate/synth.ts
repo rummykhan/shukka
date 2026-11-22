@@ -16,6 +16,7 @@ export interface SynthInputs {
 export interface SynthesizedFence {
   executionA: PolicyDocumentJson;
   executionB: PolicyDocumentJson;
+  executionC: PolicyDocumentJson;
   boundary: PolicyDocumentJson;
 }
 
@@ -39,6 +40,6 @@ export function synthFence(inputs: SynthInputs): SynthesizedFence {
     if (!doc) throw new Error(`no managed policy named ${name} in the template`);
     return doc;
   };
-  const [a, b] = executionPolicyNames(inputs.project);
-  return { executionA: get(a), executionB: get(b), boundary: get(boundaryPolicyName(inputs.project)) };
+  const [a, b, c] = executionPolicyNames(inputs.project);
+  return { executionA: get(a), executionB: get(b), executionC: get(c), boundary: get(boundaryPolicyName(inputs.project)) };
 }

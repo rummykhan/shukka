@@ -1,6 +1,6 @@
 // The per-project fence (design D5, spike S2): a permissions boundary for every role the project's stacks create,
-// and the execution policy of the project's CloudFormation execution role, split in two managed policies because
-// a managed policy holds at most 6,144 characters. A port of docs/factory/v1/spikes/s2/policy.py. Where the spike
+// and the execution policy of the project's CloudFormation execution role, split in three managed policies
+// (data and services, EC2, IAM) because a managed policy holds at most 6,144 characters. A port of docs/factory/v1/spikes/s2/policy.py. Where the spike
 // left a hole, the statement differs from the spike and says so ("Spike hole:"); test/fence.test.ts lists each
 // difference and test/simulate/run.mjs has a case proving the hole is closed.
 //
@@ -47,8 +47,10 @@ export interface PolicyDocumentJson {
 export interface FenceDocuments {
   /** Execution policy, part one: the project's data and services. */
   readonly executionA: PolicyDocumentJson;
-  /** Execution policy, part two: EC2 and IAM. */
+  /** Execution policy, part two: EC2. */
   readonly executionB: PolicyDocumentJson;
+  /** Execution policy, part three: IAM (the project's roles and instance profiles, and the boundary's protection). */
+  readonly executionC: PolicyDocumentJson;
   /** The permissions boundary on every role the project's stacks create. */
   readonly boundary: PolicyDocumentJson;
 }
@@ -58,9 +60,9 @@ export function boundaryPolicyName(project: string): string {
   return `${project}-shukka-boundary`;
 }
 
-/** Names of the two execution managed policies, in the order `cdk bootstrap` takes them. */
-export function executionPolicyNames(project: string): [string, string] {
-  return [`${project}-shukka-execution`, `${project}-shukka-execution-infra`];
+/** Names of the three execution managed policies, in the order `cdk bootstrap` takes them. */
+export function executionPolicyNames(project: string): [string, string, string] {
+  return [`${project}-shukka-execution`, `${project}-shukka-execution-infra`, `${project}-shukka-execution-iam`];
 }
 
 /**
@@ -74,29 +76,38 @@ export function infraRoleName(project: string): string {
 const PROJECT_RE = /^[a-z][a-z0-9-]{1,20}$/;
 const QUALIFIER_RE = /^[a-z0-9]{1,10}$/;
 const DOMAIN_RE = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$/i;
+const HOSTED_ZONE_RE = /^Z[A-Z0-9]{1,32}$/;
 const AMI_OWNER_RE = /^(?:amazon|aws-marketplace|\d{12})$/;
 
 /** Throws when an input would widen or break the fence (a wildcard, a name that is not a plain prefix). */
-export function validateFenceInputs(inputs: Pick<FenceInputs, 'project' | 'qualifier' | 'sesDomains' | 'amiOwners'>): void {
+export function validateFenceInputs(
+  inputs: Pick<FenceInputs, 'project' | 'qualifier' | 'sesDomains' | 'amiOwners' | 'hostedZoneId'> & { account?: string },
+): void {
   if (!PROJECT_RE.test(inputs.project)) {
     throw new Error(`shukka: project name ${JSON.stringify(inputs.project)} must match ${PROJECT_RE}`);
   }
   if (!QUALIFIER_RE.test(inputs.qualifier)) {
     throw new Error(`shukka: qualifier ${JSON.stringify(inputs.qualifier)} must match ${QUALIFIER_RE}`);
   }
+  if (!HOSTED_ZONE_RE.test(inputs.hostedZoneId)) {
+    throw new Error(`shukka: hosted zone id ${JSON.stringify(inputs.hostedZoneId)} must match ${HOSTED_ZONE_RE}`);
+  }
   for (const d of inputs.sesDomains) {
     if (!DOMAIN_RE.test(d)) throw new Error(`shukka: mail domain ${JSON.stringify(d)} must be a plain domain name, no wildcards`);
   }
   for (const o of inputs.amiOwners ?? []) {
     if (!AMI_OWNER_RE.test(o)) throw new Error(`shukka: AMI owner ${JSON.stringify(o)} must be amazon, aws-marketplace or an account id`);
+    // The project's own account is shared with other projects; its private AMIs are not the project's to launch.
+    if (o === inputs.account) throw new Error(`shukka: AMI owner ${o} is the stack's own account; private AMIs in a shared account are refused`);
   }
 }
 
 const INFRA_SIDS = new Set([
-  'EC2Read', 'EC2LaunchTagged', 'EC2CreateTagged', 'EC2RunInstancesSupporting', 'EC2RunInstancesImages', 'EC2UseOwnTagged',
-  'EC2TagOnCreate', 'EC2ChangeOwn', 'EC2ProjectTagIsFixed', 'EC2AssociateToOwnInstance', 'IAMOwnRoles', 'IAMBoundedWrites',
-  'IAMPassOwnRoles', 'IAMInstanceProfiles', 'IAMReadOIDC', 'NoEscapeFromBoundary',
+  'EC2Read', 'EC2DescribeOwnInstancesOnly', 'EC2NoSpotRequests', 'EC2RunInstancesInterfaces', 'EC2LaunchTagged', 'EC2CreateTagged', 'EC2RunInstancesSupporting', 'EC2RunInstancesImages', 'EC2UseOwnTagged',
+  'EC2TagOnCreate', 'EC2ChangeOwn', 'EC2ProjectTagIsFixed', 'EC2AssociateToOwnInstance',
 ]);
+
+const IAM_SIDS = new Set(['IAMOwnRoles', 'IAMBoundedWrites', 'IAMPassOwnRoles', 'IAMInstanceProfiles', 'IAMReadOIDC', 'NoEscapeFromBoundary']);
 
 const DATA_SIDS = new Set(['DynamoDB', 'S3', 'Lambda', 'SQS', 'SNS', 'Alarms', 'Logs', 'Parameters']);
 
@@ -162,8 +173,15 @@ export function fenceDocuments(inputs: FenceInputs): FenceDocuments {
     // Spike hole: the spike also granted ec2:Get*, which includes GetPasswordData, GetConsoleOutput and
     // GetConsoleScreenshot on any instance. CloudFormation's handlers for the EC2 resources shukka supports
     // (instance, launch template, EIP, security group, volume) call no ec2:Get action, so none is granted.
-    // Resource "*": Describe* are reads of configuration; most have no resource type.
+    // Resource "*": Describe* are reads of configuration; most have no resource type. The ones that can return
+    // user data are denied below when they are not the project's (DescribeInstanceAttribute) or always (spot
+    // requests, which shukka does not use). DescribeLaunchTemplateVersions also returns user data but has no resource
+    // type, so it cannot be fenced, and CloudFormation's instance handler needs it: keep secrets out of user data.
     { Sid: 'EC2Read', Effect: 'Allow', Action: 'ec2:Describe*', Resource: '*' },
+    // Spike hole: DescribeInstanceAttribute (Attribute=userData) read another project's instance user data.
+    // Resource "*": a deny only takes away.
+    { Sid: 'EC2DescribeOwnInstancesOnly', Effect: 'Deny', Action: 'ec2:DescribeInstanceAttribute', Resource: '*', Condition: { StringNotEquals: { 'aws:ResourceTag/Project': P } } },
+    { Sid: 'EC2NoSpotRequests', Effect: 'Deny', Action: ['ec2:DescribeSpotInstanceRequests', 'ec2:DescribeSpotFleetRequests'], Resource: '*' },
     // Spike hole: the spike allowed these creates on "*" with the request tag, which for RunInstances also matched
     // another project's security groups and any AMI or snapshot. Each create is now limited to the resource type it
     // creates; what an instance uses is granted in the statements after.
@@ -175,12 +193,19 @@ export function fenceDocuments(inputs: FenceInputs): FenceDocuments {
     },
     {
       Sid: 'EC2RunInstancesSupporting', Effect: 'Allow', Action: ['ec2:RunInstances', 'ec2:CreateSecurityGroup'],
-      Resource: [ec2('subnet'), ec2('vpc'), ec2('network-interface'), ec2('volume'), ec2('launch-template'), ec2('key-pair')],
+      Resource: [ec2('subnet'), ec2('vpc'), ec2('volume'), ec2('key-pair')],
     },
+    // Spike hole: an instance could launch into another project's network interface. A new interface has no tags
+    // yet (IfExists); an existing one must be the project's.
+    { Sid: 'EC2RunInstancesInterfaces', Effect: 'Allow', Action: 'ec2:RunInstances', Resource: ec2('network-interface'), Condition: { StringEqualsIfExists: { 'aws:ResourceTag/Project': P } } },
     // Spike hole: image/* was open to any owner's AMI.
     { Sid: 'EC2RunInstancesImages', Effect: 'Allow', Action: 'ec2:RunInstances', Resource: `arn:aws:ec2:${region}::image/*`, Condition: { StringEquals: { 'ec2:Owner': [...amiOwners] } } },
-    // Spike hole: security-group/* for RunInstances was open to every project's groups; snapshots were open too.
-    { Sid: 'EC2UseOwnTagged', Effect: 'Allow', Action: ['ec2:RunInstances', 'ec2:CreateVolume'], Resource: [ec2('security-group'), `arn:aws:ec2:${region}::snapshot/*`], Condition: ownTag },
+    // Spike hole: security-group/* and launch-template/* for RunInstances were open to every project's; snapshots
+    // were open too.
+    {
+      Sid: 'EC2UseOwnTagged', Effect: 'Allow', Action: ['ec2:RunInstances', 'ec2:CreateVolume'],
+      Resource: [ec2('security-group'), ec2('launch-template'), `arn:aws:ec2:${region}::snapshot/*`], Condition: ownTag,
+    },
     // Resource "*": tags on a resource being created; fenced by ec2:CreateAction to the creates allowed above.
     { Sid: 'EC2TagOnCreate', Effect: 'Allow', Action: 'ec2:CreateTags', Resource: '*', Condition: { StringEquals: { 'ec2:CreateAction': ec2CreateActions } } },
     // Resource "*": EC2 ids carry no project name; fenced by the Project tag on the resource.
@@ -233,7 +258,7 @@ export function fenceDocuments(inputs: FenceInputs): FenceDocuments {
       Resource: arns((n) => `arn:aws:iam::${account}:instance-profile/${n}`),
     },
     { Sid: 'IAMReadOIDC', Effect: 'Allow', Action: ['iam:GetOpenIDConnectProvider'], Resource: `arn:aws:iam::${account}:oidc-provider/token.actions.githubusercontent.com` },
-    // Spike hole: the spike protected only the first execution policy.
+    // Spike hole: the spike protected only the first execution policy (now there are three).
     {
       Sid: 'NoEscapeFromBoundary', Effect: 'Deny',
       Action: ['iam:DeleteRolePermissionsBoundary', 'iam:CreatePolicyVersion', 'iam:DeletePolicy', 'iam:DeletePolicyVersion', 'iam:SetDefaultPolicyVersion'],
@@ -303,8 +328,9 @@ export function fenceDocuments(inputs: FenceInputs): FenceDocuments {
   ];
 
   return {
-    executionA: { Version: '2012-10-17', Statement: all.filter((st) => !INFRA_SIDS.has(st.Sid)) },
+    executionA: { Version: '2012-10-17', Statement: all.filter((st) => !INFRA_SIDS.has(st.Sid) && !IAM_SIDS.has(st.Sid)) },
     executionB: { Version: '2012-10-17', Statement: all.filter((st) => INFRA_SIDS.has(st.Sid)) },
+    executionC: { Version: '2012-10-17', Statement: all.filter((st) => IAM_SIDS.has(st.Sid)) },
     boundary: { Version: '2012-10-17', Statement: boundary },
   };
 }
@@ -323,14 +349,14 @@ export interface ShukkaBoundaryProps {
 }
 
 /**
- * The project's permissions boundary and the two managed policies of its CloudFormation execution role, in the
+ * The project's permissions boundary and the three managed policies of its CloudFormation execution role, in the
  * stack's account and region. `shukka bootstrap` deploys this, then runs `cdk bootstrap` with the execution
  * policies. Throws on an invalid project name, qualifier, mail domain or AMI owner.
  */
 export class ShukkaBoundary extends Construct {
   readonly boundaryPolicy: iam.ManagedPolicy;
   /** The execution policies, in the order `cdk bootstrap --cloudformation-execution-policies` takes them. */
-  readonly executionPolicies: [iam.ManagedPolicy, iam.ManagedPolicy];
+  readonly executionPolicies: [iam.ManagedPolicy, iam.ManagedPolicy, iam.ManagedPolicy];
 
   constructor(scope: Construct, id: string, props: ShukkaBoundaryProps) {
     super(scope, id);
@@ -344,11 +370,15 @@ export class ShukkaBoundary extends Construct {
       sesDomains: props.sesDomains,
       amiOwners: props.amiOwners,
     });
-    const [execA, execB] = executionPolicyNames(props.project);
+    const [execA, execB, execC] = executionPolicyNames(props.project);
     const policy = (cid: string, name: string, doc: PolicyDocumentJson) =>
       new iam.ManagedPolicy(this, cid, { managedPolicyName: name, document: iam.PolicyDocument.fromJson(doc) });
     this.boundaryPolicy = policy('Boundary', boundaryPolicyName(props.project), docs.boundary);
-    this.executionPolicies = [policy('ExecutionA', execA, docs.executionA), policy('ExecutionB', execB, docs.executionB)];
+    this.executionPolicies = [
+      policy('ExecutionA', execA, docs.executionA),
+      policy('ExecutionB', execB, docs.executionB),
+      policy('ExecutionC', execC, docs.executionC),
+    ];
   }
 }
 

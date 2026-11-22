@@ -24,7 +24,7 @@ const d = synthFence({
   sesDomains: ['trendigle.com', 'mail.trendigle.com'],
 });
 const BOUNDARY = `arn:aws:iam::${A}:policy/trendigle-shukka-boundary`;
-const EX = [d.executionA, d.executionB];
+const EX = [d.executionA, d.executionB, d.executionC];
 const ALLOW_ALL = { Version: '2012-10-17', Statement: [{ Effect: 'Allow', Action: '*', Resource: '*' }] };
 const T = { 'aws:ResourceTag/Project': 'trendigle' };
 const O = { 'aws:ResourceTag/Project': 'orbitary' };
@@ -139,8 +139,20 @@ const extra = [
   ['exec', 'explicitDeny', 'ec2:DeleteTags', `arn:aws:ec2:${R}:${A}:instance/i-07c0a9b38ff703056`, { ...T, 'aws:TagKeys': ['Project'] }],
   ['exec', 'allowed', 'ec2:CreateTags', `arn:aws:ec2:${R}:${A}:instance/i-07c0a9b38ff703056`, { ...T, 'aws:TagKeys': ['Project'], 'aws:RequestTag/Project': 'trendigle' }],
   ['exec', 'allowed', 'ec2:CreateTags', `arn:aws:ec2:${R}:${A}:instance/i-07c0a9b38ff703056`, { ...T, 'aws:TagKeys': ['Name'], 'aws:RequestTag/Name': 'box' }],
-  // 8. The second execution policy cannot be rewritten.
+  // 8. The second and third execution policies cannot be rewritten.
   ['exec', 'explicitDeny', 'iam:CreatePolicyVersion', `arn:aws:iam::${A}:policy/trendigle-shukka-execution-infra`],
+  ['exec', 'explicitDeny', 'iam:CreatePolicyVersion', `arn:aws:iam::${A}:policy/trendigle-shukka-execution-iam`],
+  // 9. No user data from other projects' instances (DescribeInstanceAttribute), nor from spot requests.
+  ['exec', 'explicitDeny', 'ec2:DescribeInstanceAttribute', `arn:aws:ec2:${R}:${A}:instance/i-0orbitary`, O],
+  ['exec', 'explicitDeny', 'ec2:DescribeInstanceAttribute', `arn:aws:ec2:${R}:${A}:instance/i-0untagged`],
+  ['exec', 'allowed', 'ec2:DescribeInstanceAttribute', `arn:aws:ec2:${R}:${A}:instance/i-07c0a9b38ff703056`, T],
+  ['exec', 'explicitDeny', 'ec2:DescribeSpotInstanceRequests', '*'],
+  ['exec', 'allowed', 'ec2:DescribeInstances', '*'],
+  // 10. RunInstances: launch templates only the project's; existing network interfaces only the project's.
+  ['exec', 'implicitDeny', 'ec2:RunInstances', `arn:aws:ec2:${R}:${A}:launch-template/lt-0orbitary`, O],
+  ['exec', 'allowed', 'ec2:RunInstances', `arn:aws:ec2:${R}:${A}:launch-template/lt-0trendigle`, T],
+  ['exec', 'implicitDeny', 'ec2:RunInstances', `arn:aws:ec2:${R}:${A}:network-interface/eni-0orbitary`, O],
+  ['exec', 'allowed', 'ec2:RunInstances', `arn:aws:ec2:${R}:${A}:network-interface/*`],
 ];
 
 async function simulate([who, , action, resource, ctx]) {
