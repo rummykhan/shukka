@@ -445,7 +445,8 @@ jobs:
           mkdir -p -- "$RUNNER_TEMP/cdk.out"
           tar -xzf "$RUNNER_TEMP/shukka-assembly/cdk.out.tgz" -C "$RUNNER_TEMP/cdk.out" --no-same-owner --no-same-permissions
           node .shukka/scripts/assembly.mjs check "$RUNNER_TEMP/cdk.out"
-          echo "stacks=$(node .shukka/scripts/assembly.mjs stacks "$RUNNER_TEMP/cdk.out")" >>"$GITHUB_OUTPUT"
+          stacks=$(node .shukka/scripts/assembly.mjs stacks "$RUNNER_TEMP/cdk.out")
+          echo "stacks=$stacks" >>"$GITHUB_OUTPUT"
 
       - name: Assume the infra role
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
@@ -527,7 +528,9 @@ jobs:
 
       # cdk deploy --tags replaces a stack's own tags, so each stack gets its synthesized tags plus
       # shukka:revision. Stacks with the same tags deploy together; otherwise one by one in
-      # dependency order.
+      # dependency order. Nothing from the assembly may become a cdk option: each tag is one
+      # --tags=k=v token, and every stack selector is checked again (assembly.mjs SELECTOR) before
+      # cdk starts.
       - name: Deploy
         id: deploy
         if: steps.order.outputs.skip != 'true'
@@ -544,7 +547,15 @@ jobs:
           const { artifacts = {} } = JSON.parse(readFileSync(join(assembly, 'manifest.json'), 'utf8'));
           const stacks = Object.entries(artifacts).filter(([, a]) => a.type === 'aws:cloudformation:stack');
           const ids = new Set(stacks.map(([id]) => id));
-          const tagArgs = (a) => Object.entries({ ...(a.properties?.tags ?? {}), 'shukka:revision': sha }).flatMap(([k, v]) => ['--tags', `${k}=${v}`]);
+          const tagArgs = (a) => Object.entries({ ...(a.properties?.tags ?? {}), 'shukka:revision': sha }).map(([k, v]) => `--tags=${k}=${v}`);
+          const selector = (id) => artifacts[id].displayName ?? id;
+          for (const [id] of stacks) {
+            const s = selector(id);
+            if (typeof s !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9/_.-]*$/.test(s)) {
+              console.log(`::error::shukka: refusing stack selector ${JSON.stringify(s)}: it could be read as a cdk option`);
+              process.exit(1);
+            }
+          }
           const deploy = (args) => {
             const r = spawnSync(process.env.CDK, ['deploy', '--app', assembly, '--require-approval', 'never', '--no-color', ...args], { stdio: 'inherit' });
             if (r.status !== 0) {
@@ -564,7 +575,7 @@ jobs:
               seen.add(id);
               const a = artifacts[id];
               for (const dep of a.dependencies ?? []) if (ids.has(dep)) visit(dep, seen);
-              deploy(['--exclusively', a.displayName ?? id, ...tagArgs(a)]);
+              deploy(['--exclusively', selector(id), ...tagArgs(a)]);
               done.add(id);
             };
             for (const [id] of stacks) visit(id);

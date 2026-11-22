@@ -13,15 +13,30 @@
 //   - an asset source path, template file, asset manifest file, nested assembly directory or a
 //     template's `aws:asset:path` metadata that is absolute or climbs out with `..`;
 //   - a symbolic link in the assembly whose target lies outside it.
+// Stack artifacts (in every manifest) also name things the deploy step hands to cdk on its command line, so
+// none of them may be read as an option or break a line of GITHUB_OUTPUT:
+//   - an id or displayName (the stack selector) not matching SELECTOR;
+//   - a stackName (or, without one, the id) not matching STACK_NAME;
+//   - tags that are not an object of strings, or a key or value that starts with -, breaks CloudFormation's
+//     tag rules (key 1-128 characters, not aws:..., value at most 256, letters, digits, spaces and _ . : / = + - @)
+//     or, for a key, contains = (cdk splits --tags=k=v at the first =).
 //
 // CLI:
 //   node scripts/assembly.mjs check <dir>    exit 0: safe; exit 1: refused, one line per problem
-//   node scripts/assembly.mjs stacks <dir>   prints the top-level stacks' CloudFormation names, comma-separated
+//   node scripts/assembly.mjs stacks <dir>   prints the top-level stacks' CloudFormation names, comma-separated;
+//                                            exit 1, printing nothing, when any is not a valid stack name
 //   exit 2: usage error
 
 import { lstatSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
 import { isAbsolute, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+/** What a stack's id or displayName must look like to be passed to cdk as a stack selector. */
+export const SELECTOR = /^[A-Za-z0-9][A-Za-z0-9/_.-]*$/;
+/** A CloudFormation stack name. */
+export const STACK_NAME = /^[A-Za-z][A-Za-z0-9-]{0,127}$/;
+// CloudFormation's tag characters, with only plain spaces (no line or paragraph separators).
+const TAG_CHARS = /^[\p{L}\p{Zs}\p{N}_.:/=+\-@]*$/u;
 
 /**
  * @param {string} path
@@ -96,6 +111,67 @@ function checkTemplate(template, where, problems) {
     const path = /** @type {any} */ (resource)?.Metadata?.['aws:asset:path'];
     if (path !== undefined && !staysInside(path)) problems.push(`assembly: ${where}: resource ${id} aws:asset:path must stay inside the assembly`);
   }
+}
+
+/**
+ * Problems with a stack's synthesized tags (`properties.tags`), which the deploy step passes as --tags=k=v.
+ * @param {unknown} tags
+ * @param {string} where
+ * @param {string} id
+ * @returns {string[]}
+ */
+export function tagProblems(tags, where, id) {
+  if (tags === undefined) return [];
+  const at = `assembly: ${where}: stack ${id}`;
+  if (!tags || typeof tags !== 'object' || Array.isArray(tags)) return [`${at}: tags must be an object of strings`];
+  /** @type {string[]} */
+  const problems = [];
+  for (const [key, value] of Object.entries(tags)) {
+    const k = JSON.stringify(key);
+    const length = [...key].length;
+    if (length < 1 || length > 128) problems.push(`${at}: tag key ${k} must be 1 to 128 characters`);
+    if (key.startsWith('-')) problems.push(`${at}: tag key ${k} starts with -`);
+    if (/^aws:/i.test(key)) problems.push(`${at}: tag key ${k} uses the reserved aws: prefix`);
+    if (key.includes('=')) problems.push(`${at}: tag key ${k} contains =`);
+    if (!TAG_CHARS.test(key)) problems.push(`${at}: tag key ${k} has characters CloudFormation tags do not allow`);
+    if (typeof value !== 'string') {
+      problems.push(`${at}: tag ${key} value ${JSON.stringify(value)} is not a string`);
+      continue;
+    }
+    const v = JSON.stringify(value);
+    if ([...value].length > 256) problems.push(`${at}: tag ${key} value ${v} must be at most 256 characters`);
+    if (value.startsWith('-')) problems.push(`${at}: tag ${key} value ${v} starts with -`);
+    if (!TAG_CHARS.test(value)) problems.push(`${at}: tag ${key} value ${v} has characters CloudFormation tags do not allow`);
+  }
+  return problems;
+}
+
+/**
+ * Problems with the names a stack artifact gives cdk and GITHUB_OUTPUT: its selector (id, displayName), its
+ * CloudFormation name and its tags.
+ * @param {string} id
+ * @param {any} artifact
+ * @param {string} where
+ * @returns {string[]}
+ */
+export function stackProblems(id, artifact, where) {
+  const at = `assembly: ${where}: stack ${JSON.stringify(id)}`;
+  /** @type {string[]} */
+  const problems = [];
+  if (!SELECTOR.test(id)) problems.push(`${at} is not a stack selector (${SELECTOR.source})`);
+  const name = `assembly: ${where}: stack ${SELECTOR.test(id) ? id : JSON.stringify(id)}`;
+  const display = artifact?.displayName;
+  if (display !== undefined && (typeof display !== 'string' || !SELECTOR.test(display))) {
+    problems.push(`${name} displayName ${JSON.stringify(display)} is not a stack selector (${SELECTOR.source})`);
+  }
+  const stackName = artifact?.properties?.stackName;
+  if (stackName !== undefined) {
+    if (typeof stackName !== 'string' || !STACK_NAME.test(stackName)) problems.push(`${name} stackName ${JSON.stringify(stackName)} is not a CloudFormation stack name (${STACK_NAME.source})`);
+  } else if (!STACK_NAME.test(id)) {
+    problems.push(`${name} has no stackName and its id is not a CloudFormation stack name (${STACK_NAME.source})`);
+  }
+  problems.push(...tagProblems(artifact?.properties?.tags, where, SELECTOR.test(id) ? id : JSON.stringify(id)));
+  return problems;
 }
 
 /**
@@ -198,6 +274,7 @@ export function checkAssembly(dir) {
         if (nested !== null) queue.push(nested);
       }
       if (a.type === 'aws:cloudformation:stack') {
+        problems.push(...stackProblems(id, a, where));
         for (const [path, entries] of Object.entries(a.metadata ?? {})) {
           if (Array.isArray(entries) && entries.some((e) => e?.type === 'aws:cdk:asset')) {
             problems.push(`assembly: ${where}: stack ${id} carries legacy asset metadata (aws:cdk:asset at ${path}); refused`);
@@ -210,15 +287,19 @@ export function checkAssembly(dir) {
 }
 
 /**
- * The CloudFormation names of the assembly's top-level stacks.
+ * The CloudFormation names of the assembly's top-level stacks. Throws when any is not a valid stack name, so
+ * nothing else (a comma, a newline, an option) reaches the workflow's `stacks` output.
  * @param {string} dir
  * @returns {string[]}
  */
 export function stackNames(dir) {
   const { artifacts = {} } = readJson(join(dir, 'manifest.json'));
-  return Object.entries(artifacts)
+  const names = Object.entries(artifacts)
     .filter(([, a]) => /** @type {any} */ (a).type === 'aws:cloudformation:stack')
     .map(([id, a]) => /** @type {any} */ (a).properties?.stackName ?? id);
+  const bad = names.filter((n) => typeof n !== 'string' || !STACK_NAME.test(n));
+  if (bad.length > 0) throw new Error(`${bad.map((n) => JSON.stringify(n)).join(', ')} is not a CloudFormation stack name (${STACK_NAME.source})`);
+  return names;
 }
 
 const USAGE = 'usage: node scripts/assembly.mjs check|stacks <dir>';

@@ -476,7 +476,7 @@ test('shu-5ix: deploy dry run prints the workflow steps in order: checks, build,
     new RegExp(`^assume arn:aws:iam::${ACCOUNT}:role/cdk-shukkatest-deploy-role-${ACCOUNT}-us-east-1 as shukka-emergency; cdk gets only that session$`),
     new RegExp(`^${reEscape(CDK)} diff --app \\S+ --no-color$`),
     /^node scripts\/guard\.mjs < the diff$/,
-    new RegExp(`^${reEscape(CDK)} deploy --app \\S+ --require-approval never --no-color --all --tags shukka:revision=${sha}$`),
+    new RegExp(`^${reEscape(CDK)} deploy --app \\S+ --require-approval never --no-color --all --tags=shukka:revision=${sha}$`),
     new RegExp(`^upload .* to s3://shukkatest-deploy-${ACCOUNT}/shukkatest/web/${sha}\\.tgz \\(scripts/upload\\.mjs\\)$`),
     new RegExp(`^release shukkatest/web ${sha} on instances tagged Project=shukkatest \\(scripts/release\\.mjs\\)$`),
     /^bash -c 'bash smoke\.sh'$/,
@@ -535,7 +535,7 @@ test('shu-5ix: deploy runs the guard on the cdk diff, deploys with the revision 
 
   assert.match(r.out, /guard: nothing is deleted or replaced/);
   const deploy = calls.find((x) => isCdk(x, 'deploy'))!;
-  assert.deepEqual(deploy.args.slice(deploy.args.indexOf('--all')), ['--all', '--tags', 'Project=shukkatest', '--tags', `shukka:revision=${sha}`]);
+  assert.deepEqual(deploy.args.slice(deploy.args.indexOf('--all')), ['--all', '--tags=Project=shukkatest', `--tags=shukka:revision=${sha}`]);
 
   const puts = c.s3.calls.map((x) => x.input.Key);
   assert.deepEqual(puts, [`shukkatest/web/${sha}.tgz`, `shukkatest/web/${sha}.configure.sh`]);
@@ -949,3 +949,64 @@ test('shu-5ix: bin/shukka --help runs as the npx entry point', () => {
   assert.equal(pkg.bin.shukka, 'bin/shukka');
   assert.ok(pkg.dependencies.tsx, 'tsx is a runtime dependency: npx installs no devDependencies');
 });
+
+// ---------- shu-9bj.5: a stack selector or tag from the assembly never becomes a cdk option ----------
+
+const PLUGIN_FIXTURE = join(root, 'test', 'fixtures', 'assembly', 'plugin-selector');
+
+/** A deploy spawn whose synth writes the security review's hostile assembly, its manifest changed by `mutate`. */
+function hostileSynthSpawn(bundle: string, mutate: (artifacts: any, assembly: string) => void) {
+  return recordingSpawn(({ cmd, args }) => {
+    if (cmd === 'npx' && args.includes('synth')) {
+      const out = args[args.indexOf('--output') + 1]!;
+      mkdirSync(out, { recursive: true });
+      for (const f of ['Demo.template.json', 'evil.cjs']) writeFileSync(join(out, f), readFileSync(join(PLUGIN_FIXTURE, f)));
+      const manifest = JSON.parse(readFileSync(join(PLUGIN_FIXTURE, 'manifest.json'), 'utf8').replaceAll('@ASSEMBLY@', out));
+      mutate(manifest.artifacts, out);
+      writeFileSync(join(out, 'manifest.json'), JSON.stringify(manifest));
+      return { status: 0, stdout: '' };
+    }
+    if (cmd === process.execPath && args[1] === 'diff') return { status: 0, stdout: CLEAN_DIFF };
+    if (cmd === 'bash' && args[0]?.endsWith('bundle.sh')) return { status: 0, stdout: `${bundle}\n` };
+    return { status: 0, stdout: '' };
+  });
+}
+
+/** shukka's pinned cdk with these arguments, with no way to reach AWS, from an empty directory. */
+function offlineCdk(tmp: string, args: string[]) {
+  const home = mkdtempSync(join(tmp, 'cdk-home-'));
+  const empty = join(home, 'empty');
+  writeFileSync(empty, '');
+  const env = { PATH: `${dirname(process.execPath)}:/usr/bin:/bin`, HOME: home, AWS_CONFIG_FILE: empty, AWS_SHARED_CREDENTIALS_FILE: empty, AWS_EC2_METADATA_DISABLED: 'true', AWS_ENDPOINT_URL: 'http://127.0.0.1:9', AWS_REGION: 'us-east-1', CDK_DISABLE_VERSION_CHECK: 'true' };
+  const r = spawnSync(process.execPath, args, { cwd: home, env, encoding: 'utf8', timeout: 120_000 });
+  return `${r.stdout}${r.stderr}`;
+}
+
+test('shu-9bj.5: deploy re-checks each stack selector before cdk runs: a displayName --plugin=<path> is refused, nothing deployed', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  const { calls, spawn } = hostileSynthSpawn(bundleDir(tmp), () => {});
+  const r = await cli(['deploy', '--skip-checks'], { cwd: dir, spawn, aws: awsWith(releaseClients()).aws, checkAssembly: NO_ASSETS });
+  assert.equal(r.code, 1, r.out + r.err);
+  assert.match(r.err, /refusing stack selector "--plugin=\S+evil\.cjs"/);
+  assert.equal(calls.filter((x) => isCdk(x, 'deploy')).length, 0, 'cdk deploy never ran');
+}));
+
+test('shu-9bj.5: deploy passes each tag as one --tags=k=v token; the pinned cdk keeps --tags=--plugin=x as data', withTmp(async (tmp) => {
+  const { dir, sha } = consumer(tmp);
+  const { calls, spawn } = hostileSynthSpawn(bundleDir(tmp), (artifacts, out) => {
+    artifacts.Demo.displayName = 'Demo';
+    artifacts.Demo.properties.tags = { '--plugin': `${out}/evil.cjs` };
+  });
+  const r = await cli(['deploy', '--skip-checks'], { cwd: dir, spawn, aws: awsWith(releaseClients()).aws, checkAssembly: NO_ASSETS });
+  assert.equal(r.code, 0, r.out + r.err);
+  const deploys = calls.filter((x) => isCdk(x, 'deploy'));
+  assert.equal(deploys.length, 2, 'one cdk deploy per stack (their tags differ)');
+  const demo = deploys.find((x) => x.args.includes('Demo'))!;
+  const assembly = demo.args[demo.args.indexOf('--app') + 1]!;
+  assert.deepEqual(demo.args.slice(demo.args.indexOf('--exclusively')), ['--exclusively', 'Demo', `--tags=--plugin=${assembly}/evil.cjs`, `--tags=shukka:revision=${sha}`]);
+  assert.ok(!demo.args.includes('--tags'), 'no tag is split from its flag');
+  // The same argv, given to the real pinned cdk offline: it reads the assembly and never loads the plugin.
+  const out = offlineCdk(tmp, demo.args);
+  assert.match(out, /Synthesis time/, out);
+  assert.ok(!existsSync(join(assembly, 'MARKER')), `the planted plugin ran:\n${out}`);
+}));

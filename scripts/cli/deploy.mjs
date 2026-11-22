@@ -275,7 +275,15 @@ function deployStacks(io, config, session, assembly, sha) {
   const stacks = Object.entries(artifacts).filter(([, a]) => a.type === 'aws:cloudformation:stack');
   const ids = new Set(stacks.map(([id]) => id));
   /** @param {any} a */
-  const tagArgs = (a) => Object.entries({ ...(a.properties?.tags ?? {}), [REVISION_TAG]: sha }).flatMap(([k, v]) => ['--tags', `${k}=${v}`]);
+  const tagArgs = (a) => Object.entries({ ...(a.properties?.tags ?? {}), [REVISION_TAG]: sha }).map(([k, v]) => `--tags=${k}=${v}`);
+  // Nothing from the assembly may become a cdk option: each tag is one --tags=k=v token (above), and every stack
+  // selector is checked again (scripts/assembly.mjs SELECTOR) before cdk starts.
+  /** @param {string} id */
+  const selector = (id) => artifacts[id].displayName ?? id;
+  for (const [id] of stacks) {
+    const s = selector(id);
+    if (typeof s !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9/_.-]*$/.test(s)) throw new CliError(`refusing stack selector ${JSON.stringify(s)}: it could be read as a cdk option`);
+  }
   /** @param {string[]} args */
   const deploy = (args) => {
     const r = cdk(io, config, session, assembly, ['deploy', '--app', assembly, '--require-approval', 'never', '--no-color', ...args]);
@@ -284,7 +292,7 @@ function deployStacks(io, config, session, assembly, sha) {
   const keys = new Set(stacks.map(([, a]) => JSON.stringify(Object.entries(a.properties?.tags ?? {}).sort())));
   if (io.dryRun && stacks.length === 0) {
     io.out('  (dry run: nothing was synthesized; the real cdk deploy commands depend on the synthesized assembly: one --all when every stack has the same tags, else one --exclusively per stack)\n');
-    deploy(['--all', '--tags', `${REVISION_TAG}=${sha}`]);
+    deploy(['--all', `--tags=${REVISION_TAG}=${sha}`]);
   } else if (stacks.length === 0) {
     io.say('the app has no stacks');
   } else if (keys.size === 1) {
@@ -301,7 +309,7 @@ function deployStacks(io, config, session, assembly, sha) {
       seen.add(id);
       const a = artifacts[id];
       for (const dep of a.dependencies ?? []) if (ids.has(dep)) visit(dep, seen);
-      deploy(['--exclusively', a.displayName ?? id, ...tagArgs(a)]);
+      deploy(['--exclusively', selector(id), ...tagArgs(a)]);
       done.add(id);
     };
     for (const [id] of stacks) visit(id);
