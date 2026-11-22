@@ -254,14 +254,15 @@ const trustOf = (t: ReturnType<typeof bootstrapTemplate>, id: string) =>
 const INFRA = 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/trendigle-shukka-infra';
 
 test('shu-9bj.2: the deploy and file-publishing roles trust only the infra role by default, plus named emergency principals', () => {
-  for (const id of ['DeploymentActionRole', 'FilePublishingRole']) {
+  // The file-publishing role also trusts the project's own deploy role (shu-9bj.4; tested there).
+  for (const id of ['DeploymentActionRole']) {
     const [st, ...rest] = trustOf(tpl, id);
     assert.equal(rest.length, 0, `${id}: one trust statement`);
     assert.deepEqual(st!.Condition, { ArnLike: { 'aws:PrincipalArn': [{ 'Fn::Sub': INFRA }] } }, `${id}: infra role only`);
   }
   const admin = 'arn:aws:iam::123456789012:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_Admin_*';
   const withAdmin = bootstrapTemplate({ project: 'trendigle', emergencyPrincipals: [admin] });
-  for (const id of ['DeploymentActionRole', 'FilePublishingRole']) {
+  for (const id of ['DeploymentActionRole']) {
     assert.deepEqual(trustOf(withAdmin, id)[0]!.Condition, { ArnLike: { 'aws:PrincipalArn': [{ 'Fn::Sub': INFRA }, admin] } });
   }
   for (const bad of ['*', 'arn:aws:iam::123456789012:*', 'arn:aws:iam::*:role/x', 'arn:aws:iam::123456789012:role/*', 'arn:aws:sts::123456789012:assumed-role/x/y']) {
@@ -269,6 +270,37 @@ test('shu-9bj.2: the deploy and file-publishing roles trust only the infra role 
   }
   // The execution role is for CloudFormation only.
   assert.deepEqual(trustOf(tpl, 'CloudFormationExecutionRole')[0]!.Principal, { Service: 'cloudformation.amazonaws.com' });
+});
+
+const DEPLOY_ROLE = (q: string) => `arn:\${AWS::Partition}:iam::\${AWS::AccountId}:role/cdk-${q}-deploy-role-\${AWS::AccountId}-\${AWS::Region}`;
+const PUBLISH_ROLE = (q: string) => `arn:\${AWS::Partition}:iam::\${AWS::AccountId}:role/cdk-${q}-file-publishing-role-\${AWS::AccountId}-\${AWS::Region}`;
+
+test('shu-9bj.4: the file-publishing role also trusts the project deploy role and nothing else new', () => {
+  const [st, ...rest] = trustOf(tpl, 'FilePublishingRole');
+  assert.equal(rest.length, 0, 'one trust statement');
+  assert.deepEqual(st, {
+    Effect: 'Allow', Action: ['sts:AssumeRole', 'sts:TagSession'], Principal: { AWS: { Ref: 'AWS::AccountId' } },
+    Condition: { ArnLike: { 'aws:PrincipalArn': [{ 'Fn::Sub': INFRA }, { 'Fn::Sub': DEPLOY_ROLE('trendigle') }] } },
+  });
+  const admin = 'arn:aws:iam::123456789012:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_Admin_*';
+  const withAdmin = bootstrapTemplate({ project: 'trendigle', qualifier: 'tq', emergencyPrincipals: [admin] });
+  assert.deepEqual(trustOf(withAdmin, 'FilePublishingRole')[0]!.Condition, {
+    ArnLike: { 'aws:PrincipalArn': [{ 'Fn::Sub': INFRA }, { 'Fn::Sub': DEPLOY_ROLE('tq') }, admin] },
+  }, 'the deploy role of the qualifier, not the project name');
+  // The deploy role's own trust is unchanged: the infra role and emergency principals only.
+  assert.deepEqual(trustOf(withAdmin, 'DeploymentActionRole')[0]!.Condition, { ArnLike: { 'aws:PrincipalArn': [{ 'Fn::Sub': INFRA }, admin] } });
+});
+
+test('shu-9bj.4: the deploy role may assume only its own file-publishing role', () => {
+  for (const q of ['trendigle', 'tq']) {
+    const t = ((bootstrapTemplate({ project: 'trendigle', qualifier: q }).Resources as unknown as Record<string, Resource>)
+      .DeploymentActionRole!.Properties.Policies as { PolicyDocument: { Statement: Statement[] } }[]).flatMap((p) => p.PolicyDocument.Statement);
+    const assumes = t.filter((s) => list(s.Action).some((a) => a.startsWith('sts:') && a !== 'sts:GetCallerIdentity'));
+    assert.equal(assumes.length, 1, `${q}: one sts statement`);
+    assert.equal(assumes[0]!.Effect, 'Allow');
+    assert.deepEqual([...list(assumes[0]!.Action)].sort(), ['sts:AssumeRole', 'sts:TagSession']);
+    assert.deepEqual(subs(assumes[0]!.Resource), [PUBLISH_ROLE(q)], `${q}: its own file-publishing role only`);
+  }
 });
 
 test('shu-9bj.2: shukkaSynthesizer uses the project deploy role as its lookup role (there is no lookup role)', () => {
