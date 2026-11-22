@@ -31,7 +31,7 @@ Credentials exist only inside `infra.yml` and `ec2.yml`. Each AWS role trusts on
 
 **C2. `infra.yml`** (nested reusable workflow). Modes `diff` and `deploy`. Steps: checkout, `npm ci` in the infra directory, assume role, `cdk diff --no-color` to a file and the step summary, guard, then (deploy mode) `cdk deploy --all --require-approval never`. In diff mode it posts the diff and the guard verdict as a pull-request comment (updated in place) and never fails the check for a destructive diff; it says the merge will stop.
 
-**C3. `ec2.yml`** (nested reusable workflow). Downloads the build artifact for one app, assumes the app role, uploads the bundle to `s3://<bucket>/<project>/<app>/<sha>.tgz`, sends `box/shukka-release.sh` with arguments through SSM Run Command to instances tagged `Project=<project>`, waits, prints output, fails if the script failed. Concurrency group `shukka-<project>-<app>`, `cancel-in-progress: false`.
+**C3. `ec2.yml`** (nested reusable workflow). Downloads the build artifact for one app, checks out the repository (no install, no build) to take the configure hook from git rather than from the artifact, assumes the app role, uploads the bundle to `s3://<bucket>/<project>/<app>/<sha>.tgz`, sends `box/shukka-release.sh` with arguments through SSM Run Command to instances tagged `Project=<project>`, waits, prints output, fails if the script failed. Concurrency group `shukka-<project>-<app>`, `cancel-in-progress: false`.
 
 **C4. `box/shukka-release.sh`** (runs on the server as root). Release manager for one app: download, unpack to a new release directory, run the project's configure hook, switch the `current` symlink, restart the app's units, health-check, roll back on failure, prune old releases. Knows nothing about Trendigle.
 
@@ -133,7 +133,7 @@ export class ShukkaAccess extends Construct {
 
 Trust, for each role, all conditions together:
 - `aud = sts.amazonaws.com`;
-- `sub` matches the repository and `main` (infra, app) or `pull_request` (diff), in the form the customised subject produces (spike S1 settles the exact string);
+- `sub` StringEquals `repo:<githubRepo>:ref:refs/heads/main` (infra, app) or `repo:<githubRepo>:pull_request` (diff); the default subject is used, no customisation (spike S1);
 - `job_workflow_ref` StringLike `rummykhan/shukka/.github/workflows/infra.yml@refs/tags/<shukkaVersions>` (infra, diff) or `.../ec2.yml@...` (app).
 
 Permissions:
@@ -207,7 +207,8 @@ Input: full `cdk diff --no-color` output. Exit 0 = safe. Exit 1 = destructive or
 
 | Risk | Reduced or detected by |
 |---|---|
-| `job_workflow_ref` with nested reusable workflows, the customised subject and immutable IDs behave differently from the docs | Spike S1 before any building, in a throwaway role and a test caller repo |
+| `job_workflow_ref` with nested reusable workflows and immutable IDs behaves differently from the docs | Settled by spike S1 (docs/factory/v1/spikes/s1-oidc.md): it works as designed |
+| A compromised build dependency plants code that runs as root on the server | The configure hook is taken from the git checkout in `ec2.yml`, never from the artifact; the app itself runs as an unprivileged user |
 | The limited execution role cannot update or roll back an existing Trendigle resource, leaving a stack in `UPDATE_ROLLBACK_FAILED` | Spike S2 simulates every action on every physical resource; first deploy through the new bootstrap is a no-change deploy; switch one low-risk stack (Dns) first; keep the old admin bootstrap until all four have deployed cleanly through the new one |
 | Moving stacks to the new qualifier triggers resource replacement | `cdk diff` must show only metadata/asset changes; the guard stops anything else |
 | First release migration on the box takes the site down | Done in a quiet moment; configure hooks tested in the container first; rollback leaves `/opt/trendigle/app` intact until the second successful release |
