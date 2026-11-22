@@ -5,8 +5,10 @@ import { App, Stack, CustomResource, Duration } from 'aws-cdk-lib';
 import { Template, Match } from 'aws-cdk-lib/assertions';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
+import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as cr from 'aws-cdk-lib/custom-resources';
 import {
+  ShukkaAccess,
   ShukkaAccountStack,
   ShukkaBoundary,
   boundaryPolicyName,
@@ -438,4 +440,15 @@ test('shu-i1b: applyBoundary(app, project) sets the boundary on every role in an
   }
   assert.ok(roles >= 3, `found ${roles} roles`);
   Template.fromStack(a).hasResourceProperties('AWS::IAM::Role', { PermissionsBoundary: Match.objectLike(boundary) });
+});
+
+test('shu-i1b: the boundary names the same infra role ShukkaAccess creates', () => {
+  const stack = new Stack(new App(), 'Shukkatest-Ci', { env: { account: '123456789012', region: 'us-east-1' } });
+  new ShukkaAccess(stack, 'Access', {
+    project: 'shukkatest',
+    githubRepo: 'owner/repo',
+    oidcProviderArn: 'arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com',
+    deployBucket: s3.Bucket.fromBucketName(stack, 'Bucket', 'shukkatest-deploy'),
+  });
+  Template.fromStack(stack).hasResourceProperties('AWS::IAM::Role', { RoleName: infraRoleName('shukkatest') });
 });
