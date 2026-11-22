@@ -277,6 +277,83 @@ case_bad_arguments() {
   x "test ! -e /opt/demo/web/current" || fail "something was released"
 }
 
+case_app_owned_base_taken_back() {
+  # As on Trendigle: /opt/<project> and /opt/<project>/<app> exist, owned by the app user, and
+  # the app user keeps trying to swap hooks/ for its own directory holding its own hook.
+  bundle demo web aaaaaaa 8101 good
+  x "install -d -o app -g app -m 755 /opt/demo /opt/demo/web /opt/demo/web/releases"
+  x "install -d -o app -g app -m 777 /opt/demo/web/hooks"
+  x "printf '#!/usr/bin/env bash\necho attacker >>/var/log/evil-ran\n' >/tmp/evil.sh && chmod 755 /tmp/evil.sh"
+  docker exec -d "$BOX" runuser -u app -- bash -c '
+    cd /opt/demo/web || exit 1
+    while :; do
+      mv -T hooks hooks.$RANDOM 2>/dev/null
+      mkdir -p hooks 2>/dev/null; cp /tmp/evil.sh hooks/aaaaaaa.sh 2>/dev/null
+      ln -sfn /tmp hooks.l 2>/dev/null && mv -Tf hooks.l hooks 2>/dev/null
+    done'
+  release web aaaaaaa 8101
+  x "pkill -u app -f 'cd /opt/demo/web'"
+  expect_rc 0
+  expect_last "shukka: demo/web none -> aaaaaaa live"
+  x "test ! -e /var/log/evil-ran" || fail "the attacker's hook ran as root"
+  printf '%s\n' "$OUT" | grep -q "taking /opt/demo/web back for root (was app:app 755)" || fail "ownership fix not reported"
+  expect_eq "dirs" "$(x 'stat -c "%n %U:%G %a" /opt/demo /opt/demo/web /opt/demo/web/releases /opt/demo/web/hooks | tr "\n" ","')" \
+    "/opt/demo root:root 755,/opt/demo/web root:root 755,/opt/demo/web/releases root:root 755,/opt/demo/web/hooks root:root 700,"
+  expect_eq "served" "$(served 8101)" "aaaaaaa"
+}
+
+case_symlinked_dirs_refused() {
+  bundle demo web aaaaaaa 8101 good
+  x "install -d -o app -g app /tmp/elsewhere /opt/demo && ln -s /tmp/elsewhere /opt/demo/web"
+  release web aaaaaaa 8101
+  expect_rc 10
+  expect_last "shukka: demo/web none -> aaaaaaa download-failed"
+  printf '%s\n' "$OUT" | grep -q "/opt/demo/web is a symlink" || fail "no clear message"
+  expect_eq "nothing written through the symlink" "$(x 'ls -A /tmp/elsewhere')" ""
+  x "rm /opt/demo/web && mkdir -p /opt/demo/web /tmp/hk && ln -s /tmp/hk /opt/demo/web/hooks"
+  release web aaaaaaa 8101
+  expect_rc 10
+  expect_eq "nothing written through the hooks symlink" "$(x 'ls -A /tmp/hk')" ""
+}
+
+case_hostile_bundles() {
+  bundle demo web aaaaaaa 8101 good
+  local k sha
+  for k in dev:bbbbbbb suid:ccccccc revsym:ddddddd; do
+    sha=${k#*:}
+    bundle demo web "$sha" 8101 good
+    x "cd /fake-s3/$BUCKET/demo/web && python3 /fixtures/hostile-bundle.py $sha.tgz h.tgz ${k%%:*} && mv h.tgz $sha.tgz"
+  done
+  x "install -d /tmp/plant && echo original >/tmp/plant/victim"
+  release web aaaaaaa 8101; expect_rc 0
+  release web bbbbbbb 8101
+  expect_rc 10
+  expect_last "shukka: demo/web aaaaaaa -> bbbbbbb download-failed"
+  printf '%s\n' "$OUT" | grep -q "not regular files, directories or symlinks: .*fifo" || fail "no clear message for devices and fifo"
+  x "test ! -e /opt/demo/web/releases/bbbbbbb" || fail "the device bundle was kept"
+  expect_eq "no leftovers" "$(x 'ls -A /opt/demo/web/releases | tr "\n" " "')" "aaaaaaa "
+  expect_eq "current" "$(link web current)" "/opt/demo/web/releases/aaaaaaa"
+  release web ccccccc 8101
+  expect_rc 0
+  expect_eq "setuid, setgid or world-writable entries" \
+    "$(x 'find /opt/demo/web/releases/ccccccc ! -type l \( -perm /6000 -o -perm -0002 \) -printf "%P "')" ""
+  x "test -f /opt/demo/web/releases/ccccccc/suid" || fail "fixture did not carry the setuid file"
+  release web ddddddd 8101
+  expect_rc 0
+  expect_eq "victim untouched" "$(x 'cat /tmp/plant/victim')" "original"
+  x "test -f /opt/demo/web/releases/ddddddd/REVISION && test ! -L /opt/demo/web/releases/ddddddd/REVISION" || fail "REVISION is not a regular file"
+  expect_eq "REVISION" "$(x 'cat /opt/demo/web/current/REVISION')" "ddddddd"
+}
+
+case_lock_root_only() {
+  bundle demo web aaaaaaa 8101 good
+  x "install -d -o app -g app /opt/demo /opt/demo/web && install -o app -g app -m 666 /dev/null /opt/demo/web/.lock"
+  release web aaaaaaa 8101
+  expect_rc 0
+  expect_eq "lock" "$(x 'stat -c "%U:%G %a" /opt/demo/web/.lock')" "root:root 600"
+  if x "runuser -u app -- flock -n /opt/demo/web/.lock true" 2>/dev/null; then fail "the app user could take the lock"; fi
+}
+
 # ---------------------------------------------------------------------------------------------
 
 cases=(
@@ -292,6 +369,10 @@ cases=(
   "shu-766: keeps the last 5 releases and current/REVISION holds the sha|case_keeps_five"
   "shu-766: never prints the contents of settings files|case_no_secrets_printed"
   "shu-766: rejects missing or unsafe arguments with exit 2 and changes nothing|case_bad_arguments"
+  "shu-766: takes app-owned directories back for root, so a hooks/ swap never runs the attacker's hook|case_app_owned_base_taken_back"
+  "shu-766: refuses to release through a symlinked directory with exit 10|case_symlinked_dirs_refused"
+  "shu-766: refuses devices and fifos (exit 10), strips setuid, setgid and world-write, never writes through REVISION|case_hostile_bundles"
+  "shu-766: the lock file is root-only and the app user cannot flock it|case_lock_root_only"
 )
 
 ran=0

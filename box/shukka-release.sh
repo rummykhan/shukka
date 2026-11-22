@@ -98,10 +98,43 @@ new_dir=$releases/$sha
 hooks=$base/hooks
 hook=$hooks/$sha.sh
 
-mkdir -p -- "$releases" || finish 10 download-failed
-# Append mode so the lock file is never truncated, whatever it is. Children get fd 9 closed
-# (9>&-), so nothing they leave running (a daemon a hook starts) can hold the lock.
-exec 9>>"$base/.lock" || finish 10 download-failed
+# Every directory on the way to what this script runs as root must be root's: a real directory
+# (not a symlink), owned by root:root and not writable by group or others. Otherwise whoever can
+# write there could swap hooks/ or a release under us. An existing directory owned by the app user
+# (as Trendigle's /opt/trendigle is) is taken back for root, that directory alone, not recursively.
+# Top down, so each directory is fixed before anything below it is looked at.
+secure_dir() {
+  local d=$1 st
+  if [ -L "$d" ]; then
+    say "$d is a symlink; refusing to release through it"
+    finish 10 download-failed
+  fi
+  if [ ! -e "$d" ]; then
+    mkdir -m 755 -- "$d" || { say "cannot create $d"; finish 10 download-failed; }
+  fi
+  if [ ! -d "$d" ]; then
+    say "$d is not a directory"
+    finish 10 download-failed
+  fi
+  st=$(stat -c '%u:%g %a' -- "$d") || finish 10 download-failed
+  if [ "${st%% *}" != 0:0 ] || [ $((8#${st#* } & 8#022)) -ne 0 ]; then
+    say "taking $d back for root (was $(stat -c '%U:%G %a' -- "$d")): chown root:root, chmod go-w"
+    if ! { chown root:root -- "$d" && chmod go-w -- "$d"; }; then finish 10 download-failed; fi
+  fi
+}
+for d in /opt "/opt/$project" "$base" "$releases" "$hooks"; do secure_dir "$d"; done
+chmod 700 -- "$hooks" || finish 10 download-failed
+
+# The lock file is root's alone (0600), so no other user can take it and stall releases.
+# Created only when missing (never replaced: a running release may hold it); opened in append mode
+# so it is never truncated. Children get fd 9 closed (9>&-), so nothing they leave running (a
+# daemon a hook starts) can hold the lock.
+lock=$base/.lock
+if [ -L "$lock" ] || { [ -e "$lock" ] && [ ! -f "$lock" ]; }; then rm -rf -- "$lock"; fi
+if ! { (umask 077 && : >>"$lock") && chown root:root -- "$lock" && chmod 600 -- "$lock"; }; then
+  finish 10 download-failed
+fi
+exec 9>>"$lock" || finish 10 download-failed
 if ! flock -n 9; then
   say "waiting for another release of $project/$app to finish"
   flock 9 || finish 10 download-failed
@@ -110,12 +143,6 @@ fi
 # Leftovers from a release that was killed half way (we hold the lock, so none is running).
 find "$releases" -mindepth 1 -maxdepth 1 -name '.new-*' -exec rm -rf -- {} + 2>/dev/null
 
-# The hooks directory is root's alone: whatever owns /opt/<project>/<app>, nothing else may place
-# or swap a file that this script runs as root.
-if [ -L "$hooks" ] || { [ -e "$hooks" ] && [ ! -d "$hooks" ]; }; then rm -f -- "$hooks"; fi
-if ! { mkdir -p -- "$hooks" && chown root:root -- "$hooks" && chmod 700 -- "$hooks"; }; then
-  finish 10 download-failed
-fi
 find "$hooks" -mindepth 1 -maxdepth 1 -name '.new-*' -exec rm -f -- {} + 2>/dev/null
 
 target_of() { readlink -- "$1" 2>/dev/null; }
@@ -171,6 +198,8 @@ if ! { chown root:root -- "$hook_tmp" && chmod 700 -- "$hook_tmp" && mv -f -- "$
   finish 10 download-failed
 fi
 hook_tmp=
+# Run the hook from this open file, never again by path, so it cannot be swapped after download.
+exec 8<"$hook" || finish 10 download-failed
 
 # --- download and unpack, unless this sha is the live release -----------------------------------
 if [ "$old_target" = "$new_dir" ] && [ -d "$new_dir" ]; then
@@ -190,8 +219,17 @@ else
     say "unpack failed"
     finish 10 download-failed
   fi
+  # Only regular files, directories and symlinks; no setuid, setgid or world-writable bits.
+  # (chmod -R does not follow symlinks met while recursing.)
+  odd=$(find "$staging" ! -type f ! -type d ! -type l -printf '%P\n' | head -n 5)
+  if [ -n "$odd" ]; then
+    say "the bundle holds entries that are not regular files, directories or symlinks: ${odd//$'\n'/ }"
+    finish 10 download-failed
+  fi
+  chmod -R u-s,g-s,o-w -- "$staging" || finish 10 download-failed
   chmod 755 -- "$staging"
-  rm -f -- "$staging/REVISION"
+  # Never write through a bundle entry as root: remove whatever is named REVISION first.
+  rm -rf -- "$staging/REVISION"
   printf '%s\n' "$sha" >"$staging/REVISION" || finish 10 download-failed
   rm -f -- "$tgz"; tgz=
   rm -rf -- "$new_dir"
@@ -203,7 +241,7 @@ fi
 drop_new() { [ "$rerelease" = 1 ] || rm -rf -- "$new_dir" "$hook"; }
 
 say "running the configure hook"
-if ! (cd -- "$new_dir" && PROJECT=$project APP=$app SHA=$sha REGION=$region bash -- "$hook" "$new_dir" </dev/null 2>&1 9>&-); then
+if ! (cd -- "$new_dir" && PROJECT=$project APP=$app SHA=$sha REGION=$region bash /dev/fd/8 "$new_dir" </dev/null 2>&1 9>&-); then
   say "configure hook failed; nothing switched"
   drop_new
   finish 11 configure-failed
