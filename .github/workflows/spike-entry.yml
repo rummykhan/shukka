@@ -1,0 +1,21 @@
+# Spike S1 (temporary): entry reusable workflow that nests spike-inner.yml two ways.
+name: spike-entry
+on:
+  workflow_call:
+    inputs:
+      roles: { type: string, required: true }
+jobs:
+  local-path:
+    uses: ./.github/workflows/spike-inner.yml
+    permissions: { id-token: write, contents: read }
+    with: { roles: "${{ inputs.roles }}", label: "nested-local-path" }
+  full-ref:
+    uses: rummykhan/shukka/.github/workflows/spike-inner.yml@spike-s1
+    permissions: { id-token: write, contents: read }
+    with: { roles: "${{ inputs.roles }}", label: "nested-full-ref" }
+  no-id-token:
+    runs-on: ubuntu-latest
+    permissions: { contents: read }
+    steps:
+      - run: |
+          if [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then echo "RESULT no-id-token TOKEN-AVAILABLE"; else echo "RESULT no-id-token NO-TOKEN"; fi

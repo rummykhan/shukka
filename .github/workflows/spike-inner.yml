@@ -1,0 +1,28 @@
+# Spike S1 (temporary): what does a job in a nested reusable workflow look like to AWS?
+name: spike-inner
+on:
+  workflow_call:
+    inputs:
+      roles: { type: string, required: true }   # space-separated role ARNs to try
+      label: { type: string, required: true }
+jobs:
+  claims:
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    steps:
+      - name: Token claims and role attempts
+        env:
+          ROLES: ${{ inputs.roles }}
+          LABEL: ${{ inputs.label }}
+        run: |
+          set -u
+          TOKEN=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r .value)
+          # Only the payload is printed (claims), never the token.
+          echo "$TOKEN" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null | jq '{label: env.LABEL, sub, job_workflow_ref, workflow_ref, ref, event_name, repository, repository_owner_id}' || true
+          for r in $ROLES; do
+            if aws sts assume-role-with-web-identity --role-arn "$r" --role-session-name s1 --web-identity-token "$TOKEN" --query Credentials.Expiration --output text >/tmp/out 2>&1; then
+              echo "RESULT $LABEL $r ALLOWED"
+            else
+              echo "RESULT $LABEL $r DENIED $(head -c 200 /tmp/out)"
+            fi
+          done
