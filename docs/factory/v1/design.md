@@ -66,7 +66,7 @@ No database. State that exists:
   "$schema": "https://raw.githubusercontent.com/rummykhan/shukka/v1/schema/shukka.schema.json",
   "project": "trendigle",
   "qualifier": "trendigle",
-  "aws": { "account": "818221194501", "region": "us-east-1" },
+  "aws": { "account": "123456789012", "region": "us-east-1" },
   "node": "22",
   "checks": [
     { "name": "app",   "dir": "implementation/app",   "run": ["npm ci", "npm run lint", "npm run typecheck", "npm test", "npm run build"], "services": ["dynamodb-local"] },
@@ -123,10 +123,10 @@ export interface ShukkaAccessProps {
   shukkaVersions?: string;         // release line, default 'v1' → job_workflow_ref must match .../<file>@refs/tags/v1 or .../<file>@refs/tags/v1.*
   qualifier?: string;              // bootstrap qualifier, default project when valid
   allowBranch?: string;            // rc testing only: also trust .../<file>@refs/heads/<branch> (literal)
+  allowPrerelease?: boolean;       // rc testing only: also trust pre-release tags (v1.0.0-rc.1); default refused
   oidcProviderArn?: string;        // import instead of create when the account already has one
   deployBucket: s3.IBucket;
   instanceTag?: { key: string; value: string }; // default { Project: project }
-  ssmPath?: string;                // default `/${project}/prod`; app role may read it
 }
 export class ShukkaAccess extends Construct {
   readonly infraRole: iam.Role; readonly appRole: iam.Role; readonly diffRole: iam.Role;
@@ -137,12 +137,13 @@ Trust, for each role, all conditions together:
 - `aud = sts.amazonaws.com`;
 - `sub` StringEquals `repo:<githubRepo>:ref:refs/heads/main` (infra, app) or `repo:<githubRepo>:pull_request` (diff); the default subject is used, no customisation (spike S1);
 - `job_workflow_ref` StringLike either of `rummykhan/shukka/.github/workflows/infra.yml@refs/tags/<line>` and `...@refs/tags/<line>.*` (infra, diff), or the same for `ec2.yml` (app). shukka must never be renamed or moved: this claim carries names, not ids.
+- `job_workflow_ref` StringNotLike `rummykhan/shukka/.github/workflows/<file>@refs/tags/*-*` unless `allowPrerelease` is set, so a production project never runs a pre-release tag such as `v1.0.0-rc.1` (security review of the epic, access-4; shu-9bj.9).
 - Diff role stack resources: `stack/<project>-*/*` and `stack/<Project>-*/*` (a hyphen after the name, so a project named with this one as a prefix is not reachable).
 
 Permissions:
 - **infra**: `sts:AssumeRole` on the project-qualifier bootstrap roles `cdk-<qualifier>-{deploy,file-publishing}-role-*` only. Not the lookup role: the stock one has account-wide ReadOnlyAccess, and `cdk.context.json` is committed so deploys need no live lookup (security review of shu-7nw, 2026-11-22). The bootstrap itself is shukka's own template, whose deploy role can change only the project's stacks with the project's own execution role (shu-9bj.2).
-- **app**: `s3:PutObject` on `<bucket>/<project>/*`; `ssm:SendCommand` on `AWS-RunShellScript` and on instances with the tag; `ssm:GetCommandInvocation`, `ec2:DescribeInstances`; `ssm:GetParameter` on `<ssmPath>/*`.
-- **diff**: `cloudformation:GetTemplate`, `DescribeStacks` on `arn:aws:cloudformation:<region>:<account>:stack/<StackPrefix>*/*`; `ssm:GetParameter` on `/cdk-bootstrap/<qualifier>/version`. Nothing else (no lookup role: `cdk.context.json` is committed).
+- **app**: `s3:PutObject` on `<bucket>/<project>/*`; `ssm:SendCommand` on `AWS-RunShellScript` and on instances with the tag; `ssm:DescribeInstanceInformation`, `ssm:GetCommandInvocation`, `ec2:DescribeInstances` (no resource type; the boundary gives these three to the app role only, by `aws:PrincipalArn`). No `ssm:GetParameter`: nothing the app role runs reads the project's parameters (shu-9bj.9). The deploy bucket must be named `<project>*`, since the boundary's S3 statement covers only those (shukka.json refuses another `aws.deployBucket`).
+- **diff**: `cloudformation:GetTemplate`, `DescribeStacks` on `arn:aws:cloudformation:<region>:<account>:stack/<StackPrefix>*/*`; `ssm:GetParameter` on `/cdk-bootstrap/<qualifier>/version`. Nothing else (no lookup role: `cdk.context.json` is committed). The boundary allows exactly these to the diff role only, by `aws:PrincipalArn` (shu-9bj.9): every role, the pipeline's own included, carries the boundary.
 
 ### `ShukkaBoundary` / execution policy
 
@@ -224,7 +225,7 @@ Input: full `cdk diff --no-color` output. Exit 0 = safe. Exit 1 = destructive or
 | Moving stacks to the new qualifier triggers resource replacement | `cdk diff` must show only metadata/asset changes; the guard stops anything else |
 | First release migration on the box takes the site down | Done in a quiet moment; configure hooks tested in the container first; rollback leaves `/opt/trendigle/app` intact until the second successful release |
 | A tag push to rummykhan/shukka changes what deploys every project | Projects pin `@v1` (moving major tag) by choice; shukka CI must pass before a tag; projects that want stability pin `@v1.x.y` |
-| Public repo leaks something | No secrets by design; account IDs and role names only appear in consumer repos; a secret scan in shukka CI |
+| Public repo leaks something | No secrets by design; a secret scan in shukka CI. Tests, fixtures and examples use the placeholder account `123456789012` and dummy instance, security-group, zone and role ids; the shared account's real id appears only in `FACTORY.md` and the spikes' records (`docs/factory/v1/spikes/`), and in consumer repos. Account ids are not secret, but naming the account and its resources helps an attacker aim. Association parameters are readable by every bounded role in the account (`ssm:DescribeAssociation` has no project scope): never put a secret in them |
 | GitHub's free minutes change | Measured per run in the summary; budget alert note in README |
 
 ## Test strategy
