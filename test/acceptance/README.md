@@ -31,7 +31,7 @@ the `RESULT` lines and every run's log and job list are kept in the run director
 | I serialised | two web merges in quick succession; ordering read from the box (SSM's record of each release command, the release's REVISION time), not from job start times | R5 |
 | J emergency | caller workflow disabled; `shukka deploy` from this machine: a change, a dirty tree, an unpushed commit, a destructive change, an unhealthy release; workflow re-enabled | R8 |
 | K shukka's tests | shukka's CI result on the rc commit; shukka's tests against loosened trust conditions and a guard that always says safe (local clone) | R10 |
-| teardown | always, from an `EXIT` trap, even after a failure or Ctrl-C. First disables every workflow in the test consumer, cancels queued and running runs and waits for them to end; then waits for each stack to leave any `*_IN_PROGRESS` state before deleting it, retrying the delete | |
+| teardown | always, from an `EXIT` trap, even after a failure or Ctrl-C. First disables every workflow in the test consumer, cancels queued and running runs and waits for them to end; then waits for each stack to leave any `*_IN_PROGRESS` state before deleting it (except `REVIEW_IN_PROGRESS`, a change set never executed, which it deletes at once), retrying the delete | |
 | T | after teardown: nothing left, zone deleted in time, OIDC provider and default bootstrap untouched | SC9 |
 
 Phases after A need A; if A fails they are reported `BLOCKED` and teardown still runs. K needs only
