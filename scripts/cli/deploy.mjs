@@ -8,22 +8,28 @@
 //   checks (pipeline.yml "check", skippable with --skip-checks) -> build and bundle (pipeline.yml "build") ->
 //   synth, assembly and policy checks, cdk diff, guard, cdk deploy with the shukka:revision tag (infra.yml "deploy") ->
 //   upload and release each app (ec2.yml "release": scripts/upload.mjs, scripts/release.mjs) -> smoke.
-// Credentials, as in CI: the project's own code (checks, build, npm ci, synth, smoke) runs with no AWS credentials
-// (projectEnv). cdk diff and deploy run with shukka's pinned cdk and only a session of the project's bootstrap
+// Credentials, as in CI: the project's own code (checks, build, bundle, npm ci, synth, smoke) runs in a throwaway
+// Docker container with only the fresh worktree mounted and nothing of the caller's environment or home
+// (projectSteps, exec.mjs containerArgs); without Docker it runs here with no AWS variables (projectEnv), only when
+// --trust-project-code says so. cdk diff and deploy run with shukka's pinned cdk and only a session of the project's bootstrap
 // deploy role (which trusts the emergency principals named at bootstrap), so they are fenced like the pipeline.
 // Upload and release are shukka's own code and use the caller's credentials in this process.
 // Every part deploys, whatever changed: an emergency deploy makes AWS match origin/main. The release script
 // redeploys a commit that is already live without harm, and an unchanged stack is a no-op for cdk.
 
-import { existsSync, readFileSync, realpathSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import { copyFileSync, cpSync, existsSync, lstatSync, mkdtempSync, readFileSync, realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from '../config.mjs';
 import { guard, report } from '../guard.mjs';
 import { githubRepoFromUrl, policyGuard, report as policyReport } from '../policy-guard.mjs';
 import { release } from '../release.mjs';
-import { upload } from '../upload.mjs';
-import { CliError, NPM_SAFE, cdkBin, cdkPlace, mustRun, projectEnv, refuseSymlink, tempDir } from './exec.mjs';
+import { checkBundle, upload } from '../upload.mjs';
+import {
+  CliError, HOST_CODE_WARNING, NPM_SAFE, cdkBin, cdkPlace, containerArgs, dockerAvailable, ensureProjectImage, mustRun, projectEnv, refuseSymlink,
+  startServices, tempDir,
+} from './exec.mjs';
 
 const SHUKKA_DIR = fileURLToPath(new URL('../../', import.meta.url));
 export const REVISION_TAG = 'shukka:revision';
@@ -36,6 +42,14 @@ export const SESSION_NAME = 'shukka-emergency';
  * @typedef {import('../config.mjs').Config} Config
  * @typedef {{ profile?: string, region?: string }} Target
  * @typedef {{ root: string, sha: string, tree: string, config: Config, aws: Aws }} Prepared
+ * @typedef {{ cwd: string, env?: Record<string, string>, capture?: false | 'stdout', network?: string }} StepOptions network: a container whose network the step joins (container mode only)
+ * @typedef {import('./exec.mjs').RunResult} RunResult
+ * @typedef {{
+ *   inContainer: boolean,
+ *   exec: (cmd: string, args: string[], options: StepOptions) => RunResult,
+ *   run: (what: string, cmd: string, args: string[], options: StepOptions) => RunResult,
+ *   services: (check: string, names: string[]) => { network?: string, stop: () => void },
+ * }} ProjectSteps exec returns the result; run fails with `<what> failed (exit N)` on a non-zero exit
  */
 
 /**
@@ -118,13 +132,70 @@ function removeTree(io, root, tree) {
 }
 
 /**
- * Environment for the project's own code: no AWS credentials, the config's account and region for CDK.
+ * Environment for the project's own code when it runs on this machine (--trust-project-code): no AWS credentials,
+ * the config's account and region for CDK.
  * @param {Config} config
  * @param {Record<string, string>} [extra]
  * @returns {Record<string, string>}
  */
 function codeEnv(config, extra = {}) {
   return projectEnv({ CDK_DEFAULT_ACCOUNT: config.aws.account, CDK_DEFAULT_REGION: config.aws.region, ...extra });
+}
+
+/** Why diff and deploy stop when there is no Docker. */
+export const NO_DOCKER = 'refusing: Docker is not available, and the project\'s own code (npm ci, cdk synth, checks, build, bundle, smoke) '
+  + 'runs only in a container, away from your home directory and credentials. Start Docker, or pass --trust-project-code '
+  + 'to run that code on this machine as you (it can then read ~/.aws, the AWS SSO cache and gh\'s token)';
+
+/**
+ * How the project's own code runs (every npm ci, synth, check, build, bundle and smoke command): in a throwaway
+ * container of the project image (exec.mjs ensureProjectImage, built here when missing) when Docker answers
+ * (exec.mjs containerArgs: only `tree` mounted, no home directory, only the variables given here; a check's services
+ * as sibling containers, exec.mjs startServices), else on this machine with projectEnv when `trust` is set (services
+ * are then the caller's to start), else refused.
+ * @param {Io} io
+ * @param {string} tree
+ * @param {Config} config
+ * @param {boolean} trust --trust-project-code
+ * @returns {ProjectSteps}
+ */
+export function projectSteps(io, tree, config, trust) {
+  const base = { CDK_DEFAULT_ACCOUNT: config.aws.account, CDK_DEFAULT_REGION: config.aws.region };
+  /** @type {(cmd: string, args: string[], options: StepOptions) => RunResult} */
+  let exec;
+  /** @type {ProjectSteps['services']} */
+  let services;
+  const inContainer = dockerAvailable(io);
+  if (inContainer) {
+    const image = ensureProjectImage(io);
+    io.say(`the project's code (npm ci, cdk synth, checks, build, bundle, smoke) runs in throwaway containers of ${image}: `
+      + `only ${tree} is mounted, no home directory, no AWS or GitHub credentials`);
+    exec = (cmd, args, options) => io.run('docker', containerArgs({
+      image, tree, cwd: options.cwd, env: { ...base, ...options.env }, cmd, args, label: config.project,
+      ...(options.network ? { network: options.network } : {}),
+    }), options.capture ? { capture: options.capture } : {});
+    services = (check, names) => startServices(io, check, names, `${config.project}-${randomBytes(4).toString('hex')}`);
+  } else {
+    if (!trust) throw new CliError(NO_DOCKER);
+    io.warn(HOST_CODE_WARNING);
+    exec = (cmd, args, options) => io.run(cmd, args, {
+      cwd: options.cwd, fullEnv: codeEnv(config, options.env), ...(options.capture ? { capture: options.capture } : {}),
+    });
+    services = (check, names) => {
+      io.warn(`check ${check} uses services (${names.join(', ')}) that CI starts; without Docker shukka does not, start them yourself`);
+      return { stop: () => {} };
+    };
+  }
+  return {
+    inContainer,
+    exec,
+    services,
+    run(what, cmd, args, options) {
+      const r = exec(cmd, args, options);
+      if (r.status !== 0) throw new CliError(`${what} failed (exit ${r.status})`);
+      return r;
+    },
+  };
 }
 
 /**
@@ -173,19 +244,18 @@ async function fencedSession(io, aws, config) {
 }
 
 /**
- * npm ci and cdk synth in the infra directory, without AWS credentials (cdk.context.json is committed, so the
- * synth needs no lookup); returns the assembly directory, in a shukka temp directory.
- * @param {Io} io
+ * npm ci and cdk synth in the infra directory, as project code (cdk.context.json is committed, so the synth needs
+ * no lookup); returns the assembly directory, in a new directory inside the fresh tree (all the container can write).
+ * @param {ProjectSteps} steps
  * @param {string} tree
  * @param {Config} config
  * @returns {string}
  */
-function synth(io, tree, config) {
+function synth(steps, tree, config) {
   const infra = join(tree, config.infra.dir);
-  const assembly = join(tempDir('cdk'), 'cdk.out');
-  const fullEnv = codeEnv(config);
-  mustRun(io, 'npm ci in the infra directory', 'npm', ['ci'], { cwd: infra, fullEnv });
-  mustRun(io, 'cdk synth', 'npx', ['--no-install', 'cdk', 'synth', '--quiet', '--output', assembly], { cwd: infra, fullEnv });
+  const assembly = join(mkdtempSync(join(tree, '.shukka-cdk-')), 'cdk.out');
+  steps.run('npm ci in the infra directory', 'npm', ['ci'], { cwd: infra });
+  steps.run('cdk synth', 'npx', ['--no-install', 'cdk', 'synth', '--quiet', '--output', assembly], { cwd: infra });
   return assembly;
 }
 
@@ -347,29 +417,36 @@ function deployStacks(io, config, session, assembly, sha) {
 }
 
 /**
- * Run each check's commands in its directory, as pipeline.yml's check job does, without AWS credentials.
+ * Run each check's commands in its directory, as pipeline.yml's check job does, as project code.
  * @param {Io} io
+ * @param {ProjectSteps} steps
  * @param {string} tree
  * @param {Config} config
  */
-function runChecks(io, tree, config) {
+function runChecks(io, steps, tree, config) {
   for (const check of config.checks) {
-    if (check.services.length > 0) {
-      io.warn(`check ${check.name} uses services (${check.services.join(', ')}) that CI starts; shukka deploy does not, start them yourself`);
+    const services = check.services.length > 0 ? steps.services(check.name, check.services) : { stop: () => {} };
+    try {
+      check.run.forEach((command, i) => {
+        io.say(`check ${check.name}, command ${i + 1} of ${check.run.length}`);
+        steps.run(`check ${check.name} (command ${i + 1})`, 'bash', ['-eo', 'pipefail', '-c', command], {
+          cwd: join(tree, check.dir), ...(services.network ? { network: services.network } : {}),
+        });
+      });
+    } finally {
+      services.stop();
     }
-    check.run.forEach((command, i) => {
-      io.say(`check ${check.name}, command ${i + 1} of ${check.run.length}`);
-      mustRun(io, `check ${check.name} (command ${i + 1})`, 'bash', ['-eo', 'pipefail', '-c', command], { cwd: join(tree, check.dir), fullEnv: codeEnv(config) });
-    });
   }
 }
 
 /**
- * Build one app and run its bundle script, as pipeline.yml's build job does, without AWS credentials; returns the
+ * Build one app and run its bundle script, as pipeline.yml's build job does, as project code; returns the
  * bundle directory. buildEnv values come from the environment when set (CI reads them from repository variables,
  * which a laptop cannot), otherwise from Parameter Store /<project>/prod/<NAME>, where `shukka bootstrap` copied
  * them from.
+ * shukka's own bundle script (outside the tree, so outside the container) is copied into the tree first.
  * @param {Io} io
+ * @param {ProjectSteps} steps
  * @param {Aws} aws
  * @param {string} tree
  * @param {Config} config
@@ -377,7 +454,7 @@ function runChecks(io, tree, config) {
  * @param {Record<string, string | undefined>} env the caller's environment, for buildEnv values
  * @returns {Promise<string>}
  */
-async function build(io, aws, tree, config, app, env) {
+async function build(io, steps, aws, tree, config, app, env) {
   /** @type {Record<string, string>} */
   const values = { ...app.build.env };
   for (const name of app.build.buildEnv) {
@@ -392,20 +469,90 @@ async function build(io, aws, tree, config, app, env) {
     if (p.type === 'SecureString') throw new CliError(`build ${app.name}: ${path} is a SecureString; build-time values must not be secret`);
     values[name] = p.value;
   }
-  const fullEnv = codeEnv(config, values);
   const cwd = join(tree, app.build.dir);
   app.build.run.forEach((command, i) => {
     io.say(`build ${app.name}, command ${i + 1} of ${app.build.run.length}`);
-    mustRun(io, `build ${app.name} (command ${i + 1})`, 'bash', ['-eo', 'pipefail', '-c', command], { cwd, fullEnv });
+    steps.run(`build ${app.name} (command ${i + 1})`, 'bash', ['-eo', 'pipefail', '-c', command], { cwd, env: values });
   });
   let script = resolve(cwd, app.build.bundle);
   if (!existsSync(script) && app.build.bundle === 'scripts/bundle.sh') script = join(SHUKKA_DIR, 'scripts', 'bundle.sh');
   if (!io.dryRun && !existsSync(script)) throw new CliError(`build ${app.name}: no bundle script ${app.build.bundle} in ${app.build.dir}`);
-  const r = mustRun(io, `build ${app.name}: the bundle script`, 'bash', [script], { cwd, fullEnv, capture: 'stdout' });
+  if (steps.inContainer && !inside(tree, script)) {
+    // shukka's own script is outside the checkout, so outside the container: a copy goes into a new directory there.
+    const copy = join(mkdtempSync(join(tree, '.shukka-bundle-')), basename(script));
+    copyFileSync(script, copy);
+    script = copy;
+  }
+  const r = steps.run(`build ${app.name}: the bundle script`, 'bash', [script], { cwd, env: values, capture: 'stdout' });
   if (io.dryRun) return `<directory printed by ${app.build.bundle}>`;
   const dir = r.stdout.split('\n').map((l) => l.trim()).filter(Boolean).pop();
   if (!dir) throw new CliError(`build ${app.name}: the bundle script did not print a directory`);
-  return resolve(cwd, dir);
+  return snapshotBundle(checkBundlePath(tree, resolve(cwd, dir), app.name), app.name);
+}
+
+/**
+ * A copy of the checked bundle in a shukka temp directory outside the tree, made before any further project step
+ * runs: later steps (the next app's build, npm ci, synth) still have the tree mounted read-write and could swap the
+ * bundle for a link to ~/.aws, so the upload reads only this copy. Links are copied as links, never followed; the
+ * bundle is checked as upload.mjs checks it (no link leaving it, nothing but files, directories and such links)
+ * before the copy, so nothing special is read, and again after, on the copy.
+ * @param {string} bundle
+ * @param {string} app
+ * @returns {string}
+ */
+function snapshotBundle(bundle, app) {
+  const refuse = (/** @type {string[]} */ problems) => {
+    if (problems.length > 0) throw new CliError(`build ${app}: refusing the bundle ${bundle}:\n${problems.join('\n')}`);
+  };
+  refuse(checkBundle(bundle));
+  const copy = join(tempDir('bundle'), 'bundle');
+  cpSync(bundle, copy, { recursive: true, dereference: false, verbatimSymlinks: true, errorOnExist: true });
+  refuse(checkBundle(copy));
+  return copy;
+}
+
+/**
+ * The bundle directory, refused unless it is a real directory inside the checkout: no part of its path below the
+ * tree may be a symbolic link (one made by the bundle script, or committed, could point at ~/.aws, and the upload
+ * would follow it), and its real path must be inside the tree's real path. Only the checkout outlives the container.
+ * @param {string} tree
+ * @param {string} bundle
+ * @param {string} app
+ * @returns {string}
+ */
+export function checkBundlePath(tree, bundle, app) {
+  if (!inside(tree, bundle)) throw new CliError(`build ${app}: the bundle script printed ${bundle}, outside the checkout; only the checkout outlives the container`);
+  let at = tree;
+  for (const part of relative(tree, bundle).split(/[\\/]/).filter(Boolean)) {
+    at = join(at, part);
+    let st;
+    try {
+      st = lstatSync(at);
+    } catch {
+      throw new CliError(`build ${app}: the bundle directory ${bundle} does not exist`);
+    }
+    if (st.isSymbolicLink()) throw new CliError(`build ${app}: refusing the bundle ${bundle}: ${at} is a symbolic link`);
+  }
+  let real;
+  try {
+    real = realpathSync(bundle);
+  } catch {
+    throw new CliError(`build ${app}: the bundle directory ${bundle} does not exist`);
+  }
+  if (!inside(realpathSync(tree), real)) throw new CliError(`build ${app}: refusing the bundle ${bundle}: its real path ${real} is outside the checkout`);
+  if (!lstatSync(real).isDirectory()) throw new CliError(`build ${app}: the bundle ${bundle} is not a directory`);
+  return bundle;
+}
+
+/**
+ * Whether `path` is `dir` or below it.
+ * @param {string} dir
+ * @param {string} path
+ * @returns {boolean}
+ */
+function inside(dir, path) {
+  const rel = relative(dir, path);
+  return !rel.startsWith('..') && !isAbsolute(rel);
 }
 
 /**
@@ -439,14 +586,18 @@ async function prepare({ io, makeAws, target, configPath, cwd }) {
 
 /**
  * `shukka diff`: synth, cdk diff and the guard's verdict. Exit 0 when nothing is deleted or replaced.
- * @param {{ io: Io, makeAws: (region: string) => Aws, target: Target, configPath: string, cwd: string, checkAssembly?: (dir: string) => string[] }} options
+ * @param {{
+ *   io: Io, makeAws: (region: string) => Aws, target: Target, configPath: string, cwd: string,
+ *   trustProjectCode?: boolean, checkAssembly?: (dir: string) => string[],
+ * }} options
  * @returns {Promise<number>}
  */
 export async function diffCommand(options) {
   const { io } = options;
   const { root, tree, config, aws } = await prepare(options);
   try {
-    const assembly = synth(io, tree, config);
+    const steps = projectSteps(io, tree, config, options.trustProjectCode ?? false);
+    const assembly = synth(steps, tree, config);
     await checkAssemblySafe(io, assembly, options.checkAssembly);
     const session = await fencedSession(io, aws, config);
     const { result, diffStatus } = diffAndGuard(io, config, session, assembly, false);
@@ -461,7 +612,7 @@ export async function diffCommand(options) {
  * `shukka deploy`.
  * @param {{
  *   io: Io, makeAws: (region: string) => Aws, target: Target, configPath: string, cwd: string,
- *   bucket?: string, allowReplacement?: boolean, skipChecks?: boolean,
+ *   bucket?: string, allowReplacement?: boolean, skipChecks?: boolean, trustProjectCode?: boolean,
  *   env?: Record<string, string | undefined>, checkAssembly?: (dir: string) => string[],
  * }} options
  * @returns {Promise<number>}
@@ -470,19 +621,20 @@ export async function deployCommand(options) {
   const { io } = options;
   const { root, sha, tree, config, aws } = await prepare(options);
   try {
+    const steps = projectSteps(io, tree, config, options.trustProjectCode ?? false);
     // aws.deployBucket is added to shukka.json by the workflows task; until then, the workflows' default.
     const configured = /** @type {{ deployBucket?: string }} */ (config.aws).deployBucket;
     const bucket = options.bucket ?? configured ?? `${config.project}-deploy-${config.aws.account}`;
     io.say(`deploying ${sha} to ${config.project}; bundles go to s3://${bucket}`);
 
     if (options.skipChecks) io.warn('--skip-checks: the project\'s checks are not run; you are deploying unchecked code');
-    else runChecks(io, tree, config);
+    else runChecks(io, steps, tree, config);
 
     /** @type {Map<string, string>} */
     const bundles = new Map();
-    for (const app of config.apps) bundles.set(app.name, await build(io, aws, tree, config, app, options.env ?? process.env));
+    for (const app of config.apps) bundles.set(app.name, await build(io, steps, aws, tree, config, app, options.env ?? process.env));
 
-    const assembly = synth(io, tree, config);
+    const assembly = synth(steps, tree, config);
     await checkAssemblySafe(io, assembly, options.checkAssembly);
     checkPoliciesSafe(io, root, assembly, config, options.allowReplacement ?? false);
     const session = await fencedSession(io, aws, config);
@@ -505,9 +657,12 @@ export async function deployCommand(options) {
       }
       const uploaded = await upload({ dir, bucket, project: config.project, app: app.name, sha, region: config.aws.region, s3: clients.s3 });
       io.say(`uploaded ${uploaded.bytes} bytes to ${uploaded.url}`);
+      // The hook is read with git from the root, never from the tree: the root was checked clean at `sha` and its .git
+      // is never mounted, while any container step could have rewritten the tree's .git (a planted promisor remote's
+      // core.sshCommand runs on the next host git that needs an object there).
       const released = await release({
         project: config.project, app: app.name, sha, bucket, region: config.aws.region,
-        checkout: tree, configure: app.server.configure, units: app.server.units, health: app.server.health,
+        checkout: root, configure: app.server.configure, units: app.server.units, health: app.server.health,
         bundleSha256: uploaded.sha256,
         s3: clients.s3, ssm: clients.ssm, ec2: clients.ec2, out: io.out,
       });
@@ -515,7 +670,7 @@ export async function deployCommand(options) {
     }
 
     if (config.smoke) {
-      const r = io.run('bash', ['-c', config.smoke.run], { cwd: tree, fullEnv: codeEnv(config) });
+      const r = steps.exec('bash', ['-c', config.smoke.run], { cwd: tree });
       if (r.status !== 0) throw new CliError(`the site is live but failing its smoke test (the smoke command exited ${r.status})`);
       io.say(io.dryRun ? 'dry run: smoke test not run' : 'smoke test passed');
     }

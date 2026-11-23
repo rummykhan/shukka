@@ -30,6 +30,10 @@ import { CliError } from './exec.mjs';
  * @typedef {{ send(command: any): Promise<any> }} Client
  * @typedef {{ name: string, arn: string, defaultVersionId: string }} LocalPolicy
  * @typedef {{ accessKeyId: string, secretAccessKey: string, sessionToken: string }} Session
+ * @typedef {keyof typeof FENCED_KINDS} ResourceKind
+ * @typedef {{ kind: ResourceKind, name: string, path?: string }} AccountResource name as CloudFormation's physical id
+ *   gives it (a queue's URL, a topic's ARN, otherwise the name); path for an IAM role or instance profile whose path
+ *   is not `/`
  * @typedef {{
  *   callerArn: () => Promise<{ account: string, arn: string }>,
  *   roleArn: (roleName: string) => Promise<string>,
@@ -44,6 +48,9 @@ import { CliError } from './exec.mjs';
  *   localPolicies: () => Promise<LocalPolicy[]>,
  *   policyDocument: (policy: LocalPolicy) => Promise<string>,
  *   assumeRole: (roleArn: string, sessionName: string) => Promise<Session>,
+ *   accountResources: () => Promise<AccountResource[]>,
+ *   stacksWithTags: () => Promise<{ name: string, tags: Record<string, string> }[]>,
+ *   stackPhysicalIds: (name: string) => Promise<string[]>,
  *   clients: () => { s3: Client, ssm: Client, ec2: Client },
  * }} Aws
  */
@@ -56,6 +63,25 @@ function notFound(error) {
   const e = /** @type {{ name?: string, message?: string }} */ (error);
   return e.name === 'ParameterNotFound' || e.name === 'NoSuchEntity' || /does not exist/.test(e.message ?? '');
 }
+
+/**
+ * Every kind of resource the fence grants by name prefix (lib/boundary.ts: an ARN ending `<project>*` or `<Project>*`),
+ * with the part of that ARN before the prefix (`<service>:<resource type>`), and so every kind bootstrap lists to find
+ * names the new fence would reach. A test keeps this in step with boundary.ts.
+ */
+export const FENCED_KINDS = Object.freeze({
+  'dynamodb-table': 'dynamodb:table/',
+  's3-bucket': 's3:',
+  'sqs-queue': 'sqs:',
+  'sns-topic': 'sns:',
+  'lambda-function': 'lambda:function:',
+  'log-group': 'logs:log-group:',
+  'cloudwatch-alarm': 'cloudwatch:alarm:',
+  'iam-role': 'iam:role/',
+  'iam-instance-profile': 'iam:instance-profile/',
+  'ses-configuration-set': 'ses:configuration-set/',
+  'ssm-document': 'ssm:document/',
+});
 
 /**
  * The real reads, with the caller's profile (or the default credential chain) and region.
@@ -193,6 +219,80 @@ export function realAws({ profile, region, io }) {
       if (r.status !== 0) throw new CliError(`cannot assume ${roleArn}; is your principal one of the project's emergency principals (shukka bootstrap --emergency-principal)?`);
       const c = JSON.parse(r.stdout).Credentials ?? {};
       return { accessKeyId: String(c.AccessKeyId), secretAccessKey: String(c.SecretAccessKey), sessionToken: String(c.SessionToken) };
+    },
+    async accountResources() {
+      // Through the AWS CLI (read-only; it pages by itself), as STS and Route 53: no SDK client per service. S3 and
+      // IAM list the whole account; the others, this region. One listing per kind in FENCED_KINDS.
+      /**
+       * @param {string[]} args
+       * @returns {any}
+       */
+      const list = (args) => {
+        const r = io.run('aws', [...args, ...cliArgs], { mutates: false, capture: 'stdout' });
+        if (r.status !== 0) throw new CliError(`cannot list the account's resources (aws ${args.join(' ')} failed); the fence check would be blind`);
+        return JSON.parse(r.stdout || '{}');
+      };
+      /** @type {AccountResource[]} */
+      const found = [];
+      for (const name of list(['dynamodb', 'list-tables']).TableNames ?? []) found.push({ kind: 'dynamodb-table', name: String(name) });
+      for (const b of list(['s3api', 'list-buckets']).Buckets ?? []) found.push({ kind: 's3-bucket', name: String(b.Name) });
+      for (const url of list(['sqs', 'list-queues']).QueueUrls ?? []) found.push({ kind: 'sqs-queue', name: String(url) });
+      for (const t of list(['sns', 'list-topics']).Topics ?? []) found.push({ kind: 'sns-topic', name: String(t.TopicArn) });
+      for (const f of list(['lambda', 'list-functions']).Functions ?? []) found.push({ kind: 'lambda-function', name: String(f.FunctionName) });
+      for (const g of list(['logs', 'describe-log-groups']).logGroups ?? []) found.push({ kind: 'log-group', name: String(g.logGroupName) });
+      const alarms = list(['cloudwatch', 'describe-alarms']);
+      for (const a of [...(alarms.MetricAlarms ?? []), ...(alarms.CompositeAlarms ?? [])]) found.push({ kind: 'cloudwatch-alarm', name: String(a.AlarmName) });
+      for (const p of list(['iam', 'list-instance-profiles']).InstanceProfiles ?? []) {
+        const name = String(p.InstanceProfileName);
+        found.push(p.Path && p.Path !== '/' ? { kind: 'iam-instance-profile', name, path: String(p.Path) } : { kind: 'iam-instance-profile', name });
+      }
+      // The CLI does not page sesv2 list-configuration-sets by itself.
+      /** @type {string | undefined} */
+      let next;
+      do {
+        const r = list(['sesv2', 'list-configuration-sets', ...(next ? ['--next-token', next] : [])]);
+        for (const name of r.ConfigurationSets ?? []) found.push({ kind: 'ses-configuration-set', name: String(name) });
+        next = r.NextToken || undefined;
+      } while (next);
+      for (const d of list(['ssm', 'list-documents', '--filters', 'Key=Owner,Values=Self']).DocumentIdentifiers ?? []) found.push({ kind: 'ssm-document', name: String(d.Name) });
+      /** @type {string | undefined} */
+      let marker;
+      do {
+        const r = await iam.send(new ListRolesCommand(marker ? { Marker: marker } : {}));
+        for (const role of r.Roles ?? []) {
+          if (!role.RoleName) continue;
+          found.push(role.Path && role.Path !== '/' ? { kind: 'iam-role', name: role.RoleName, path: role.Path } : { kind: 'iam-role', name: role.RoleName });
+        }
+        marker = r.IsTruncated ? r.Marker : undefined;
+      } while (marker);
+      return found;
+    },
+    async stacksWithTags() {
+      /** @type {{ name: string, tags: Record<string, string> }[]} */
+      const stacks = [];
+      /** @type {string | undefined} */
+      let token;
+      do {
+        const r = await cfn.send(new DescribeStacksCommand(token ? { NextToken: token } : {}));
+        for (const st of r.Stacks ?? []) {
+          if (!st.StackName || st.StackStatus === 'DELETE_COMPLETE') continue;
+          stacks.push({ name: st.StackName, tags: Object.fromEntries((st.Tags ?? []).map((/** @type {any} */ t) => [t.Key, t.Value])) });
+        }
+        token = r.NextToken;
+      } while (token);
+      return stacks;
+    },
+    async stackPhysicalIds(name) {
+      /** @type {string[]} */
+      const ids = [];
+      /** @type {string | undefined} */
+      let token;
+      do {
+        const r = await cfn.send(new ListStackResourcesCommand({ StackName: name, ...(token ? { NextToken: token } : {}) }));
+        for (const s of r.StackResourceSummaries ?? []) if (s.PhysicalResourceId) ids.push(s.PhysicalResourceId);
+        token = r.NextToken;
+      } while (token);
+      return ids;
     },
     clients() {
       return { s3: new S3Client(config), ssm, ec2: new EC2Client(config) };

@@ -124,7 +124,16 @@ export function hookKey(project, app, sha) {
  * @returns {Buffer}
  */
 function git(checkout, args) {
-  const result = spawnSync('git', ['-C', checkout, ...args]);
+  // A fixed, minimal environment: no lazy fetch from a promisor remote (whose core.sshCommand would run), no system or
+  // global config, no GIT_DIR or other variable of the caller's steering which repository is read.
+  const env = {
+    PATH: process.env.PATH ?? '/usr/bin:/bin',
+    GIT_NO_LAZY_FETCH: '1',
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_CONFIG_GLOBAL: '/dev/null',
+    GIT_TERMINAL_PROMPT: '0',
+  };
+  const result = spawnSync('git', ['-C', checkout, ...args], { env });
   if (result.error) throw new Error(`git: ${result.error.message}`);
   if (result.status !== 0) {
     throw new Error(`git ${args[0]} failed in ${checkout}: ${result.stderr.toString().trim().split('\n')[0] ?? ''}`);

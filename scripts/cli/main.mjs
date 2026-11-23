@@ -5,7 +5,7 @@
 // 10 to 13 a release failed with the release script's code (scripts/release.mjs).
 
 import { realAws } from './aws.mjs';
-import { CliError, cleanTemps, createIo } from './exec.mjs';
+import { CliError, HOST_CODE_WARNING, PROJECT_BASE_IMAGE, PROJECT_PLATFORM, SERVICES, cleanTemps, createIo } from './exec.mjs';
 
 /**
  * @typedef {{ name: string, value?: string, repeat?: boolean, help: string }} FlagSpec
@@ -16,6 +16,28 @@ const PROFILE = { name: 'profile', value: '<name>', help: 'AWS profile to use (d
 const REGION = { name: 'region', value: '<region>', help: 'AWS region (default: aws.region in shukka.json; must match it)' };
 const CONFIG = { name: 'config', value: '<path>', help: 'path of shukka.json (default: shukka.json)' };
 const DRY_RUN = { name: 'dry-run', help: 'print every command that would change something, change nothing (lookups still run)' };
+const TRUST = { name: 'trust-project-code', help: "without Docker, run the project's own code on this machine as you (warns; it can read your home directory)" };
+
+/** How diff and deploy run the project's own code: the same text in both commands' help. */
+const PROJECT_CODE_HELP = [
+  'Project code: npm ci, cdk synth, the checks, build, bundle and smoke run in throwaway Docker containers',
+  `(docker run --rm --platform ${PROJECT_PLATFORM}) of the image shukka-project:<hash>, built here from shukka's`,
+  'scripts/cli/image/Dockerfile the first time and again only when that file changes. Its base is node:22 (Debian',
+  'bookworm) pinned by its multi-platform index digest',
+  `(${PROJECT_BASE_IMAGE}); it holds Node 22, npm, npx,`,
+  'bash, git, curl, jq, python3, make, gcc, g++ and ca-certificates. Only the fresh worktree is mounted, read-write,',
+  'at its own path; the container runs as your user and group, so files written back are yours; it has no home',
+  'directory of yours (HOME=/tmp inside), no capabilities, and none of your environment: only CI=true,',
+  "CDK_DEFAULT_ACCOUNT, CDK_DEFAULT_REGION and the app's build env and buildEnv values (names starting AWS_, GH_ or",
+  'GITHUB_, and HOME, are refused). The network is allowed (npm needs it). A check\'s services',
+  `(${Object.keys(SERVICES).join(', ')}) start as sibling containers from the images the workflows use and the check`,
+  'joins their network, so it reaches them on localhost as in CI; they are removed when the check ends. Any other',
+  'service is refused: use --skip-checks. git metadata is not in the container (the worktree\'s .git points outside',
+  'it). The bundle must be a real directory inside the worktree (no symbolic link). cdk diff and cdk deploy then',
+  'run on this machine, as below, on the assembly the container wrote.',
+  'Without Docker, diff and deploy refuse unless --trust-project-code is given, and then print this warning:',
+  `  ${HOST_CODE_WARNING}.`,
+];
 
 /** @type {CommandSpec[]} */
 export const COMMANDS = [
@@ -29,10 +51,14 @@ export const COMMANDS = [
       "the account's GitHub OIDC provider, or imports an existing one with --oidc-provider-arn, and lists the account's",
       'projects (kept from the deployed stack unless --projects is given).',
       '',
-      'Once per project, with admin credentials, in the project root: refuses a project name that prefixes another',
-      "project in the account (or is prefixed by one), a qualifier already bootstrapped by anything but shukka for this",
-      'project (or CDK\'s default hnb659fds), private CloudFormation extensions, and roles named like the project',
-      'without its boundary. Then deploys Shukka-Boundary-<project> (the boundary and the three execution policies,',
+      'Once per project, with admin credentials, reading shukka.json from --config: refuses a project name that prefixes',
+      "another project in the account (or is prefixed by one), a qualifier already bootstrapped by anything but shukka for",
+      'this project (or CDK\'s default hnb659fds), private CloudFormation extensions, roles named like the project without',
+      'its boundary, and any DynamoDB table, S3 bucket, SQS queue, SNS topic, Lambda function, log group, CloudWatch alarm,',
+      'IAM role, IAM instance profile, SES configuration set or SSM document named <project>* or <Project>* (the fence)',
+      'that is in no stack tagged Project=<project> or shukka:project=<project>:',
+      "the fence would hand it to this project's pipeline (S3 and IAM are listed account-wide, the rest in the region).",
+      'Then deploys Shukka-Boundary-<project> (the boundary and the three execution policies,',
       "cdk deploy), the project's own bootstrap as stack CDKToolkit-<qualifier> (aws cloudformation deploy; its",
       'execution role carries the three execution policies, its roles trust the infra role and the emergency',
       'principals), copies each buildEnv value from Parameter Store /<project>/prod/<NAME> to a GitHub repository',
@@ -55,18 +81,21 @@ export const COMMANDS = [
   },
   {
     name: 'diff',
-    usage: 'shukka diff [--config <path>] [--profile <name>] [--region <region>]',
+    usage: 'shukka diff [--config <path>] [--trust-project-code] [--profile <name>] [--region <region>]',
     summary: [
       'Refuses unless the working tree is clean and HEAD equals origin/main. Synthesizes the CDK app from a fresh',
-      'worktree of origin/main (npm ci, cdk synth in infra.dir, no AWS credentials), prints cdk diff run as the',
+      'worktree of origin/main (npm ci, cdk synth in infra.dir, as project code: below), prints cdk diff run as the',
       'project\'s bootstrap deploy role (as for deploy, below) and the guard\'s verdict (scripts/guard.mjs). Exit 0 when',
       'nothing would be deleted or replaced, 1 when something would be or the diff is incomplete.',
+      '',
+      ...PROJECT_CODE_HELP,
     ].join('\n'),
-    flags: [CONFIG, PROFILE, REGION],
+    flags: [CONFIG, TRUST, PROFILE, REGION],
   },
   {
     name: 'deploy',
-    usage: 'shukka deploy [--config <path>] [--profile <name>] [--region <region>] [--bucket <name>] [--allow-replacement] [--skip-checks] [--dry-run]',
+    usage: 'shukka deploy [--config <path>] [--profile <name>] [--region <region>] [--bucket <name>] [--allow-replacement] [--skip-checks]\n'
+      + '    [--trust-project-code] [--dry-run]',
     summary: [
       'The emergency path when GitHub is down. Refuses unless the working tree is clean and HEAD equals origin/main,',
       'then does what the workflows do, in their order (credentials below): the checks, build and bundle every',
@@ -75,19 +104,21 @@ export const COMMANDS = [
       '(scripts/upload.mjs) and release it on the servers (scripts/release.mjs), and the smoke test. Every part',
       'deploys, whatever changed. It builds from a fresh worktree of origin/main and reads shukka.json from there.',
       '',
-      "Credentials: the project's own code (checks, build, npm ci, cdk synth, smoke) runs with every AWS_* variable",
-      'removed, the AWS config and credentials files pointed at empty files and instance metadata off. cdk diff and',
-      "cdk deploy run with shukka's pinned cdk and only a session of the project's bootstrap deploy role",
-      '(cdk-<qualifier>-deploy-role-<account>-<region>), which your principal must be allowed to assume (an',
+      ...PROJECT_CODE_HELP,
+      '',
+      "Credentials: cdk diff and cdk deploy run with shukka's pinned cdk and only a session of the project's bootstrap",
+      'deploy role (cdk-<qualifier>-deploy-role-<account>-<region>), which your principal must be allowed to assume (an',
       "emergency principal named at bootstrap). Upload and release are shukka's own code and use your credentials.",
-      'Code that reads ~/.aws files directly by path is not stopped: where possible, run the emergency deploy as a',
-      'non-admin emergency principal rather than an admin.',
+      'With --trust-project-code the project\'s code runs with every AWS_* variable removed, the AWS config and',
+      'credentials files pointed at empty files and instance metadata off, but code that reads ~/.aws by path is not',
+      'stopped: there, run the emergency deploy as a non-admin emergency principal rather than an admin.',
     ].join('\n'),
     flags: [
       CONFIG,
       { name: 'bucket', value: '<name>', help: 'bucket for app bundles (default: <project>-deploy-<account>, as in the workflows)' },
       { name: 'allow-replacement', help: 'deploy even when resources would be deleted or replaced (the guard\'s --allow)' },
       { name: 'skip-checks', help: "skip the project's checks (warns)" },
+      TRUST,
       PROFILE,
       REGION,
       DRY_RUN,
@@ -277,9 +308,10 @@ export async function main(argv, deps = {}) {
     const target = { ...(profile ? { profile } : {}), ...(region ? { region } : {}) };
     const { deployCommand, diffCommand } = await import('./deploy.mjs');
     const checkAssembly = deps.checkAssembly ? { checkAssembly: deps.checkAssembly } : {};
-    if (spec.name === 'diff') return await diffCommand({ io, makeAws, target, configPath, cwd, ...checkAssembly });
+    const trustProjectCode = flags['trust-project-code'] === true;
+    if (spec.name === 'diff') return await diffCommand({ io, makeAws, target, configPath, cwd, trustProjectCode, ...checkAssembly });
     return await deployCommand({
-      io, makeAws, target, configPath, cwd, env, ...checkAssembly,
+      io, makeAws, target, configPath, cwd, env, trustProjectCode, ...checkAssembly,
       ...(str(flags, 'bucket') ? { bucket: str(flags, 'bucket') } : {}),
       allowReplacement: flags['allow-replacement'] === true,
       skipChecks: flags['skip-checks'] === true,
