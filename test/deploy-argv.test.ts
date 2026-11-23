@@ -64,11 +64,12 @@ function runDeployStep(assembly: string) {
   const cwd = mkdtempSync(join(scratch, 'cwd-'));
   const wrapper = join(scratch, 'cdk');
   writeFileSync(wrapper, `#!/bin/sh\nexec "${process.execPath}" "${cdkBin()}" "$@"\n`, { mode: 0o755 });
-  const r = spawnSync(process.execPath, ['--input-type=module', '-', assembly, '0123456789abcdef0123456789abcdef01234567'], {
+  // The step hands the script shukka's assembly.mjs (deployCommands) and the project (shu-9bj.12).
+  const r = spawnSync(process.execPath, ['--input-type=module', '-', assembly, '0123456789abcdef0123456789abcdef01234567', join(root, 'scripts', 'assembly.mjs')], {
     cwd,
     input: deploySnippet(),
     encoding: 'utf8',
-    env: { ...offlineEnv(), CDK: wrapper },
+    env: { ...offlineEnv(), CDK: wrapper, PROJECT: 'demo' },
     timeout: 120_000,
   });
   return { code: r.status, out: `${r.stdout}${r.stderr}` };

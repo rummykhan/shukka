@@ -65,7 +65,7 @@ Example values: project `acme`, repository `acme-org/acme`, account `12345678901
   node -e "JSON.parse(require('fs').readFileSync('shukka.json','utf8'))" && echo ok
   ```
 
-- [ ] Install shukka's constructs and tsx in the infra directory, from the exact tag your caller workflow pins (`v1.0.0-rc.N` while testing a release candidate), and commit the lockfile:
+- [ ] Install shukka's constructs and tsx in the infra directory, from the exact release your caller runs (`v1.2.3`; the newest `v1.x.y` if your caller follows `@v1`; `v1.0.0-rc.N` while testing a release candidate), and commit the lockfile:
 
   ```bash
   cd ~/src/acme/infra
@@ -76,7 +76,7 @@ Example values: project `acme`, repository `acme-org/acme`, account `12345678901
 
 - [ ] `cdk.json` runs the app with tsx: `"app": "npx tsx bin/app.ts"`.
 
-- [ ] In the CDK app (README, step 3): `shukkaSynthesizer('<qualifier>')` on every stack; a CI stack `<Project>-Ci` holding `ShukkaAccess` with your `githubRepo` subject and deploy bucket; `Tags.of(app).add('Project', '<project>')`; `applyBoundary(app, '<project>')`. Import from `shukka`, never from files under it. Testing a release candidate: `allowPrerelease: true` on `ShukkaAccess` (never in production), or AWS refuses the pre-release tag.
+- [ ] In the CDK app (README, step 3): `shukkaSynthesizer('<qualifier>')` on every stack but the CI stack; a CI stack named exactly `<Project>-Ci` with `shukkaCiSynthesizer('<qualifier>')`, holding only `ShukkaAccess` with your `githubRepo` subject and deploy bucket; `Tags.of(app).add('Project', '<project>')`; `applyBoundary(app, '<project>')`. Import from `shukka`, never from files under it. Testing a release candidate: `allowPrerelease: true` on `ShukkaAccess` (never in production), or AWS refuses the pre-release tag.
 
 - [ ] Every stack is named `<project>-...` or `<Project>-...`, at the top level of the app (not inside a CDK `Stage`); every resource you name starts with the project name. Stacks use only the services the fence covers (README, "What the fence stops").
 
@@ -139,10 +139,10 @@ Example values: project `acme`, repository `acme-org/acme`, account `12345678901
   gh variable list --repo acme-org/acme
   ```
 
-- [ ] Deploy the CI stack once by hand, from a clean checkout you trust (later changes to its three roles also need an admin deploy; the fence refuses them):
+- [ ] Deploy the CI stack by hand with admin credentials, from a clean checkout of `main` you trust, after reading its diff. The pipeline and `shukka deploy` never deploy `<Project>-Ci`: repeat this whenever it changes (the pipeline's diff then says `guard: Acme-Ci changes, and the pipeline never deploys it`):
 
   ```bash
-  cd ~/src/acme/infra && npm ci && npx cdk deploy Acme-Ci --profile admin
+  cd ~/src/acme/infra && npm ci && npx cdk diff Acme-Ci --profile admin && npx cdk deploy Acme-Ci --profile admin
   for r in infra app diff; do aws iam get-role --role-name acme-shukka-$r --profile admin --query Role.Arn; done
   ```
 

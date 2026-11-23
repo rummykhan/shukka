@@ -282,7 +282,7 @@ test('shu-9bj.12: deployCommands leaves the CI stack out and never lets cdk pull
     skipped: ['Shukkatest-Ci'],
   });
   // No CI stack in the app: unchanged, one --all.
-  const { 'Shukkatest-Ci': _ci, 'Shukkatest-Ci.assets': _a, ...noCi } = same;
+  const noCi = Object.fromEntries(Object.entries(same).filter(([id]) => !id.startsWith('Shukkatest-Ci')));
   assert.deepEqual(deployCommands(noCi, 'shukkatest', 'abc').commands, [['--all', '--tags=Project=shukkatest', '--tags=shukka:revision=abc']]);
   // Only the CI stack: nothing to deploy.
   assert.deepEqual(deployCommands({ 'Shukkatest-Ci': same['Shukkatest-Ci'] }, 'shukkatest', 'abc'), { commands: [], skipped: ['Shukkatest-Ci'] });

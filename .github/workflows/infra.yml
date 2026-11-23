@@ -592,7 +592,7 @@ jobs:
             process.exit(1);
           }
           for (const s of plan.skipped) {
-            console.log(`::notice::shukka: not deploying ${s}: the CI stack is deployed by hand with admin credentials (npx cdk deploy ${s}, README step 5)`);
+            console.log(`::notice::shukka: not deploying ${s}: the CI stack is deployed by hand with admin credentials (cdk deploy ${s}, README step 5)`);
           }
           if (plan.commands.length === 0) console.log(plan.skipped.length > 0 ? 'shukka: no stack to deploy but the CI stack' : 'shukka: the app has no stacks');
           for (const args of plan.commands) {

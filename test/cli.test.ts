@@ -535,7 +535,7 @@ test('shu-5ix: deploy dry run prints the workflow steps in order: checks, build,
     new RegExp(`^${box}bash \\S+/shukka-tree-\\S+/\\.shukka-bundle-\\S+/bundle\\.sh$`), // shukka's script, copied into the tree
     new RegExp(`^${box}npm ci$`),
     new RegExp(`^${box}npx --no-install cdk synth --quiet --output \\S+$`),
-    /^node scripts\/assembly\.mjs check \S+$/,
+    /^node scripts\/assembly\.mjs check \S+ --project shukkatest$/,
     new RegExp(`^node scripts/policy-guard\\.mjs \\S+ --account ${ACCOUNT} --mail-domain example\\.com$`),
     new RegExp(`^assume arn:aws:iam::${ACCOUNT}:role/cdk-shukkatest-deploy-role-${ACCOUNT}-us-east-1 as shukka-emergency; cdk gets only that session$`),
     new RegExp(`^${reEscape(CDK)} diff --app \\S+ --no-color$`),
