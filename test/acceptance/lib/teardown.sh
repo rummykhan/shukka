@@ -73,14 +73,59 @@ leftovers() {
     grep -E '^cdk-shukkatest-' || true); do printf 'LEFTOVER ecr %s\n' "$x"; done
   # Anything still tagged as ours. Terminated instances keep their tags for up to an hour; they are
   # gone for all purposes, so they are not counted.
+  # The tagging API also lists resources deleted a while ago (ENIs, volumes), so each ARN is described
+  # first and only reported if it is still there.
   for arn in $(aws resourcegroupstaggingapi get-resources --tag-filters "Key=Project,Values=$PROJECT,shukkatest-standin" \
     --query 'ResourceTagMappingList[].ResourceARN' --output text 2>/dev/null | text_items); do
     if [[ "$arn" == *:instance/* ]]; then
       state=$(aws ec2 describe-instances --instance-ids "${arn##*/}" --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || echo gone)
       [[ "$state" == terminated || "$state" == gone || "$state" == None ]] && continue
+    elif ! arn_exists "$arn"; then
+      continue
     fi
     printf 'LEFTOVER tagged %s\n' "${arn//$acct/123456789012}"
   done
+}
+
+# aws_not_found <aws args...>: runs the read-only call; true only if it failed because the thing is not
+# there. Success, or any other error (a denied read, a throttle), counts as present.
+aws_not_found() {
+  local err
+  if err=$(aws "$@" 2>&1 >/dev/null); then return 1; fi
+  grep -Eiq 'NotFound|does not exist|NoSuch|Not Found|\(404\)|NonExistent' <<<"$err"
+}
+
+# arn_exists <arn>: false only when a describe of that resource says it is gone. Kinds this does not
+# know how to describe are taken to exist (reported, never hidden).
+arn_exists() {
+  local arn=$1 svc res id st
+  svc=$(cut -d: -f3 <<<"$arn")
+  res=$(cut -d: -f6- <<<"$arn")
+  id=${res##*/}
+  case "$svc:$res" in
+    ec2:volume/*) ! aws_not_found ec2 describe-volumes --volume-ids "$id" ;;
+    ec2:network-interface/*) ! aws_not_found ec2 describe-network-interfaces --network-interface-ids "$id" ;;
+    ec2:security-group/*) ! aws_not_found ec2 describe-security-groups --group-ids "$id" ;;
+    ec2:launch-template/*) ! aws_not_found ec2 describe-launch-templates --launch-template-ids "$id" ;;
+    ec2:snapshot/*) ! aws_not_found ec2 describe-snapshots --snapshot-ids "$id" ;;
+    ec2:image/*) ! aws_not_found ec2 describe-images --image-ids "$id" ;;
+    cloudformation:stack/*)
+      # describe-stacks by ARN still answers for a deleted stack, with DELETE_COMPLETE.
+      st=$(stack_status "$arn")
+      [[ "$st" != ABSENT && "$st" != DELETE_COMPLETE ]] ;;
+    s3:*) ! aws_not_found s3api head-bucket --bucket "$res" ;;
+    dynamodb:table/*) ! aws_not_found dynamodb describe-table --table-name "$id" ;;
+    sqs:*) ! aws_not_found sqs get-queue-url --queue-name "$res" ;;
+    iam:role/*) ! aws_not_found iam get-role --role-name "$id" ;;
+    route53:hostedzone/*) ! aws_not_found route53 get-hosted-zone --id "$id" ;;
+    ssm:parameter/*) ! aws_not_found ssm get-parameter --name "/${res#parameter/}" ;;
+    logs:log-group:*)
+      id=${res#log-group:}
+      id=${id%:\*}
+      [[ -n "$(aws logs describe-log-groups --log-group-name-prefix "$id" \
+        --query "logGroups[?logGroupName=='$id'].logGroupName" --output text 2>/dev/null | text_items)" ]] ;;
+    *) return 0 ;;
+  esac
 }
 no_leftovers() { [[ -z "$(leftovers)" ]]; }
 
@@ -123,10 +168,19 @@ stack_settled() {
   [[ "$st" == REVIEW_IN_PROGRESS || "$st" != *_IN_PROGRESS ]]
 }
 
+# delete_failed_resources <stack>: logical ids of the stack's resources in DELETE_FAILED.
+delete_failed_resources() {
+  aws cloudformation describe-stack-resources --stack-name "$1" \
+    --query "StackResources[?ResourceStatus=='DELETE_FAILED'].LogicalResourceId" --output text 2>/dev/null | text_items
+}
+
 # delete_stack <name>: waits for any operation in progress (a deploy that was running when teardown
-# began) to finish, then deletes, retrying while the stack is still there. Non-zero if it remains.
+# began) to finish, then deletes, retrying while the stack is still there. When a delete leaves the
+# stack DELETE_FAILED, it retries once at once with --retain-resources for the resources that failed
+# (a resource whose creation was cancelled, so nothing exists, but which the execution role may not
+# delete): the stack goes, and anything real it kept is still found by leftovers. Non-zero if it remains.
 delete_stack() {
-  local s=$1 attempt st
+  local s=$1 attempt st retained=0 failed
   if ! is_ours "$s" && ! grep -qx -- "$s" <<<"$(qualifier_stacks)"; then
     die "refusing to delete stack '$s'"
   fi
@@ -145,6 +199,20 @@ delete_stack() {
     log "teardown: stack $s is $st"
     aws cloudformation describe-stack-events --stack-name "$s" --max-items 10 \
       --query "StackEvents[?contains(ResourceStatus, 'FAILED')].[LogicalResourceId, ResourceStatusReason]" --output text >&2 || true
+    if [[ "$st" == DELETE_FAILED && $retained == 0 ]]; then
+      retained=1
+      failed=$(delete_failed_resources "$s")
+      if [[ -n "$failed" ]]; then
+        log "teardown: stack $s, deleting again and retaining $(paste -sd ' ' - <<<"$failed")"
+        # shellcheck disable=SC2086 # one argument per logical id
+        if aws cloudformation delete-stack --stack-name "$s" --retain-resources $failed; then
+          wait_until 3600 20 stack_settled "$s" || true
+          st=$(stack_status "$s")
+          [[ "$st" == ABSENT || "$st" == DELETE_COMPLETE ]] && return 0
+          log "teardown: stack $s is $st after retaining its failed resources"
+        fi
+      fi
+    fi
     sleep 30
   done
   return 1

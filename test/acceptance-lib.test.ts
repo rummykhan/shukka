@@ -545,3 +545,270 @@ test('shu-9bj.19: a stack in another *_IN_PROGRESS state is still waited out bef
   );
   assert.match(r.stderr, /Shukkatest-Box \(UPDATE_COMPLETE\), delete attempt 1/);
 });
+
+// shu-9bj.21: phase D's state, the escape restore, the DELETE_FAILED retry, stale tagged ARNs, need_state
+// failures in command substitutions, and the rollback cases' release-line guard.
+
+const phasesDir = resolve(lib, '..', 'phases');
+const casesDir = resolve(lib, '..', 'cases');
+
+function stateLines(dir: string): string[] {
+  return readFileSync(join(dir, 'run', 'state.env'), 'utf8').split('\n').filter((l) => l !== '');
+}
+
+test('shu-9bj.21: state_set flattens a multi-line value (raw CLI error output) into one line instead of dying', () => {
+  const r = withStubs(
+    `state_set standin_bucket_policy $'\\nAn error occurred (NoSuchBucketPolicy) when calling the GetBucketPolicy operation\\r\\n\\nThe bucket policy does not exist\\n'; state_set plain 'a  b '; echo after; cat "$RUN_DIR/state.env"`,
+  );
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^after$/m, 'state_set did not stop the shell');
+  assert.deepEqual(r.stdout.split('\n').filter((l) => l.includes('=')), [
+    'standin_bucket_policy=An error occurred (NoSuchBucketPolicy) when calling the GetBucketPolicy operation The bucket policy does not exist',
+    'plain=a  b ',
+  ]);
+});
+
+// A stub aws for phase D: the stand-in bucket has no policy and the queue does not exist, and the CLI
+// says so on stderr the way it does, starting with a blank line.
+const fenceStub = `#!/usr/bin/env bash
+( IFS=$'\\x1f'; printf '%s\\n' "$*" ) >>"$STUB_DIR/aws.log"
+case "$1 $2" in
+  "s3api get-bucket-policy") printf '\\nAn error occurred (NoSuchBucketPolicy) when calling the GetBucketPolicy operation: The bucket policy does not exist\\n' >&2; exit 254 ;;
+  "sqs get-queue-url") printf '\\nAn error occurred (AWS.SimpleQueueService.NonExistentQueue) when calling the GetQueueUrl operation:\\nThe specified queue does not exist.\\n' >&2; exit 254 ;;
+esac
+exit 0
+`;
+
+/** Runs phase D against a real local git consumer (with a bare origin) and stubbed aws, CI waits and box. */
+function runPhaseD(boxRun: string): { status: number | null; stderr: string; state: string[]; calls: string; log: string[]; settings: unknown } {
+  const dir = mkdtempSync(join(tmpdir(), 'shu-9bj21d-'));
+  try {
+    const bin = join(dir, 'bin');
+    const consumer = join(dir, 'run', 'consumer');
+    spawnSync('mkdir', ['-p', bin, join(dir, 'run', 'runs'), join(consumer, 'infra')]);
+    writeFileSync(join(bin, 'aws'), fenceStub);
+    writeFileSync(join(bin, 'sleep'), '#!/usr/bin/env bash\nexit 0\n');
+    for (const f of ['aws', 'sleep']) chmodSync(join(bin, f), 0o755);
+    writeFileSync(join(dir, 'aws.log'), '');
+    writeFileSync(join(dir, 'calls'), '');
+    writeFileSync(join(dir, 'escape'), 'ROLLBACK_FAILED\n');
+    writeFileSync(join(consumer, 'infra', 'settings.json'), '{ "escape": false }\n');
+    const git = (cwd: string, ...a: string[]) => {
+      const g = spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.com', ...a], { cwd, encoding: 'utf8' });
+      assert.equal(g.status, 0, g.stderr);
+    };
+    git(dir, 'init', '-q', '--bare', '-b', 'main', 'origin.git');
+    git(consumer, 'init', '-q', '-b', 'main');
+    git(consumer, 'add', '-A');
+    git(consumer, 'commit', '-q', '-m', 'baseline');
+    git(consumer, 'remote', 'add', 'origin', join(dir, 'origin.git'));
+    git(consumer, 'push', '-q', '-u', 'origin', 'main');
+    const fakes = [
+      'snapshot() { :; }',
+      'stack_last_updated() { echo 2026-11-23T10:00:00Z; }',
+      'stack_status() { if [[ "$1" == Shukkatest-Escape ]]; then cat "$STUB_DIR/escape"; else echo CREATE_COMPLETE; fi; }',
+      'delete_stack() { echo "delete_stack $1" >>"$STUB_DIR/calls"; echo ABSENT >"$STUB_DIR/escape"; }',
+      'wait_run_of() { echo "wait_run_of $1" >>"$STUB_DIR/calls"; echo "run-${1:0:7}"; }',
+      'push_main() { echo "push" >>"$STUB_DIR/calls"; c_git push -q origin HEAD:main; }',
+      'c_git() { git -C "$RUN_DIR/consumer" -c user.name=t -c user.email=t@example.com "$@"; }',
+      `box_run() { ${boxRun}; }`,
+      'state_set standin_stack Standin-shukkatest-x; state_set standin_bucket standin-shukkatest-x-1; state_set standin_table standin-shukkatest-x',
+    ].join('\n');
+    const r = spawnSync('bash', ['-c', `set -uo pipefail; source "${lib}/common.sh"; source "${phasesDir}/D-fence.sh"\n${fakes}\nphase_D`], {
+      encoding: 'utf8',
+      timeout: 60_000,
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, STUB_DIR: dir, RUN_DIR: join(dir, 'run'), RUN_ID: '20261123100000', AWS_PROFILE: 'stub' },
+    });
+    const log = spawnSync('git', ['log', '--format=%s', 'main'], { cwd: join(dir, 'origin.git'), encoding: 'utf8' }).stdout.split('\n').filter((l) => l);
+    return {
+      status: r.status,
+      stderr: r.stderr,
+      state: stateLines(dir),
+      calls: readFileSync(join(dir, 'calls'), 'utf8'),
+      log,
+      settings: JSON.parse(readFileSync(join(consumer, 'infra', 'settings.json'), 'utf8')),
+    };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test('shu-9bj.21: phase D stores the stand-in bucket policy and queue answers as single lines and runs the restore merge', () => {
+  const r = runPhaseD('echo AccessDenied');
+  assert.equal(r.status, 0, r.stderr);
+  assert.doesNotMatch(r.stderr, /value has a newline|ERROR/);
+  const get = (k: string) => r.state.filter((l) => l.startsWith(`${k}=`)).at(-1)?.slice(k.length + 1);
+  assert.match(get('standin_bucket_policy') ?? '', /^An error occurred \(NoSuchBucketPolicy\)/);
+  assert.match(get('standin_queue') ?? '', /NonExistentQueue.*does not exist/);
+  assert.ok(get('escape_restore_run'), 'the restore merge ran and its run was recorded');
+  assert.deepEqual(r.log, ['shukkatest 20261123100000: remove the escape attempt', 'shukkatest 20261123100000: escape attempt (fence check)', 'baseline']);
+  assert.match(r.calls, /delete_stack Shukkatest-Escape/);
+});
+
+test('shu-9bj.21: phase D still merges the escape removal and deletes Shukkatest-Escape after the escape part dies', () => {
+  const r = runPhaseD('die "box unreachable"');
+  assert.notEqual(r.status, 0, 'the phase reports the failure');
+  assert.match(r.stderr, /ERROR: box unreachable/);
+  assert.equal(r.log[0], 'shukkatest 20261123100000: remove the escape attempt', 'the restore commit reached main');
+  assert.deepEqual(r.settings, { escape: false });
+  assert.ok(r.state.some((l) => l.startsWith('escape_restore_run=')), 'the restore run was recorded');
+  const calls = r.calls.split('\n');
+  assert.ok(calls.indexOf('delete_stack Shukkatest-Escape') > calls.lastIndexOf('push'), 'Shukkatest-Escape is deleted after the restore merge');
+});
+
+test('shu-9bj.21: other phases pass no raw multi-line CLI or HTTP output to state_set', () => {
+  for (const f of ['D-fence.sh', 'G-rollback.sh']) {
+    const src = readFileSync(join(phasesDir, f), 'utf8');
+    const raw = src.split('\n').filter((l) => /state_set .*(2>&1|http_get)/.test(l) && !/one_line/.test(l));
+    assert.deepEqual(raw, [], f);
+  }
+});
+
+// A stub aws for the DELETE_FAILED retry: Shukkatest-Escape's plain delete fails on StandinBucketPolicy
+// (the execution role may not delete it; its creation was cancelled); a delete that retains it succeeds.
+const retainStub = `#!/usr/bin/env bash
+log="$STUB_DIR/aws.log"
+st="$STUB_DIR/stacks"
+( IFS=$'\\x1f'; printf '%s\\n' "$*" ) >>"$log"
+arg() { local k=$1; shift; while (($#)); do [[ "$1" == "$k" ]] && { printf '%s' "$2"; return; }; shift; done; }
+name=$(arg --stack-name "$@")
+status_of() { awk -v n="$1" '$1 == n && $2 != "DELETE_COMPLETE" {print $2}' "$st"; }
+set_status() { awk -v n="$1" -v s="$2" '$1 == n {$2 = s} {print}' "$st" >"$st.new" && mv "$st.new" "$st"; }
+case "$1 $2" in
+  "sts get-caller-identity") printf '123456789012\\n'; exit 0 ;;
+  "cloudformation list-stacks") awk '$2 != "DELETE_COMPLETE" {print $1}' "$st" | paste -sd '\\t' -; exit 0 ;;
+  "cloudformation describe-stacks")
+    s=$(status_of "$name"); [[ -n "$s" ]] || { echo "Stack with id $name does not exist" >&2; exit 254; }
+    printf '%s\\n' "$s"; exit 0 ;;
+  "cloudformation describe-stack-resources")
+    if [[ "$name" == Shukkatest-Escape && "$(status_of "$name")" == DELETE_FAILED && "$*" == *DELETE_FAILED* ]]; then
+      printf 'StandinBucketPolicy\\tStandinQueue\\n'; exit 0
+    fi ;;
+  "cloudformation delete-stack")
+    if [[ "$name" == Shukkatest-Escape && "$*" != *--retain-resources* ]]; then set_status "$name" DELETE_FAILED; else set_status "$name" DELETE_COMPLETE; fi
+    exit 0 ;;
+esac
+for a in "$@"; do
+  if [[ "$a" == text ]]; then printf 'None\\n'; exit 0; fi
+done
+exit 0
+`;
+
+test('shu-9bj.21: delete_stack retries a DELETE_FAILED stack once with --retain-resources for the failed logical ids', () => {
+  const r = withStubs('delete_stack Shukkatest-Escape', { aws: retainStub, stacks: 'Shukkatest-Escape ROLLBACK_FAILED' });
+  assert.equal(r.status, 0, r.stderr);
+  const deletes = r.calls.filter((c) => c[1] === 'delete-stack');
+  assert.deepEqual(deletes, [
+    ['cloudformation', 'delete-stack', '--stack-name', 'Shukkatest-Escape'],
+    ['cloudformation', 'delete-stack', '--stack-name', 'Shukkatest-Escape', '--retain-resources', 'StandinBucketPolicy', 'StandinQueue'],
+  ]);
+  assert.match(r.stderr, /retaining StandinBucketPolicy StandinQueue/);
+});
+
+test('shu-9bj.21: teardown gets Shukkatest-Escape out by retaining its failed resources, then goes on to delete the bootstrap', () => {
+  const stacks = ['Shukkatest-Escape ROLLBACK_FAILED', 'CDKToolkit-shukkatest CREATE_COMPLETE', 'Shukka-Boundary-shukkatest CREATE_COMPLETE'].join('\n');
+  const r = withStubs('teardown', { aws: retainStub, stacks });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stderr, /teardown: clean/);
+  assert.doesNotMatch(r.stderr, /leaving the shukkatest bootstrap in place/);
+  const at = (pred: (c: string[]) => boolean) => r.calls.findIndex(pred);
+  const retained = at((c) => c[1] === 'delete-stack' && c.includes('Shukkatest-Escape') && c.includes('--retain-resources'));
+  const bootstrap = at((c) => c[1] === 'delete-stack' && c.includes('CDKToolkit-shukkatest'));
+  const boundary = at((c) => c[1] === 'delete-stack' && c.includes('Shukka-Boundary-shukkatest'));
+  assert.ok(retained >= 0 && bootstrap > retained && boundary > bootstrap, 'escape (retained), then bootstrap, then boundary');
+  assert.equal(r.calls.filter((c) => c[1] === 'delete-stack' && c.includes('--retain-resources')).length, 1, 'retained once');
+});
+
+// A stub aws whose tagging API still lists a deleted ENI and volume next to a live volume and a volume
+// whose describe is denied (reported: only "not found" counts as gone).
+const taggedStub = `#!/usr/bin/env bash
+( IFS=$'\\x1f'; printf '%s\\n' "$*" ) >>"$STUB_DIR/aws.log"
+a="arn:aws:ec2:us-east-1:123456789012"
+case "$1 $2" in
+  "sts get-caller-identity") printf '123456789012\\n'; exit 0 ;;
+  "resourcegroupstaggingapi get-resources")
+    printf '%s\\t%s\\t%s\\t%s\\t%s\\n' "$a:network-interface/eni-gone" "$a:volume/vol-gone" "$a:volume/vol-live" "$a:volume/vol-denied" "$a:elastic-ip/eipalloc-1"; exit 0 ;;
+  "ec2 describe-network-interfaces") echo "An error occurred (InvalidNetworkInterfaceID.NotFound) when calling the DescribeNetworkInterfaces operation: The networkInterface ID 'eni-gone' does not exist" >&2; exit 254 ;;
+  "ec2 describe-volumes")
+    case "$*" in
+      *vol-gone*) echo "An error occurred (InvalidVolume.NotFound) when calling the DescribeVolumes operation: The volume 'vol-gone' does not exist." >&2; exit 254 ;;
+      *vol-denied*) echo "An error occurred (UnauthorizedOperation) when calling the DescribeVolumes operation" >&2; exit 254 ;;
+      *) printf '{"Volumes":[{"VolumeId":"vol-live"}]}\\n'; exit 0 ;;
+    esac ;;
+esac
+for a in "$@"; do
+  if [[ "$a" == text ]]; then printf 'None\\n'; exit 0; fi
+done
+exit 0
+`;
+
+test('shu-9bj.21: leftovers describes each tagged ARN and reports only those that still exist', () => {
+  const r = withStubs('leftovers', { aws: taggedStub });
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(lines(r.stdout), [
+    'LEFTOVER tagged arn:aws:ec2:us-east-1:123456789012:elastic-ip/eipalloc-1',
+    'LEFTOVER tagged arn:aws:ec2:us-east-1:123456789012:volume/vol-denied',
+    'LEFTOVER tagged arn:aws:ec2:us-east-1:123456789012:volume/vol-live',
+  ]);
+  assert.ok(r.calls.some((c) => c[1] === 'describe-network-interfaces' && c.includes('eni-gone')), 'the ENI was described');
+});
+
+/** Runs case_exec on a case file written from `body` (the body of case_run), with `pre` run first. */
+function runCase(body: string, pre = ''): { status: number | null; stderr: string } {
+  const dir = mkdtempSync(join(tmpdir(), 'shu-9bj21c-'));
+  try {
+    spawnSync('mkdir', ['-p', join(dir, 'run', 'runs')]);
+    const f = join(dir, 'case.sh');
+    writeFileSync(f, `case_run() {\n${body}\n}\n`);
+    const r = spawnSync('bash', ['-c', `set -uo pipefail; source "${lib}/common.sh"; ${pre}\ncase_exec "${f}"`], {
+      encoding: 'utf8',
+      timeout: 60_000,
+      env: { ...process.env, RUN_DIR: join(dir, 'run'), STUB_DIR: dir },
+    });
+    return { status: r.status, stderr: r.stderr };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test('shu-9bj.21: a missing state value fails the case, whether need_state ran in an assignment or inside an assertion', () => {
+  const assigned = runCase('  local run\n  run=$(need_state escape_restore_run) || return\n  ok "never reached"');
+  assert.notEqual(assigned.status, 0, assigned.stderr);
+  assert.match(assigned.stderr, /state 'escape_restore_run' is missing/);
+  const inline = runCase('  assert_match "x$(need_state standin_queue)" "x" "a check that would pass on an empty value"');
+  assert.notEqual(inline.status, 0, inline.stderr);
+  const present = runCase('  assert_eq "$(need_state k)" v "present"', 'state_set k v');
+  assert.equal(present.status, 0, present.stderr);
+  const direct = runCase('  fail "direct"');
+  assert.notEqual(direct.status, 0);
+  const runSh = readFileSync(resolve(lib, '..', 'run.sh'), 'utf8');
+  assert.match(runSh, /if case_exec "\$f"; then verdict=PASS; else verdict=FAIL; fi/);
+});
+
+const OLD = 'a'.repeat(40);
+const NEW = 'b'.repeat(40);
+const rollbackState = `state_set unhealthy_run 77; state_set unhealthy_sha ${NEW}; state_set before_unhealthy_web_rev ${OLD}; state_set after_unhealthy_web_rev ${OLD}; state_set after_unhealthy_http "200 ${OLD}"; state_set before_unhealthy_api_rev c; state_set after_unhealthy_api_rev c; state_set after_restore_api_rev c; state_set before_unhealthy_api_unit "1 active"; state_set after_restore_api_unit "1 active"`;
+const ciFakes = `run_conclusion() { echo failure; }; job_conclusions() { echo failure; }; did_not_run() { :; }; http_code() { echo 200; }; box_ip() { echo 10.0.0.1; }`;
+
+test('shu-9bj.21: R5 rollback cases fail when no release ran on the box, before comparing current/previous', () => {
+  for (const c of ['G01-R5-unhealthy-release-rolls-back.sh', 'G02-R5-other-app-keeps-running.sh']) {
+    const body = `  source "${join(casesDir, c)}"; case_run`;
+    const noRelease = runCase(body, `${rollbackState}; ${ciFakes}; printf 'shukka / servers / release web\\tskipped: infra deploy failed ${OLD} ${NEW}\\n' >"$RUN_DIR/runs/77.log"`);
+    assert.notEqual(noRelease.status, 0, c);
+    assert.match(noRelease.stderr, /not ok - the web release of b+ ran on the box and rolled back/, c);
+    assert.doesNotMatch(noRelease.stderr, /ok - web current\/REVISION is the previous release|ok - api release unchanged/, c);
+    const released = runCase(body, `${rollbackState}; ${ciFakes}; printf 'release web\\tshukka: shukkatest/web ${OLD} -> ${NEW} rolled-back\\n' >"$RUN_DIR/runs/77.log"`);
+    assert.equal(released.status, 0, `${c}: ${released.stderr}`);
+  }
+});
+
+test('shu-9bj.21: the R8 CLI rollback case fails when shukka deploy released nothing, before comparing current/previous', () => {
+  const body = `  source "${join(casesDir, 'J04-R8-cli-rolls-back-unhealthy.sh')}"; case_run`;
+  const st = `state_set before_cli_unhealthy_web_rev ${OLD}; state_set cli_unhealthy_sha ${NEW}; state_set cli_unhealthy_rc 1; state_set after_cli_unhealthy_web_rev ${OLD}; state_set cli_restore_rc 0`;
+  const none = runCase(body, `${st}; printf 'shukka: stacks failed (${OLD} ${NEW})\\n' >"$RUN_DIR/runs/cli-unhealthy.log"`);
+  assert.notEqual(none.status, 0);
+  assert.match(none.stderr, /not ok - the web release of b+ ran on the box and rolled back \(no release line in the shukka deploy output\)/);
+  assert.doesNotMatch(none.stderr, /ok - web current\/REVISION is the previous release/);
+  const rolled = runCase(body, `${st}; printf 'shukka: shukkatest/web ${OLD} -> ${NEW} rolled-back\\n' >"$RUN_DIR/runs/cli-unhealthy.log"`);
+  assert.equal(rolled.status, 0, rolled.stderr);
+});

@@ -64,10 +64,16 @@ result() {
   if [[ -n "${RESULTS_FILE:-}" ]]; then printf '%s\n' "$line" >>"$RESULTS_FILE"; fi
 }
 
-# Assertions used inside case_run. They never exit; they count failures in CASE_FAILS.
+# Assertions used inside case_run. They never exit; they count failures in CASE_FAILS and, when the
+# case runs under case_exec, also in CASE_FAIL_FILE, so a failure made inside $(...) (need_state's,
+# typically) still reaches the case: a subshell's CASE_FAILS is lost, a line in the file is not.
 CASE_FAILS=${CASE_FAILS:-0}
 ok() { printf '    ok - %s\n' "$*" >&2; }
-fail() { printf '    not ok - %s\n' "$*" >&2; CASE_FAILS=$((CASE_FAILS + 1)); }
+fail() {
+  printf '    not ok - %s\n' "$*" >&2
+  CASE_FAILS=$((CASE_FAILS + 1))
+  if [[ -n "${CASE_FAIL_FILE:-}" ]]; then printf '%s\n' "$*" >>"$CASE_FAIL_FILE"; fi
+}
 assert_eq() { # actual expected description
   if [[ "$1" == "$2" ]]; then ok "$3"; else fail "$3 (got '$1', want '$2')"; fi
 }
@@ -92,10 +98,15 @@ assert_not_cmd() { # description command...
 # ---------------------------------------------------------------------------------------------
 # Run state: key=value lines in $RUN_DIR/state.env; the last value for a key wins.
 
+# state_set <key> <value>: a value is one line of state.env. A multi-line value (raw CLI output, which
+# often starts with a newline) is flattened, its non-blank lines joined by spaces, rather than lost.
 state_set() {
-  [[ "$2" != *$'\n'* ]] || die "state_set $1: value has a newline"
-  printf '%s=%s\n' "$1" "$2" >>"$RUN_DIR/state.env"
+  local v=$2
+  if [[ "$v" == *[$'\n\r']* ]]; then v=$(printf '%s\n' "$v" | one_line); fi
+  printf '%s=%s\n' "$1" "$v" >>"$RUN_DIR/state.env"
 }
+# one_line: stdin's non-blank lines joined by single spaces (for CLI output kept in state).
+one_line() { tr -d '\r' | awk 'NF' | paste -sd ' ' -; }
 state_get() {
   [[ -f "$RUN_DIR/state.env" ]] || return 0
   grep -E "^$1=" "$RUN_DIR/state.env" | tail -n 1 | cut -d= -f2-
@@ -106,6 +117,30 @@ need_state() { # key → value, or fail the case
   if [[ -z "$v" ]]; then fail "state '$1' is missing (an earlier phase did not record it)"; return 1; fi
   printf '%s\n' "$v"
 }
+
+# case_exec <case-file>: runs the file's case_run in a subshell; succeeds only if no assertion failed,
+# counting failures made in command substitutions (a missing need_state value) as well as direct ones.
+case_exec() {
+  local ff rc
+  ff=$(mktemp "${RUN_DIR:-${TMPDIR:-/tmp}}/case-fails.XXXXXX") || return 1
+  (
+    CASE_FAILS=0
+    CASE_FAIL_FILE=$ff
+    # shellcheck source=/dev/null
+    source "$1"
+    case_run
+    exit $((CASE_FAILS > 0 ? 1 : 0))
+  )
+  rc=$?
+  if [[ -s "$ff" ]]; then rc=1; fi
+  rm -f "$ff"
+  return $rc
+}
+
+# release_line_re <app> <old> <new> <result>: a regex for the line box/shukka-release.sh prints when a
+# release on the box finishes ("shukka: <project>/<app> <old> -> <new> <result>"). The rollback cases
+# require it before they compare current/previous, which would otherwise match when no release ran.
+release_line_re() { printf 'shukka: %s/%s %s -> %s %s' "$PROJECT" "$1" "$2" "$3" "$4"; }
 
 # ---------------------------------------------------------------------------------------------
 # Safety: the only names this suite may change or delete.

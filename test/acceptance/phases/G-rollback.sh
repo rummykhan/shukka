@@ -13,7 +13,7 @@ phase_G() {
   state_set unhealthy_sha "$sha"
   id=$(wait_run_of "$sha") && state_set unhealthy_run "$id"
   snapshot after_unhealthy
-  state_set after_unhealthy_http "$(http_code "http://$(box_ip):8080/health") $(http_get "http://$(box_ip):8080/version")"
+  state_set after_unhealthy_http "$(http_code "http://$(box_ip):8080/health") $(http_get "http://$(box_ip):8080/version" | one_line)"
 
   printf '{ "healthy": true }\n' >"$RUN_DIR/consumer/apps/web/health.json"
   sha=$(commit_all "shukkatest $RUN_ID: healthy web release again") || return 1

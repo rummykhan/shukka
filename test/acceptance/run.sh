@@ -112,13 +112,7 @@ run_cases() {
       verdict=BLOCKED
     else
       log "case $id: $(header "$f" title)"
-      if (
-        CASE_FAILS=0
-        # shellcheck source=/dev/null
-        source "$f"
-        case_run
-        exit $((CASE_FAILS > 0 ? 1 : 0))
-      ); then verdict=PASS; else verdict=FAIL; fi
+      if case_exec "$f"; then verdict=PASS; else verdict=FAIL; fi
     fi
     printf 'CASE %s %s %s\n' "$SUITE_TASK" "$id" "$verdict" | tee -a "$SUMMARY_FILE" >&2
   done
