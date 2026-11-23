@@ -179,6 +179,19 @@ const extra = [
   ['exec', 'allowed', 'ec2:RunInstances', `arn:aws:ec2:${R}:${A}:launch-template/lt-0trendigle`, T],
   ['exec', 'implicitDeny', 'ec2:RunInstances', `arn:aws:ec2:${R}:${A}:network-interface/eni-0orbitary`, O],
   ['exec', 'allowed', 'ec2:RunInstances', `arn:aws:ec2:${R}:${A}:network-interface/*`],
+  // 10b. shu-9bj.18: the tagged creates need Project on the request. CloudFormation sends none for a launch template
+  // unless its TagSpecifications hold it (tagProject); without it the create is refused, as in the rc.5 deploy.
+  ['exec', 'implicitDeny', 'ec2:CreateLaunchTemplate', `arn:aws:ec2:${R}:${A}:launch-template/*`],
+  ['exec', 'implicitDeny', 'ec2:CreateLaunchTemplate', `arn:aws:ec2:${R}:${A}:launch-template/*`, { 'aws:RequestTag/Project': 'orbitary' }],
+  ['exec', 'allowed', 'ec2:CreateLaunchTemplate', `arn:aws:ec2:${R}:${A}:launch-template/*`, { 'aws:RequestTag/Project': 'trendigle', 'aws:TagKeys': ['Project'] }],
+  ['exec', 'allowed', 'ec2:CreateTags', `arn:aws:ec2:${R}:${A}:launch-template/*`, { 'ec2:CreateAction': 'CreateLaunchTemplate', 'aws:RequestTag/Project': 'trendigle', 'aws:TagKeys': ['Project'] }],
+  ['exec', 'implicitDeny', 'ec2:CreateSecurityGroup', `arn:aws:ec2:${R}:${A}:security-group/*`],
+  ['exec', 'allowed', 'ec2:CreateSecurityGroup', `arn:aws:ec2:${R}:${A}:security-group/*`, { 'aws:RequestTag/Project': 'trendigle' }],
+  ['exec', 'implicitDeny', 'ec2:AllocateAddress', `arn:aws:ec2:${R}:${A}:elastic-ip/*`],
+  ['exec', 'allowed', 'ec2:AllocateAddress', `arn:aws:ec2:${R}:${A}:elastic-ip/*`, { 'aws:RequestTag/Project': 'trendigle' }],
+  ['exec', 'implicitDeny', 'ec2:CreateVolume', `arn:aws:ec2:${R}:${A}:volume/*`],
+  ['exec', 'allowed', 'ec2:CreateVolume', `arn:aws:ec2:${R}:${A}:volume/*`, { 'aws:RequestTag/Project': 'trendigle' }],
+  ['exec', 'implicitDeny', 'ec2:RunInstances', `arn:aws:ec2:${R}:${A}:instance/*`],
   // 11. shu-9bj.9: listing the account's instances and reading any command's output only for the app role, never
   // servers, Lambdas or another project's app role.
   ['bounded', 'allowed', 'ec2:DescribeInstances', '*', APP],

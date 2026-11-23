@@ -173,9 +173,9 @@ shukka's constructs are TypeScript source, so run your CDK app with `tsx` (`cdk.
 
 ```ts
 // infra/bin/app.ts
-import { App, Stack, Tags } from 'aws-cdk-lib';
+import { App, Stack } from 'aws-cdk-lib';
 import * as s3 from 'aws-cdk-lib/aws-s3';
-import { ShukkaAccess, applyBoundary, shukkaCiSynthesizer, shukkaSynthesizer } from 'shukka';
+import { ShukkaAccess, applyBoundary, shukkaCiSynthesizer, shukkaSynthesizer, tagProject } from 'shukka';
 
 const app = new App();
 const env = { account: '123456789012', region: 'us-east-1' };
@@ -193,7 +193,7 @@ new ShukkaAccess(ci, 'Access', {
 // Your own stacks: every one with { env, synthesizer }, named Acme-... or acme-...
 // new BoxStack(app, 'Acme-Box', { env, synthesizer });
 
-Tags.of(app).add('Project', 'acme');    // EC2 resources must carry it
+tagProject(app, 'acme');                // Project=acme on everything, and on every EC2 create request
 applyBoundary(app, 'acme');             // every role gets the project's boundary, CDK's own roles too
 ```
 
@@ -201,6 +201,7 @@ What each piece is for:
 
 - **`shukkaSynthesizer(qualifier)`** makes every stack deploy through your project's own bootstrap (the fenced execution role) instead of the account's default one.
 - **`shukkaCiSynthesizer(qualifier)`** is for the CI stack only, which must be named `<Project>-Ci` (`Acme-Ci`). It names no deploy or execution role, so `cdk deploy` runs CloudFormation with your own (admin) credentials, and publishes the stack's template to your project's bootstrap bucket with them; diffs still read the deployed template through the project's deploy role. The pipeline and `shukka deploy` refuse it on any other stack, and leave `<Project>-Ci` out of every deploy. Give the CI stack nothing but `ShukkaAccess`: any asset it had would be published with admin credentials too.
+- **`tagProject(app, project)`** tags every resource with `Project=<project>` (it does `Tags.of(app).add('Project', project)`), and also puts the tag in each launch template's `TagSpecifications` (`launch-template`, and `instance`, `volume` and `network-interface` in its launch data). `Tags.of` alone does not reach a plain `CfnLaunchTemplate`, such as the one `ec2.Instance` makes for `requireImdsv2`, so CloudFormation would create it with no tag and the fence would refuse it.
 - **`applyBoundary(app, project)`** puts your permissions boundary on every IAM role in the app, including the ones CDK makes for custom resources. Without it, the execution role refuses to create the role.
 - **`ShukkaAccess`** creates `acme-shukka-infra`, `acme-shukka-app` and `acme-shukka-diff`. Options: `oidcProviderArn` (default: the account's GitHub provider ARN), `shukkaVersions` (the release line the roles trust, default `v1`; `v1.2` narrows it), `instanceTag` (default `Project=<project>`), `qualifier` (default the project name), and `allowPrerelease` and `allowBranch` (release-candidate testing only: trust pre-release tags such as `v1.0.0-rc.1`, or a branch of shukka; never in production). Without `allowPrerelease`, a caller pinned to a pre-release tag is refused by AWS.
 - To get your repository's immutable subject: `gh api repos/acme-org/acme --jq '"\(.owner.login)@\(.owner.id)/\(.name)@\(.id)"'`.
@@ -210,6 +211,7 @@ Rules your stacks must follow:
 - **Names.** Stack names start with `<project>-` or `<Project>-`. Resources you name yourself start with the project name (`acme-items`, `acme-deploy-123456789012`). CDK's generated names start with the stack name, which already does.
 - **No live lookups. Commit `cdk.context.json`.** The pipeline synthesizes with no AWS credentials and the bootstrap has no lookup role, so `Vpc.fromLookup`, `HostedZone.fromLookup` and `MachineImage.lookup` must already be answered in `cdk.context.json`. Simplest is to avoid lookups: pass ids (`Vpc.fromVpcAttributes`, `HostedZone.fromHostedZoneAttributes`, `MachineImage.genericLinux`).
 - **The deploy bucket** (`<project>-deploy-<account>`, or `aws.deployBucket`) is yours to create in one of your stacks: block public access, enforce SSL, and add a lifecycle rule expiring `<project>/` objects after 30 days (servers keep their own copies).
+- **EC2 creates carry the tag.** The execution role creates an instance, security group, launch template, elastic IP or volume only when the create request itself carries `Project=<project>`: on `AWS::EC2::Instance`, `SecurityGroup`, `EIP` and `Volume` that is their `Tags`, on `AWS::EC2::LaunchTemplate` its `TagSpecifications` entry for `launch-template`. `tagProject` sets all of them; if you tag another way, check the synthesized template. Changing or deleting an EC2 resource needs the tag on the resource.
 - **The server** needs: the tag `Project=<project>`; an instance role with `AmazonSSMManagedInstanceCore` and read access to `s3://<bucket>/<project>/*`; and `bash`, the AWS CLI, `curl`, `flock` and systemd. Amazon Linux 2023 has all of them. No inbound port is needed for deploys.
 - **No Docker image assets.** File assets (Lambda code, zipped directories) are fine, but a file asset ending `.json`, `.yaml`, `.yml` or `.template` must be a JSON object (a YAML file asset is refused): CloudFormation templates are checked, and shukka cannot tell such a file from one.
 - **Top-level stacks only.** Stacks inside a CDK `Stage` (a nested cloud assembly) are not deployed by the pipeline in v1.
