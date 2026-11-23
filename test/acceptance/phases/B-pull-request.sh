@@ -21,6 +21,7 @@ phase_B() {
   state_set pr_branch "$branch"
   state_set pr_tag "$tag"
   state_set pr_sha1 "$sha1"
+  enable_probe_workflows || return 1
   c_git push -q origin "$branch" || return 1
   c_git tag "$tag" && c_git push -q origin "refs/tags/$tag" || return 1
   gh pr create -R "$CONSUMER_REPO" --head "$branch" --base main \

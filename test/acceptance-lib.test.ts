@@ -246,3 +246,237 @@ test('shu-9bj.16: pipeline.yml calls its nested workflows by ./ path, and the RE
   assert.match(readme, /lightweight tags/);
   assert.match(readme, /annotated tag/);
 });
+
+// A stub gh for the test consumer's caller workflow (CI, .github/workflows/ci.yml, id 42) and its runs.
+// WF_STATE is the caller's state before it is enabled; ENABLE_RC is what `gh workflow enable` exits with;
+// once enabled, the caller turns active on the ACTIVE_AFTER-th look at it (never, if unset). Runs for the
+// commit come from $STUB_DIR/runs (a `gh run list --json` array). Every call goes to $STUB_DIR/gh.log.
+const ciStub = `#!/usr/bin/env bash
+d=$STUB_DIR
+printf 'gh %s\\n' "$*" >>"$d/gh.log"
+q=
+prev=
+for a in "$@"; do
+  if [[ "$prev" == -q || "$prev" == --jq ]]; then q=$a; fi
+  prev=$a
+done
+out() { if [[ -n "$q" ]]; then jq -rc "$q"; else cat; fi; }
+case "$1 $2" in
+  "workflow enable")
+    [[ "\${ENABLE_RC:-0}" == 0 ]] || { echo "HTTP 403: Resource not accessible by integration" >&2; exit "$ENABLE_RC"; }
+    printf '0\\n' >"$d/polls"; exit 0 ;;
+  "api repos/rummykhan/shukka-consumer-test/actions/workflows")
+    state=\${WF_STATE:-disabled_manually}
+    if [[ -f "$d/polls" ]]; then
+      n=$(( $(cat "$d/polls") + 1 )); printf '%s\\n' "$n" >"$d/polls"
+      if [[ -n "\${ACTIVE_AFTER:-}" ]] && (( n >= ACTIVE_AFTER )); then state=active; fi
+    fi
+    printf '{"total_count":2,"workflows":[{"id":7,"name":"shukkatest-probe","path":".github/workflows/shukkatest-probe.yml","state":"active"},{"id":42,"name":"CI","path":".github/workflows/ci.yml","state":"%s"}]}\\n' "$state" | out
+    exit 0 ;;
+  "run list") { cat "$d/runs" 2>/dev/null || printf '[]\\n'; } | out; exit 0 ;;
+  "run view") printf '{"status":"completed","conclusion":"startup_failure"}\\n' | out; exit 0 ;;
+esac
+exit 0
+`;
+
+const SHA = 'f275c12a0b1c2d3e4f5061728394a5b6c7d8e9f0';
+
+function withGh(
+  script: string,
+  env: Record<string, string> = {},
+  runs?: unknown[],
+): { status: number | null; stdout: string; stderr: string; gh: string[] } {
+  const dir = mkdtempSync(join(tmpdir(), 'shu-9bj17-'));
+  try {
+    const bin = join(dir, 'bin');
+    spawnSync('mkdir', ['-p', bin, join(dir, 'run', 'runs')]);
+    writeFileSync(join(bin, 'gh'), ciStub);
+    writeFileSync(join(bin, 'sleep'), '#!/usr/bin/env bash\nexit 0\n');
+    for (const f of ['gh', 'sleep']) chmodSync(join(bin, f), 0o755);
+    writeFileSync(join(dir, 'gh.log'), '');
+    if (runs) writeFileSync(join(dir, 'runs'), JSON.stringify(runs));
+    // The consumer working copy and its push are stubbed: c_git only records what it was asked to do.
+    const fakes = `clean_consumer_github() { :; }; require_consumer_remote() { :; }; commit_all() { printf '%s\\n' ${SHA}; }; c_git() { printf 'gh-stub-git %s\\n' "$*" >>"$STUB_DIR/gh.log"; }`;
+    const r = spawnSync(
+      'bash',
+      ['-c', `set -uo pipefail; source "${lib}/common.sh"; source "${lib}/setup.sh"; ${fakes}; ${script}`],
+      {
+        encoding: 'utf8',
+        timeout: 60_000,
+        env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, STUB_DIR: dir, RUN_DIR: join(dir, 'run'), RUN_ID: '20261123050000', ...env },
+      },
+    );
+    const gh = readFileSync(join(dir, 'gh.log'), 'utf8')
+      .split('\n')
+      .filter((l) => l !== '');
+    return { status: r.status, stdout: r.stdout, stderr: r.stderr, gh };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+const pushed = (gh: string[]) => gh.findIndex((l) => l.startsWith('gh-stub-git push'));
+const startupFailureRun = {
+  databaseId: 45117994300,
+  workflowName: '.github/workflows/ci.yml',
+  workflowDatabaseId: 42,
+  event: 'push',
+  createdAt: '2026-11-23T05:00:00Z',
+  headBranch: 'main',
+};
+
+test('shu-9bj.17: setup dies, and does not push, when enabling the caller fails', () => {
+  const r = withGh('setup_push_baseline', { ENABLE_RC: '1' });
+  assert.notEqual(r.status, 0);
+  assert.ok(r.gh.some((l) => l.startsWith('gh workflow enable CI')), 'gh workflow enable was called');
+  assert.match(r.stderr, /ERROR: cannot enable the caller workflow 'CI'/);
+  assert.equal(pushed(r.gh), -1, 'nothing was pushed');
+});
+
+test('shu-9bj.17: setup dies after a bounded wait, and does not push, when the caller stays disabled', () => {
+  const r = withGh('setup_push_baseline');
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /ERROR: caller workflow 'CI' is still 'disabled_manually'/);
+  assert.equal(pushed(r.gh), -1, 'nothing was pushed');
+  const looks = r.gh.filter((l) => l.startsWith('gh api repos/rummykhan/shukka-consumer-test/actions/workflows')).length;
+  assert.ok(looks > 2 && looks <= 20, `polled a bounded number of times (${looks})`);
+});
+
+test('shu-9bj.17: setup pushes only after gh reports the caller active, and finds a startup-failure run by its file path', () => {
+  const r = withGh('setup_push_baseline; cat "$RUN_DIR/state.env"', { ACTIVE_AFTER: '3' }, [startupFailureRun]);
+  assert.equal(r.status, 0, r.stderr);
+  const enable = r.gh.findIndex((l) => l.startsWith('gh workflow enable CI'));
+  const p = pushed(r.gh);
+  assert.ok(enable >= 0 && p > enable, 'the push comes after the enable');
+  const looksBeforePush = r.gh.slice(enable, p).filter((l) => l.includes('/actions/workflows')).length;
+  assert.equal(looksBeforePush, 3, 'it waited until the third look reported active');
+  assert.match(r.stdout, /baseline_run=45117994300/);
+  assert.match(r.stderr, /named '\.github\/workflows\/ci\.yml'/);
+  assert.match(r.stderr, /finished: startup_failure/);
+});
+
+test('shu-9bj.17: setup does not re-enable a caller that is already active', () => {
+  const r = withGh('setup_push_baseline', { WF_STATE: 'active' }, [startupFailureRun]);
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(!r.gh.some((l) => l.startsWith('gh workflow enable')), 'no enable call');
+  assert.ok(pushed(r.gh) >= 0, 'pushed');
+});
+
+test('shu-9bj.17: the wait for a commit finds a run named by the workflow file path and says so; other workflows are not matched', () => {
+  const probe = { ...startupFailureRun, databaseId: 1, workflowName: 'shukkatest-probe', workflowDatabaseId: 7, createdAt: '2026-11-23T06:00:00Z' };
+  const r = withGh(`wait_run_for_sha ${SHA} CI push`, { WF_STATE: 'active' }, [startupFailureRun, probe]);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout.trim(), '45117994300');
+  assert.match(r.stderr, /run 45117994300 for f275c12a0b1c is named '\.github\/workflows\/ci\.yml', not 'CI'/);
+  assert.match(r.stderr, /startup failure/);
+  const none = withGh(`wait_run_for_sha ${SHA} CI push "" 0`, { WF_STATE: 'active' }, [probe]);
+  assert.notEqual(none.status, 0, 'a run of another workflow is not the caller run');
+});
+
+test('shu-9bj.17: when no run appears, the error names the caller state and the full sha', () => {
+  const r = withGh(`wait_run_for_sha ${SHA} CI push "" 0`, { WF_STATE: 'disabled_inactivity' }, []);
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, new RegExp(`no 'CI' run for push at ${SHA}`));
+  assert.match(r.stderr, /caller 'CI' is disabled_inactivity/);
+  const s = withGh('setup_push_baseline', { ACTIVE_AFTER: '1', RUN_APPEAR_TIMEOUT: '0' }, []);
+  assert.notEqual(s.status, 0);
+  assert.match(s.stderr, new RegExp(`ERROR: no CI run for the baseline merge ${SHA}.*caller 'CI' is active`));
+});
+
+// A stub gh whose workflows live in $STUB_DIR/workflows.json (the actions/workflows response). Enabling a
+// workflow (by id or name) turns it active there, unless ENABLE_RC is set (the enable fails) or STUCK is set (gh
+// accepts the enable but the workflow never turns active).
+const probeStub = `#!/usr/bin/env bash
+d=$STUB_DIR
+printf 'gh %s\\n' "$*" >>"$d/gh.log"
+q=
+prev=
+for a in "$@"; do
+  if [[ "$prev" == -q || "$prev" == --jq ]]; then q=$a; fi
+  prev=$a
+done
+out() { if [[ -n "$q" ]]; then jq -rc "$q"; else cat; fi; }
+case "$1 $2" in
+  "workflow enable")
+    [[ "\${ENABLE_RC:-0}" == 0 ]] || { echo "HTTP 403" >&2; exit 1; }
+    if [[ -z "\${STUCK:-}" ]]; then
+      jq --arg i "$3" '.workflows |= map(if (.id | tostring) == $i or .name == $i then .state = "active" else . end)' "$d/workflows.json" >"$d/w.new" && mv "$d/w.new" "$d/workflows.json"
+    fi
+    exit 0 ;;
+  "api repos/rummykhan/shukka-consumer-test/actions/workflows") out <"$d/workflows.json"; exit 0 ;;
+  "run list") printf '[]\\n' | out; exit 0 ;;
+esac
+exit 0
+`;
+
+const consumerWorkflows = {
+  total_count: 4,
+  workflows: [
+    { id: 42, name: 'CI', path: '.github/workflows/ci.yml', state: 'disabled_manually' },
+    { id: 7, name: 'shukkatest-probe', path: '.github/workflows/shukkatest-probe.yml', state: 'disabled_manually' },
+    { id: 8, name: 'shukkatest-probe-infra', path: '.github/workflows/shukkatest-probe-infra.yml', state: 'disabled_manually' },
+    { id: 9, name: 'shukkatest-probe-old', path: '.github/workflows/old.yml', state: 'active' },
+  ],
+};
+
+function withProbes(script: string, env: Record<string, string> = {}): { status: number | null; stderr: string; gh: string[]; workflows: typeof consumerWorkflows } {
+  const dir = mkdtempSync(join(tmpdir(), 'shu-9bj17p-'));
+  try {
+    const bin = join(dir, 'bin');
+    spawnSync('mkdir', ['-p', bin, join(dir, 'run', 'runs'), join(dir, 'run', 'consumer', '.github', 'workflows'), join(dir, 'run', 'consumer', 'probe', 'workflows')]);
+    writeFileSync(join(dir, 'run', 'consumer', 'probe', 'workflows', 'shukkatest-probe.yml'), 'name: shukkatest-probe\n');
+    writeFileSync(join(bin, 'gh'), probeStub);
+    writeFileSync(join(bin, 'sleep'), '#!/usr/bin/env bash\nexit 0\n');
+    for (const f of ['gh', 'sleep']) chmodSync(join(bin, f), 0o755);
+    writeFileSync(join(dir, 'gh.log'), '');
+    writeFileSync(join(dir, 'workflows.json'), JSON.stringify(consumerWorkflows));
+    const fakes = `commit_all() { printf '%s\\n' ${SHA}; }; c_git() { printf 'gh-stub-git %s\\n' "$*" >>"$STUB_DIR/gh.log"; }; push_main() { c_git push origin HEAD:main; }`;
+    const phases = resolve(lib, '..', 'phases');
+    const r = spawnSync(
+      'bash',
+      ['-c', `set -uo pipefail; source "${lib}/common.sh"; source "${phases}/C-own-workflow-on-main.sh"; source "${phases}/J-cli.sh"; ${fakes}; ${script}`],
+      {
+        encoding: 'utf8',
+        timeout: 60_000,
+        env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, STUB_DIR: dir, RUN_DIR: join(dir, 'run'), RUN_ID: '20261123050000', RUN_APPEAR_TIMEOUT: '0', ...env },
+      },
+    );
+    const gh = readFileSync(join(dir, 'gh.log'), 'utf8').split('\n').filter((l) => l !== '');
+    const workflows = JSON.parse(readFileSync(join(dir, 'workflows.json'), 'utf8')) as typeof consumerWorkflows;
+    return { status: r.status, stderr: r.stderr, gh, workflows };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test('shu-9bj.17: phase C enables the disabled probe workflows by id, and waits for them, before it pushes the probe', () => {
+  const r = withProbes('phase_C');
+  const enables = r.gh.map((l, k) => [l, k] as const).filter(([l]) => l.startsWith('gh workflow enable'));
+  assert.deepEqual(enables.map(([l]) => l.split(' ')[3]).sort(), ['7', '8'], 'only the disabled probes, never the caller or an active one');
+  const p = r.gh.findIndex((l) => l.startsWith('gh-stub-git push'));
+  assert.ok(p > Math.max(...enables.map(([, k]) => k)), 'the push comes after the enables');
+  assert.match(r.stderr, /probe workflows are active/);
+  assert.deepEqual(r.workflows.workflows.filter((w) => w.state !== 'active').map((w) => w.name), ['CI']);
+});
+
+test('shu-9bj.17: phase C fails, and does not push, when a probe workflow cannot be enabled or never turns active', () => {
+  const cases: Record<string, string>[] = [{ ENABLE_RC: '1' }, { STUCK: '1' }];
+  for (const env of cases) {
+    const r = withProbes('phase_C', env);
+    assert.notEqual(r.status, 0, JSON.stringify(env));
+    assert.match(r.stderr, env.STUCK ? /probe workflows still not active.*shukkatest-probe/ : /cannot enable the probe workflow 'shukkatest-probe/);
+    assert.equal(r.gh.findIndex((l) => l.startsWith('gh-stub-git push')), -1, `no push (${JSON.stringify(env)})`);
+  }
+});
+
+test('shu-9bj.17: phase B enables the probe workflows before its first push, and phase J re-enables the caller through enable_workflow', () => {
+  const b = readFileSync(resolve(lib, '..', 'phases', 'B-pull-request.sh'), 'utf8');
+  const enable = b.indexOf('enable_probe_workflows');
+  assert.ok(enable > 0 && enable < b.indexOf('c_git push'), 'B enables the probes before it pushes them');
+  const r = withProbes('enable_workflow "$CALLER_WORKFLOW" && echo enabled');
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(r.gh.includes('gh workflow enable CI -R rummykhan/shukka-consumer-test'));
+  const j = readFileSync(resolve(lib, '..', 'phases', 'J-cli.sh'), 'utf8');
+  assert.match(j, /enable_workflow "\$CALLER_WORKFLOW" && state_set workflow_disabled 0/);
+  assert.doesNotMatch(j, /gh workflow enable/);
+});

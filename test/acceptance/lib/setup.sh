@@ -253,11 +253,13 @@ setup_push_baseline() {
   local sha id
   sha=$(commit_all "shukkatest $RUN_ID: consumer baseline")
   require_consumer_remote
-  # Teardown of an earlier run leaves the caller disabled; enable it so this merge runs.
-  gh workflow enable "$CALLER_WORKFLOW" -R "$CONSUMER_REPO" >/dev/null 2>&1 || true
+  # Teardown of an earlier run leaves the caller disabled; enable it, and wait until it is active, so
+  # this merge runs.
+  enable_workflow "$CALLER_WORKFLOW"
   c_git push -q --force origin HEAD:main || die "cannot push the baseline to $CONSUMER_REPO"
   state_set baseline_sha "$sha"
-  id=$(wait_run_of "$sha") || die "no CI run for the baseline merge"
+  id=$(wait_run_of "$sha") ||
+    die "no CI run for the baseline merge $sha; caller '$CALLER_WORKFLOW' is $(workflow_state "$CALLER_WORKFLOW")"
   state_set baseline_run "$id"
 }
 
