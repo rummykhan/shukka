@@ -140,24 +140,75 @@ wait_until() {
 # ---------------------------------------------------------------------------------------------
 # GitHub runs in the test consumer
 
-# run_for_sha <sha> <workflow-name> <event> [head-branch-or-tag]: newest matching run id, or nothing.
+# How long a pushed commit's run may take to appear, and how many times (2s apart) to look for a workflow
+# to turn active after enabling it. Overridable for the stubbed tests.
+RUN_APPEAR_TIMEOUT=${RUN_APPEAR_TIMEOUT:-300}
+WORKFLOW_ACTIVE_TRIES=${WORKFLOW_ACTIVE_TRIES:-15}
+
+# workflow_info <workflow-name>: "<id> <state> <path>" of the test consumer's workflow with that `name:`
+# (the active one if several), or nothing. state is active, disabled_manually, disabled_inactivity, ...
+workflow_info() {
+  gh api "repos/$CONSUMER_REPO/actions/workflows" --paginate --jq '.workflows[]' 2>/dev/null |
+    jq -rs --arg w "$1" '[.[] | select(.name == $w)] | (map(select(.state == "active")) + .) | first // empty
+      | "\(.id) \(.state) \(.path)"'
+}
+# workflow_state <workflow-name>: its state as gh reports it, or "not found".
+workflow_state() {
+  local id state path
+  read -r id state path <<<"$(workflow_info "$1")"
+  printf '%s\n' "${state:-not found}"
+}
+
+# enable_workflow <workflow-name>: enables it in the test consumer and waits (bounded) until gh reports it
+# active; dies otherwise. A push made before it is active starts no run (shu-9bj.17).
+enable_workflow() {
+  local wf=$1 i state
+  state=$(workflow_state "$wf")
+  if [[ "$state" != active ]]; then
+    gh workflow enable "$wf" -R "$CONSUMER_REPO" >/dev/null ||
+      die "cannot enable the caller workflow '$wf' in $CONSUMER_REPO (gh workflow enable failed; it is $state)"
+    for ((i = 0; i < WORKFLOW_ACTIVE_TRIES; i++)); do
+      state=$(workflow_state "$wf")
+      [[ "$state" == active ]] && break
+      sleep 2
+    done
+    [[ "$state" == active ]] ||
+      die "caller workflow '$wf' is still '$state' in $CONSUMER_REPO $((WORKFLOW_ACTIVE_TRIES * 2))s after enabling it"
+  fi
+  log "workflow '$wf' is active in $CONSUMER_REPO"
+}
+
+# run_for_sha <sha> <workflow-name> <event> [head-branch-or-tag] [workflow-id] [workflow-path]: the newest
+# matching run as "<id> <run name>", or nothing. A run GitHub could not start (startup failure, a workflow
+# file issue) is named by its file path, not its `name:`, so it is also matched by workflow id and path.
 run_for_sha() {
   gh run list -R "$CONSUMER_REPO" --commit "$1" --limit 50 \
-    --json databaseId,workflowName,event,createdAt,headBranch 2>/dev/null |
-    jq -r --arg w "$2" --arg e "$3" --arg b "${4:-}" \
-      '[.[] | select(.workflowName == $w and .event == $e and ($b == "" or .headBranch == $b))]
-       | sort_by(.createdAt) | last | .databaseId // empty'
+    --json databaseId,workflowName,workflowDatabaseId,event,createdAt,headBranch 2>/dev/null |
+    jq -r --arg w "$2" --arg e "$3" --arg b "${4:-}" --arg i "${5:-}" --arg p "${6:-}" \
+      '[.[] | select((.workflowName == $w or ($p != "" and .workflowName == $p)
+                      or ($i != "" and ((.workflowDatabaseId // "") | tostring) == $i))
+                     and .event == $e and ($b == "" or .headBranch == $b))]
+       | sort_by(.createdAt) | last | select(. != null) | "\(.databaseId) \(.workflowName)"'
 }
 
 # wait_run_for_sha <sha> <workflow-name> <event> [head-branch-or-tag] [appear-timeout]: echoes the run id.
+# If no run appears, says what state the workflow is in and how many runs the commit has at all.
 wait_run_for_sha() {
-  local sha=$1 wf=$2 ev=$3 head=${4:-} timeout=${5:-300} start id
+  local sha=$1 wf=$2 ev=$3 head=${4:-} timeout=${5:-$RUN_APPEAR_TIMEOUT} start hit id name wid wstate wpath
+  read -r wid wstate wpath <<<"$(workflow_info "$wf")"
   start=$(date +%s)
   while :; do
-    id=$(run_for_sha "$sha" "$wf" "$ev" "$head")
-    if [[ -n "$id" ]]; then printf '%s\n' "$id"; return 0; fi
+    hit=$(run_for_sha "$sha" "$wf" "$ev" "$head" "${wid:-}" "${wpath:-}")
+    if [[ -n "$hit" ]]; then
+      read -r id name <<<"$hit"
+      if [[ "$name" != "$wf" ]]; then
+        log "run $id for ${sha:0:12} is named '$name', not '$wf': GitHub could not start the workflow (startup failure, a workflow file issue)"
+      fi
+      printf '%s\n' "$id"
+      return 0
+    fi
     if (($(date +%s) - start >= timeout)); then
-      log "no '$wf' run for $ev at ${sha:0:12} after ${timeout}s"
+      log "no '$wf' run for $ev at $sha after ${timeout}s; caller '$wf' is $(workflow_state "$wf")${wpath:+ ($wpath)} in $CONSUMER_REPO; runs for this commit of any workflow: $(runs_for_sha_count "$sha")"
       return 1
     fi
     sleep 10
