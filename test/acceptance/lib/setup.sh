@@ -90,7 +90,7 @@ setup_zone() {
   local name out id ns
   name=${SHUKKATEST_ZONE_DOMAIN:-shukkatest-$RUN_ID.com}
   out=$(aws route53 create-hosted-zone --name "$name" --caller-reference "shukkatest-$RUN_ID" \
-    --hosted-zone-config Comment="shukka acceptance $RUN_ID, delete within 12 hours" \
+    --hosted-zone-config "$(jq -nc --arg c "shukka acceptance $RUN_ID, delete within 12 hours" '{Comment: $c}')" \
     --query '[HostedZone.Id, DelegationSet.NameServers[0]]' --output text) || die "cannot create hosted zone $name"
   id=$(awk '{print $1}' <<<"$out")
   id=${id#/hostedzone/}
@@ -204,7 +204,7 @@ qualifier_stacks() {
   {
     aws cloudformation describe-stacks \
       --query "Stacks[?Parameters[?ParameterKey=='Qualifier' && ParameterValue=='$QUALIFIER']].StackName" \
-      --output text 2>/dev/null | tr '\t' '\n'
+      --output text 2>/dev/null | text_items
     for s in $(our_stacks); do
       if aws cloudformation describe-stack-resources --stack-name "$s" \
         --query "StackResources[?ResourceType=='AWS::SSM::Parameter'].PhysicalResourceId" --output text 2>/dev/null |

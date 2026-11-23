@@ -111,6 +111,11 @@ require_ours() {
   is_ours "$1" || die "refusing to touch '$1': not a shukkatest resource"
 }
 
+# text_items: the items of an `aws ... --output text` listing, one per line, without blanks and without
+# the literal None the CLI prints for a null result (a missing key, `| [0]` of an empty list). Every
+# discovery that feeds a delete reads its names through this, so "nothing found" is never a name.
+text_items() { tr '\t' '\n' | grep -Exv '(None)?' || true; }
+
 # ---------------------------------------------------------------------------------------------
 # Polling
 

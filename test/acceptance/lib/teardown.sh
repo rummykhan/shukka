@@ -12,14 +12,14 @@
 # our_stacks: live stacks whose names mark them as shukkatest's or the stand-in's.
 our_stacks() {
   aws cloudformation list-stacks --query "StackSummaries[?StackStatus!='DELETE_COMPLETE'].StackName" \
-    --output text 2>/dev/null | tr '\t' '\n' | grep -Ei '^(shukkatest|standin-shukkatest)' || true
+    --output text 2>/dev/null | text_items | grep -Ei '^(shukkatest|standin-shukkatest)' || true
 }
 
 # is_boundary_stack <stack>: it holds the shukkatest-shukka-* managed policies.
 is_boundary_stack() {
   aws cloudformation describe-stack-resources --stack-name "$1" \
     --query "StackResources[?ResourceType=='AWS::IAM::ManagedPolicy'].PhysicalResourceId" --output text 2>/dev/null |
-    grep -q "$PROJECT-shukka-"
+    text_items | grep -q "$PROJECT-shukka-"
 }
 
 project_stacks() {
@@ -36,7 +36,7 @@ project_stacks() {
 boundary_stacks() {
   local s q
   q=$(qualifier_stacks)
-  for s in $(our_stacks) $(aws cloudformation list-stacks --query "StackSummaries[?StackStatus!='DELETE_COMPLETE'].StackName" --output text 2>/dev/null | tr '\t' '\n' | grep -i shukka || true); do
+  for s in $(our_stacks) $(aws cloudformation list-stacks --query "StackSummaries[?StackStatus!='DELETE_COMPLETE'].StackName" --output text 2>/dev/null | text_items | grep -i shukka || true); do
     grep -qx -- "$s" <<<"$q" && continue
     [[ "$s" == Shukka-Account ]] && continue
     is_boundary_stack "$s" && printf '%s\n' "$s"
@@ -48,28 +48,28 @@ leftovers() {
   local acct x arn state
   acct=$(aws sts get-caller-identity --query Account --output text 2>/dev/null)
   for x in $(our_stacks) $(qualifier_stacks); do printf 'LEFTOVER stack %s\n' "$x"; done | sort -u
-  for x in $(aws s3api list-buckets --query 'Buckets[].Name' --output text 2>/dev/null | tr '\t' '\n' |
+  for x in $(aws s3api list-buckets --query 'Buckets[].Name' --output text 2>/dev/null | text_items |
     grep -E '^(shukkatest-|cdk-shukkatest-|standin-shukkatest-)' || true); do printf 'LEFTOVER bucket %s\n' "$x"; done
-  for x in $(aws dynamodb list-tables --query 'TableNames[]' --output text 2>/dev/null | tr '\t' '\n' |
+  for x in $(aws dynamodb list-tables --query 'TableNames[]' --output text 2>/dev/null | text_items |
     grep -E '^(shukkatest|standin-shukkatest)' || true); do printf 'LEFTOVER table %s\n' "$x"; done
-  for x in $(aws iam list-roles --query 'Roles[].RoleName' --output text 2>/dev/null | tr '\t' '\n' |
+  for x in $(aws iam list-roles --query 'Roles[].RoleName' --output text 2>/dev/null | text_items |
     grep -E '^(shukkatest|Shukkatest|cdk-shukkatest-|standin-shukkatest)' || true); do printf 'LEFTOVER role %s\n' "$x"; done
-  for x in $(aws iam list-policies --scope Local --query 'Policies[].PolicyName' --output text 2>/dev/null | tr '\t' '\n' |
+  for x in $(aws iam list-policies --scope Local --query 'Policies[].PolicyName' --output text 2>/dev/null | text_items |
     grep -E '^(shukkatest|Shukkatest)' || true); do printf 'LEFTOVER policy %s\n' "$x"; done
   for x in $(aws route53 list-hosted-zones --query 'HostedZones[].[Id,Name]' --output text 2>/dev/null |
     awk '$2 ~ /^shukkatest-/ {sub("/hostedzone/", "", $1); print $1 ":" $2}'); do printf 'LEFTOVER zone %s\n' "$x"; done
-  for x in $(aws ssm get-parameters-by-path --path "/$PROJECT" --recursive --query 'Parameters[].Name' --output text 2>/dev/null | tr '\t' '\n' | grep . || true); do
+  for x in $(aws ssm get-parameters-by-path --path "/$PROJECT" --recursive --query 'Parameters[].Name' --output text 2>/dev/null | text_items); do
     printf 'LEFTOVER parameter %s\n' "$x"
   done
-  for x in $(aws ecr describe-repositories --query 'repositories[].repositoryName' --output text 2>/dev/null | tr '\t' '\n' |
+  for x in $(aws ecr describe-repositories --query 'repositories[].repositoryName' --output text 2>/dev/null | text_items |
     grep -E '^cdk-shukkatest-' || true); do printf 'LEFTOVER ecr %s\n' "$x"; done
   # Anything still tagged as ours. Terminated instances keep their tags for up to an hour; they are
   # gone for all purposes, so they are not counted.
   for arn in $(aws resourcegroupstaggingapi get-resources --tag-filters "Key=Project,Values=$PROJECT,shukkatest-standin" \
-    --query 'ResourceTagMappingList[].ResourceARN' --output text 2>/dev/null | tr '\t' '\n' | grep . || true); do
+    --query 'ResourceTagMappingList[].ResourceARN' --output text 2>/dev/null | text_items); do
     if [[ "$arn" == *:instance/* ]]; then
       state=$(aws ec2 describe-instances --instance-ids "${arn##*/}" --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || echo gone)
-      [[ "$state" == terminated || "$state" == gone ]] && continue
+      [[ "$state" == terminated || "$state" == gone || "$state" == None ]] && continue
     fi
     printf 'LEFTOVER tagged %s\n' "${arn//$acct/123456789012}"
   done
@@ -179,10 +179,10 @@ td_project_stacks() {
 
 td_retained_data() {
   local x
-  for x in $(aws dynamodb list-tables --query 'TableNames[]' --output text 2>/dev/null | tr '\t' '\n' | grep -E '^shukkatest' || true); do
+  for x in $(aws dynamodb list-tables --query 'TableNames[]' --output text 2>/dev/null | text_items | grep -E '^shukkatest' || true); do
     delete_table "$x"
   done
-  for x in $(aws s3api list-buckets --query 'Buckets[].Name' --output text 2>/dev/null | tr '\t' '\n' | grep -E '^shukkatest-' || true); do
+  for x in $(aws s3api list-buckets --query 'Buckets[].Name' --output text 2>/dev/null | text_items | grep -E '^shukkatest-' || true); do
     delete_bucket "$x" || true
   done
 }
@@ -204,14 +204,14 @@ td_bootstrap() {
   done
   for s in $(boundary_stacks); do delete_stack "$s" || rc=1; done
   # Managed policies left outside any stack (for example if the CLI created them directly).
-  for p in $(aws iam list-policies --scope Local --query "Policies[?starts_with(PolicyName, '$PROJECT-shukka-')].Arn" --output text 2>/dev/null | tr '\t' '\n' | grep . || true); do
+  for p in $(aws iam list-policies --scope Local --query "Policies[?starts_with(PolicyName, '$PROJECT-shukka-')].Arn" --output text 2>/dev/null | text_items); do
     require_ours "${p##*/}"
-    for v in $(aws iam list-policy-versions --policy-arn "$p" --query 'Versions[?!IsDefaultVersion].VersionId' --output text 2>/dev/null); do
+    for v in $(aws iam list-policy-versions --policy-arn "$p" --query 'Versions[?!IsDefaultVersion].VersionId' --output text 2>/dev/null | text_items); do
       aws iam delete-policy-version --policy-arn "$p" --version-id "$v" >/dev/null 2>&1 || true
     done
     aws iam delete-policy --policy-arn "$p" >/dev/null 2>&1 || { log "teardown: policy $p is still attached"; rc=1; }
   done
-  for arn in $(aws ecr describe-repositories --query 'repositories[].repositoryName' --output text 2>/dev/null | tr '\t' '\n' | grep -E '^cdk-shukkatest-' || true); do
+  for arn in $(aws ecr describe-repositories --query 'repositories[].repositoryName' --output text 2>/dev/null | text_items | grep -E '^cdk-shukkatest-' || true); do
     aws ecr delete-repository --repository-name "$arn" --force >/dev/null 2>&1 || rc=1
   done
   return $rc
@@ -225,19 +225,19 @@ td_standin() {
     [[ -n "$b" && "$b" != None ]] && { empty_bucket "$b" || true; }
     delete_stack "$s" || rc=1
   done
-  for b in $(aws s3api list-buckets --query 'Buckets[].Name' --output text 2>/dev/null | tr '\t' '\n' | grep -E '^standin-shukkatest-' || true); do
+  for b in $(aws s3api list-buckets --query 'Buckets[].Name' --output text 2>/dev/null | text_items | grep -E '^standin-shukkatest-' || true); do
     delete_bucket "$b" || rc=1
   done
-  for b in $(aws dynamodb list-tables --query 'TableNames[]' --output text 2>/dev/null | tr '\t' '\n' | grep -E '^standin-shukkatest-' || true); do
+  for b in $(aws dynamodb list-tables --query 'TableNames[]' --output text 2>/dev/null | text_items | grep -E '^standin-shukkatest-' || true); do
     delete_table "$b"
   done
-  for b in $(aws sqs list-queues --queue-name-prefix standin-shukkatest- --query 'QueueUrls[]' --output text 2>/dev/null | tr '\t' '\n' | grep . || true); do
+  for b in $(aws sqs list-queues --queue-name-prefix standin-shukkatest- --query 'QueueUrls[]' --output text 2>/dev/null | text_items); do
     require_ours "${b##*/}"
     aws sqs delete-queue --queue-url "$b" || rc=1
   done
-  for r in $(aws iam list-roles --query "Roles[?starts_with(RoleName, 'standin-shukkatest-')].RoleName" --output text 2>/dev/null | tr '\t' '\n' | grep . || true); do
+  for r in $(aws iam list-roles --query "Roles[?starts_with(RoleName, 'standin-shukkatest-')].RoleName" --output text 2>/dev/null | text_items); do
     require_ours "$r"
-    for p in $(aws iam list-role-policies --role-name "$r" --query 'PolicyNames[]' --output text); do
+    for p in $(aws iam list-role-policies --role-name "$r" --query 'PolicyNames[]' --output text | text_items); do
       aws iam delete-role-policy --role-name "$r" --policy-name "$p" || true
     done
     aws iam delete-role --role-name "$r" || rc=1
@@ -247,7 +247,7 @@ td_standin() {
 
 td_parameters() {
   local x
-  for x in $(aws ssm get-parameters-by-path --path "/$PROJECT" --recursive --query 'Parameters[].Name' --output text 2>/dev/null | tr '\t' '\n' | grep . || true); do
+  for x in $(aws ssm get-parameters-by-path --path "/$PROJECT" --recursive --query 'Parameters[].Name' --output text 2>/dev/null | text_items); do
     aws ssm delete-parameter --name "$x" || true
   done
 }
