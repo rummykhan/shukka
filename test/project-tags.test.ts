@@ -8,9 +8,9 @@ import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writ
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { App, Size, Stack, Tags } from 'aws-cdk-lib';
+import { App, CfnParameter, Size, Stack, Tags } from 'aws-cdk-lib';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
-import { Template } from 'aws-cdk-lib/assertions';
+import { Annotations, Match, Template } from 'aws-cdk-lib/assertions';
 import { tagProject } from '../lib/index.js';
 
 type Loose = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
@@ -135,4 +135,82 @@ test('shu-9bj.18: tagProject tags a volume, an ec2.LaunchTemplate and an L1 laun
   assert.deepEqual(specFor(l1.Properties.LaunchTemplateData.TagSpecifications, 'instance')?.Tags, [{ Key: 'Name', Value: 'web' }, { Key: 'Project', Value: 'shukkatest' }]);
   const l2 = Object.values(res).find((r) => r.Properties?.LaunchTemplateName === 'shukkatest-l2') as Loose;
   assert.equal(specFor(l2.Properties.TagSpecifications, 'launch-template')?.Tags.filter((x: Loose) => x.Key === 'Project').length, 1);
+});
+
+const ltOf = (t: Loose): [string, Loose][] => (Object.entries(t.Resources) as [string, Loose][]).filter(([, r]) => r.Type === 'AWS::EC2::LaunchTemplate');
+const imdsBox = (s: Stack, vpc: ec2.IVpc) => new ec2.Instance(s, 'Box', {
+  vpc, instanceType: new ec2.InstanceType('t4g.nano'), machineImage: ec2.MachineImage.genericLinux({ 'us-east-1': 'ami-1' }), requireImdsv2: true,
+});
+
+test('shu-9bj.20: synth of the consumer names the requireImdsv2 launch template with the project prefix, and the instance launches from that name', () => {
+  const box = JSON.parse(readFileSync(join(synthConsumer(), 'Shukkatest-Box.template.json'), 'utf8'));
+  const lts = ltOf(box);
+  assert.equal(lts.length, 1);
+  const [id, lt] = lts[0] as [string, Loose];
+  const name = lt.Properties.LaunchTemplateName as string;
+  assert.ok(name.startsWith('shukkatest'), name);
+  assert.match(name, /^[a-zA-Z0-9().\-/_]{3,128}$/);
+  const inst = (Object.values(box.Resources) as Loose[]).find((r) => r.Type === 'AWS::EC2::Instance') as Loose;
+  assert.equal(inst.Properties.LaunchTemplate.LaunchTemplateName, name, 'the instance references the renamed template');
+  assert.deepEqual(inst.Properties.LaunchTemplate.Version, { 'Fn::GetAtt': [id, 'LatestVersionNumber'] });
+});
+
+test('shu-9bj.20: two projects in one app with an instance called Box get different, project-prefixed launch template names, the same each synth', () => {
+  const synth = () => {
+    const app = new App();
+    const names: string[] = [];
+    const stacks: Stack[] = [];
+    for (const p of ['alpha', 'beta']) {
+      const s = new Stack(app, `${p}-Box`, { env: { account: '123456789012', region: 'us-east-1' } });
+      const vpc = ec2.Vpc.fromVpcAttributes(s, 'Vpc', { vpcId: 'vpc-1', availabilityZones: ['us-east-1a'], publicSubnetIds: ['subnet-1'] });
+      imdsBox(s, vpc);
+      tagProject(s, p);
+      stacks.push(s);
+    }
+    for (const [i, s] of stacks.entries()) {
+      const t = Template.fromStack(s).toJSON();
+      const lts = ltOf(t);
+      assert.equal(lts.length, 1);
+      const name = (lts[0] as [string, Loose])[1].Properties.LaunchTemplateName as string;
+      assert.ok(name.startsWith(i === 0 ? 'alpha' : 'beta'), name);
+      const inst = (Object.values(t.Resources) as Loose[]).find((r) => r.Type === 'AWS::EC2::Instance') as Loose;
+      assert.equal(inst.Properties.LaunchTemplate.LaunchTemplateName, name);
+      names.push(name);
+    }
+    return names;
+  };
+  const first = synth();
+  assert.notEqual(first[0], first[1]);
+  assert.deepEqual(synth(), first, 'deterministic across synths');
+});
+
+test('shu-9bj.20: names already starting with the project are left alone; long or odd names stay within EC2 rules; absent stays absent', () => {
+  const long = 'x'.repeat(126);
+  const t = stackWith((s) => {
+    new ec2.CfnLaunchTemplate(s, 'Own', { launchTemplateName: 'shukkatest-own', launchTemplateData: {} });
+    new ec2.CfnLaunchTemplate(s, 'Long', { launchTemplateName: long, launchTemplateData: {} });
+    new ec2.CfnLaunchTemplate(s, 'Odd', { launchTemplateName: 'web server#1', launchTemplateData: {} });
+    new ec2.CfnLaunchTemplate(s, 'None', { launchTemplateData: {} });
+  }, (app) => tagProject(app, 'shukkatest'));
+  const byId = Object.fromEntries(ltOf(t).map(([id, r]) => [id.replace(/[A-F0-9]{8}$/, ''), r.Properties.LaunchTemplateName]));
+  assert.equal(byId.Own, 'shukkatest-own');
+  assert.equal(byId.None, undefined);
+  for (const k of ['Long', 'Odd']) {
+    assert.ok((byId[k] as string).startsWith('shukkatest-'), byId[k]);
+    assert.match(byId[k] as string, /^[a-zA-Z0-9().\-/_]{3,128}$/, k);
+  }
+  assert.equal(byId.Odd, 'shukkatest-web-server-1');
+});
+
+test('shu-9bj.20: a token launch template name is left alone with a synth warning', () => {
+  const app = new App();
+  const s = new Stack(app, 'Shukkatest-T', { env: { account: '123456789012', region: 'us-east-1' } });
+  const p = new CfnParameter(s, 'LtName');
+  new ec2.CfnLaunchTemplate(s, 'Tok', { launchTemplateName: p.valueAsString, launchTemplateData: {} });
+  tagProject(app, 'shukkatest');
+  const t = Template.fromStack(s);
+  const [, lt] = ltOf(t.toJSON())[0] as [string, Loose];
+  assert.deepEqual(lt.Properties.LaunchTemplateName, { Ref: 'LtName' });
+  const warnings = Annotations.fromStack(s).findWarning('*', Match.stringLikeRegexp('LaunchTemplateName'));
+  assert.equal(warnings.length, 1, JSON.stringify(warnings));
 });
