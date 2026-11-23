@@ -196,9 +196,9 @@ setup_bootstrap_project() {
   [[ -n "$(qualifier_stacks)" ]] || die "no bootstrap stack with qualifier $QUALIFIER after shukka bootstrap"
 }
 
-# qualifier_stacks: the project's bootstrap stack(s): a Qualifier parameter of shukkatest, or (shukka
-# uses its own bootstrap template, whose parameters are not fixed by the design) a shukkatest-named
-# stack that holds the /cdk-bootstrap/shukkatest/ version parameter.
+# qualifier_stacks: the project's bootstrap stack(s): CDKToolkit-shukkatest (shukka's own template,
+# which takes no Qualifier parameter), a stack with a Qualifier parameter of shukkatest, or a
+# shukkatest-named stack that holds the /cdk-bootstrap/shukkatest/ version parameter.
 qualifier_stacks() {
   local s
   {
@@ -206,6 +206,8 @@ qualifier_stacks() {
       --query "Stacks[?Parameters[?ParameterKey=='Qualifier' && ParameterValue=='$QUALIFIER']].StackName" \
       --output text 2>/dev/null | text_items
     for s in $(our_stacks); do
+      [[ "$s" == "$BOUNDARY_STACK" ]] && continue
+      if [[ "$s" == "$BOOTSTRAP_STACK" ]]; then printf '%s\n' "$s"; continue; fi
       if aws cloudformation describe-stack-resources --stack-name "$s" \
         --query "StackResources[?ResourceType=='AWS::SSM::Parameter'].PhysicalResourceId" --output text 2>/dev/null |
         grep -q "/cdk-bootstrap/$QUALIFIER/"; then

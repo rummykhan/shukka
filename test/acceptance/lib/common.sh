@@ -10,6 +10,12 @@ SUITE_TASK=shu-95y
 PROJECT=shukkatest
 # shellcheck disable=SC2034
 QUALIFIER=shukkatest
+# shukka bootstrap's two stacks (lib/bootstrap.ts bootstrapStackName/boundaryStackName). Neither starts
+# with the project name (the project's deploy role could change them), so they are named here exactly.
+# shellcheck disable=SC2034
+BOOTSTRAP_STACK=CDKToolkit-$QUALIFIER
+# shellcheck disable=SC2034
+BOUNDARY_STACK=Shukka-Boundary-$PROJECT
 # shellcheck disable=SC2034
 SHUKKA_REPO=${SHUKKATEST_SHUKKA_REPO:-rummykhan/shukka}
 # The only repository this suite may push to (it force-pushes main). Not overridable on purpose.
@@ -105,7 +111,8 @@ need_state() { # key → value, or fail the case
 # Safety: the only names this suite may change or delete.
 
 is_ours() {
-  [[ "$1" =~ ^(shukkatest|Shukkatest|cdk-shukkatest-|standin-shukkatest|Standin-shukkatest) ]]
+  [[ "$1" =~ ^(shukkatest|Shukkatest|cdk-shukkatest-|standin-shukkatest|Standin-shukkatest) ]] ||
+    [[ "$1" == "$BOOTSTRAP_STACK" || "$1" == "$BOUNDARY_STACK" ]]
 }
 require_ours() {
   is_ours "$1" || die "refusing to touch '$1': not a shukkatest resource"

@@ -25,12 +25,16 @@ done
 exit 0
 `;
 
-function withStubs(script: string): { status: number | null; stderr: string; calls: string[][] } {
+function withStubs(
+  script: string,
+  opts: { aws?: string; stacks?: string } = {},
+): { status: number | null; stdout: string; stderr: string; calls: string[][] } {
   const dir = mkdtempSync(join(tmpdir(), 'shu-9bj13-'));
   try {
     const bin = join(dir, 'bin');
     spawnSync('mkdir', ['-p', bin, join(dir, 'run', 'runs')]);
-    writeFileSync(join(bin, 'aws'), awsStub);
+    writeFileSync(join(bin, 'aws'), opts.aws ?? awsStub);
+    writeFileSync(join(dir, 'stacks'), opts.stacks ?? '');
     writeFileSync(join(bin, 'gh'), '#!/usr/bin/env bash\nexit 0\n');
     writeFileSync(join(bin, 'sleep'), '#!/usr/bin/env bash\nexit 0\n');
     for (const f of ['aws', 'gh', 'sleep']) chmodSync(join(bin, f), 0o755);
@@ -48,7 +52,7 @@ function withStubs(script: string): { status: number | null; stderr: string; cal
       .split('\n')
       .filter((l) => l !== '')
       .map((l) => l.split(SEP));
-    return { status: r.status, stderr: r.stderr, calls };
+    return { status: r.status, stdout: r.stdout, stderr: r.stderr, calls };
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -83,4 +87,108 @@ test('shu-9bj.13: teardown with every aws text query answering None runs to the 
   // No delete or describe was ever aimed at a resource named None.
   const aimedAtNone = r.calls.filter((c) => c.slice(2).some((a, k) => a === 'None' && c[k + 1]?.startsWith('--')));
   assert.deepEqual(aimedAtNone, []);
+});
+
+// A stub aws that keeps CloudFormation stacks in $STUB_DIR/stacks (one "name status" per line), the way
+// shukka bootstrap leaves them: CDKToolkit-<qualifier> (no Qualifier parameter) holding the retained
+// assets bucket, and Shukka-Boundary-<project>, whose delete fails while the bootstrap's execution role
+// still has its policies attached.
+const stackStub = `#!/usr/bin/env bash
+log="$STUB_DIR/aws.log"
+st="$STUB_DIR/stacks"
+( IFS=$'\\x1f'; printf '%s\\n' "$*" ) >>"$log"
+arg() { local k=$1; shift; while (($#)); do [[ "$1" == "$k" ]] && { printf '%s' "$2"; return; }; shift; done; }
+name=$(arg --stack-name "$@")
+query=$(arg --query "$@")
+status_of() { awk -v n="$1" '$1 == n && $2 != "DELETE_COMPLETE" {print $2}' "$st"; }
+case "$1 $2" in
+  "sts get-caller-identity") printf '123456789012\\n'; exit 0 ;;
+  "cloudformation list-stacks") awk '$2 != "DELETE_COMPLETE" {print $1}' "$st" | paste -sd '\\t' -; exit 0 ;;
+  "cloudformation describe-stacks")
+    if [[ -n "$name" ]]; then
+      s=$(status_of "$name"); [[ -n "$s" ]] || { echo "Stack with id $name does not exist" >&2; exit 254; }
+      printf '%s\\n' "$s"; exit 0
+    fi ;;
+  "cloudformation delete-stack")
+    new=DELETE_COMPLETE
+    if [[ "$name" == Shukka-Boundary-shukkatest && -n "$(status_of CDKToolkit-shukkatest)" ]]; then new=DELETE_FAILED; fi
+    awk -v n="$name" -v s="$new" '$1 == n {$2 = s} {print}' "$st" >"$st.new" && mv "$st.new" "$st"
+    exit 0 ;;
+  "cloudformation describe-stack-resources")
+    if [[ "$name" == CDKToolkit-shukkatest && "$query" == *S3::Bucket* ]]; then
+      printf 'cdk-shukkatest-assets-123456789012-us-east-1\\n'; exit 0
+    fi ;;
+esac
+for a in "$@"; do
+  if [[ "$a" == text ]]; then printf 'None\\n'; exit 0; fi
+done
+exit 0
+`;
+
+const liveStacks = [
+  'CDKToolkit CREATE_COMPLETE',
+  'CDKToolkit-shukkatest CREATE_COMPLETE',
+  'Shukka-Boundary-shukkatest CREATE_COMPLETE',
+  'CDKToolkit-trendigle CREATE_COMPLETE',
+  'Shukka-Boundary-trendigle CREATE_COMPLETE',
+  'CDKToolkit-shukkatestx CREATE_COMPLETE',
+  'Shukka-Boundary-shukkatestx CREATE_COMPLETE',
+  'Shukka-Account CREATE_COMPLETE',
+  'Shukkatest-Box CREATE_COMPLETE',
+].join('\n');
+
+function lines(s: string): string[] {
+  return s.split('\n').filter((l) => l !== '').sort();
+}
+
+test("shu-9bj.14: discovery finds shukka's CDKToolkit-shukkatest and Shukka-Boundary-shukkatest by name, never CDKToolkit or another project's", () => {
+  const run = (fn: string) => {
+    const r = withStubs(fn, { aws: stackStub, stacks: liveStacks });
+    assert.equal(r.status, 0, r.stderr);
+    return lines(r.stdout);
+  };
+  assert.deepEqual(run('our_stacks'), ['CDKToolkit-shukkatest', 'Shukka-Boundary-shukkatest', 'Shukkatest-Box']);
+  assert.deepEqual(run('qualifier_stacks'), ['CDKToolkit-shukkatest']);
+  assert.deepEqual(run('boundary_stacks'), ['Shukka-Boundary-shukkatest']);
+  assert.deepEqual(run('project_stacks'), ['Shukkatest-Box']);
+});
+
+test('shu-9bj.14: the safety check accepts exactly the two bootstrap stack names and delete_stack refuses the rest', () => {
+  const ours = ['CDKToolkit-shukkatest', 'Shukka-Boundary-shukkatest'];
+  const notOurs = [
+    'CDKToolkit',
+    'CDKToolkit-trendigle',
+    'Shukka-Boundary-trendigle',
+    'CDKToolkit-shukkatestx',
+    'Shukka-Boundary-shukkatestx',
+    'CDKToolkit-shukkatest-x',
+    'Shukka-Account',
+  ];
+  for (const n of ours) assert.equal(withStubs(`require_ours ${n}`).status, 0, n);
+  for (const n of notOurs) {
+    assert.notEqual(withStubs(`is_ours ${n}`).status, 0, `is_ours ${n}`);
+    const r = withStubs(`delete_stack ${n}`, { aws: stackStub, stacks: liveStacks });
+    assert.notEqual(r.status, 0, `delete_stack ${n}`);
+    assert.match(r.stderr, /refusing to delete stack/, n);
+    assert.ok(!r.calls.some((c) => c[1] === 'delete-stack'), `no delete-stack for ${n}`);
+  }
+});
+
+test('shu-9bj.14: teardown empties the assets bucket, deletes the bootstrap stack, then retries the DELETE_FAILED boundary stack, and ends clean', () => {
+  const stacks = ['CDKToolkit CREATE_COMPLETE', 'CDKToolkit-shukkatest CREATE_COMPLETE', 'Shukka-Boundary-shukkatest DELETE_FAILED'].join(
+    '\n',
+  );
+  const r = withStubs('teardown', { aws: stackStub, stacks });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stderr, /teardown: clean/);
+  const bucket = 'cdk-shukkatest-assets-123456789012-us-east-1';
+  const at = (pred: (c: string[]) => boolean) => r.calls.findIndex(pred);
+  const emptied = at((c) => c[1] === 'list-object-versions' && c.includes(bucket));
+  const bootstrap = at((c) => c[1] === 'delete-stack' && c.includes('CDKToolkit-shukkatest'));
+  const boundary = at((c) => c[1] === 'delete-stack' && c.includes('Shukka-Boundary-shukkatest'));
+  const bucketGone = at((c) => c[1] === 'delete-bucket' && c.includes(bucket));
+  assert.ok(emptied >= 0 && bootstrap > emptied, 'the assets bucket is emptied before the bootstrap stack is deleted');
+  assert.ok(boundary > bootstrap, 'the boundary stack is deleted after the bootstrap stack');
+  assert.ok(bucketGone > bootstrap, 'the retained bucket is deleted after its stack');
+  assert.ok(!r.calls.some((c) => c[1] === 'delete-stack' && c.includes('CDKToolkit')), 'the default CDKToolkit is never deleted');
 });
