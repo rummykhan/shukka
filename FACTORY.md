@@ -17,7 +17,7 @@ Run from the repo root.
 | Gate | `npm run gate` = `npm run lint && npm run typecheck && npm test && npm run actionlint && npm run shellcheck`; shellcheck runs via `find box scripts -name '*.sh' -type f -exec shellcheck {} +`; typecheck covers `lib/`, `test/` and `scripts/**/*.mjs` (JSDoc types, `checkJs`) |
 | Run locally | `node bin/shukka --help`; workflows only run on GitHub |
 | Worktree setup | `npm ci`. Nothing is shared between worktrees except Docker; container names in tests carry the worktree's task id |
-| Deploy | Tag a release (`vX.Y.Z` and move `v1`) after CI is green on main. Consumers pick it up by pin |
+| Deploy | Tag a release (`vX.Y.Z` and move `v1`) after CI is green on main, always as a **lightweight** tag (`git tag v1.2.3 <sha>`, `git tag -f v1 <sha>`; never `-a`/`-m`): GitHub will not start a caller pinned to an annotated tag (shu-9bj.16). Consumers pick it up by pin |
 | Watch a deploy | `gh run list -R rummykhan/shukka`; consumers: `gh run list -R trendigle/trendigle` |
 | Post-deploy smoke | The consumer's own CI run after bumping its pin |
 
