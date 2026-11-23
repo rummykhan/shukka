@@ -6,8 +6,8 @@ import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { App, Tags } from 'aws-cdk-lib';
-import { applyBoundary, shukkaCiSynthesizer, shukkaSynthesizer } from 'shukka';
+import { App } from 'aws-cdk-lib';
+import { applyBoundary, shukkaCiSynthesizer, shukkaSynthesizer, tagProject } from 'shukka';
 import { CiStack } from '../lib/ci-stack.mjs';
 import { BoxStack } from '../lib/box-stack.mjs';
 import { EscapeStack } from '../lib/escape-stack.mjs';
@@ -41,7 +41,8 @@ if (settings.escape === true) {
   new EscapeStack(app, 'Shukkatest-Escape', { env: stackEnv, synthesizer: shukkaSynthesizer('shukkatest'), targets });
 }
 
-Tags.of(app).add('Project', 'shukkatest');
+// Project on everything, and on the create request of the box's launch template, which the fence requires (shu-9bj.18).
+tagProject(app, 'shukkatest');
 applyBoundary(app, 'shukkatest');
 
 // A compromised dependency in the project's CDK code: after synthesis it adds a file asset that

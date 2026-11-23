@@ -5,3 +5,4 @@ export * from './account-stack.js';
 export * from './synthesizer.js';
 export * from './bootstrap.js';
 export * from './unbounded-roles.js';
+export * from './project-tags.js';
