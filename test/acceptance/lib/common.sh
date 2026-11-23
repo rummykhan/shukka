@@ -178,6 +178,33 @@ enable_workflow() {
   log "workflow '$wf' is active in $CONSUMER_REPO"
 }
 
+# probe_workflows_inactive: "<id> <name> <state>" of each probe workflow (name starting with
+# $PROBE_WORKFLOW) the test consumer knows and that is not active.
+probe_workflows_inactive() {
+  gh api "repos/$CONSUMER_REPO/actions/workflows" --paginate --jq '.workflows[]' 2>/dev/null |
+    jq -r --arg p "$PROBE_WORKFLOW" 'select((.name | startswith($p)) and .state != "active") | "\(.id) \(.name) \(.state)"'
+}
+
+# enable_probe_workflows: teardown disables every workflow in the test consumer and a probe workflow keeps
+# its id (and state) across runs, so enable each known probe workflow by id before pushing it, and wait
+# (bounded) until none is inactive; dies otherwise. A probe GitHub has never seen starts out active.
+enable_probe_workflows() {
+  local id name state i left
+  while read -r id name state; do
+    [[ -n "$id" ]] || continue
+    gh workflow enable "$id" -R "$CONSUMER_REPO" >/dev/null ||
+      die "cannot enable the probe workflow '$name' ($id) in $CONSUMER_REPO (gh workflow enable failed; it is $state)"
+  done <<<"$(probe_workflows_inactive)"
+  for ((i = 0; i < WORKFLOW_ACTIVE_TRIES; i++)); do
+    left=$(probe_workflows_inactive)
+    [[ -z "$left" ]] && break
+    sleep 2
+  done
+  [[ -z "$left" ]] ||
+    die "probe workflows still not active in $CONSUMER_REPO $((WORKFLOW_ACTIVE_TRIES * 2))s after enabling them: $(tr '\n' ';' <<<"$left")"
+  log "probe workflows are active in $CONSUMER_REPO"
+}
+
 # run_for_sha <sha> <workflow-name> <event> [head-branch-or-tag] [workflow-id] [workflow-path]: the newest
 # matching run as "<id> <run name>", or nothing. A run GitHub could not start (startup failure, a workflow
 # file issue) is named by its file path, not its `name:`, so it is also matched by workflow id and path.

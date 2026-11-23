@@ -64,5 +64,5 @@ phase_J() {
   push_main || return 1
   cli_try restore
 
-  gh workflow enable "$CALLER_WORKFLOW" -R "$CONSUMER_REPO" && state_set workflow_disabled 0
+  enable_workflow "$CALLER_WORKFLOW" && state_set workflow_disabled 0
 }
