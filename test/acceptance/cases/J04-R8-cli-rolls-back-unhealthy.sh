@@ -9,6 +9,11 @@ case_run() {
   out=$(cat "$RUN_DIR/runs/cli-unhealthy.log" 2>/dev/null)
   old=$(need_state before_cli_unhealthy_web_rev) || return
   new=$(need_state cli_unhealthy_sha) || return
+  # Without a release on the box, "current is the previous release" holds trivially: require it first.
+  if ! grep -Eq -- "$(release_line_re web "$old" "$new" rolled-back)" <<<"$out"; then
+    fail "the web release of $new ran on the box and rolled back (no release line in the shukka deploy output)"
+    return 1
+  fi
   assert_ne "$(need_state cli_unhealthy_rc)" 0 "shukka deploy exited non-zero"
   assert_eq "$(need_state after_cli_unhealthy_web_rev)" "$old" "web current/REVISION is the previous release"
   assert_match "$out" "$old" "the output names the previous version"
