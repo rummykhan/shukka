@@ -13,7 +13,8 @@ shukka() {
 # stack owns the account's shared GitHub OIDC provider and is created only after Trendigle's Ci stack
 # releases it (shu-li5, epic 2). shukkatest imports the existing provider by ARN.
 
-# Project bootstrap: boundary and execution policies, `cdk bootstrap --qualifier shukkatest`, and
+# Project bootstrap: boundary and execution policies (stack Shukka-Boundary-shukkatest), shukka's own
+# bootstrap template (stack CDKToolkit-shukkatest), and
 # buildEnv values copied from /shukkatest/prod/<NAME> to the consumer's repository variables.
 # Run inside the rendered consumer (it reads ./shukka.json).
 cli_bootstrap_project() { # consumer-dir hosted-zone-id

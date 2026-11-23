@@ -41,7 +41,9 @@ share one deployed project (a fresh project per case would take hours and severa
 ## Safety rules the code enforces
 
 - Everything created is named `shukkatest*` (bootstrap: `cdk-shukkatest-*`; the stand-in "other
-  project": `standin-shukkatest-<run>`) and tagged `Project=shukkatest` (stand-in:
+  project": `standin-shukkatest-<run>`), except shukka bootstrap's two stacks, which are matched by
+  their exact names `CDKToolkit-shukkatest` and `Shukka-Boundary-shukkatest` (never `CDKToolkit` or
+  another project's) and tagged `Project=shukkatest` (stand-in:
   `Project=shukkatest-standin`). Every delete goes through `require_ours`.
 - Trendigle and Orbitary: Trendigle's table and bucket are only *read* (DescribeTable, a one-key
   listing) with shukkatest's credentials, to observe refusals. Writes are only ever attempted on
@@ -183,8 +185,10 @@ with shu-9zr on its mailbox; the guard's lines are `scripts/guard.mjs`'s report.
 Kept in one place each so they are easy to correct; all asked on the owners' mailboxes:
 
 - CLI flags (`lib/cli.sh`): `bootstrap <project> --config
-  --hosted-zone-id --repo`, `deploy --profile`. The toolkit stack's name is not assumed: the suite finds
-  it by its `Qualifier` parameter and the boundary stack by the policies it holds.
+  --hosted-zone-id --repo`, `deploy --profile`. The bootstrap stacks are `CDKToolkit-shukkatest` (no
+  `Qualifier` parameter) and `Shukka-Boundary-shukkatest`, as `lib/bootstrap.ts` names them
+  (`BOOTSTRAP_STACK`, `BOUNDARY_STACK` in `lib/common.sh`); teardown deletes the first (emptying its
+  retained assets bucket) before the second.
 - Job display names (`JOB_RE_*` in `lib/common.sh`), as shu-9zr named them: `plan`, `check <name>`,
   `build <app>`, `stacks / synth|changes|deploy`, `pull request / synth|diff|comment`,
   `servers / changes|release <app>`, `smoke` (each prefixed `shukka / ` by the caller's job id).

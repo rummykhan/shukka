@@ -9,10 +9,16 @@
 # ---------------------------------------------------------------------------------------------
 # Discovery (read-only)
 
-# our_stacks: live stacks whose names mark them as shukkatest's or the stand-in's.
+# our_stacks: live stacks whose names mark them as shukkatest's or the stand-in's, and shukka
+# bootstrap's two stacks for shukkatest, by their exact names (never CDKToolkit or another project's).
 our_stacks() {
-  aws cloudformation list-stacks --query "StackSummaries[?StackStatus!='DELETE_COMPLETE'].StackName" \
-    --output text 2>/dev/null | text_items | grep -Ei '^(shukkatest|standin-shukkatest)' || true
+  local all
+  all=$(aws cloudformation list-stacks --query "StackSummaries[?StackStatus!='DELETE_COMPLETE'].StackName" \
+    --output text 2>/dev/null | text_items)
+  {
+    grep -Ei '^(shukkatest|standin-shukkatest)' <<<"$all"
+    grep -Fx -e "$BOOTSTRAP_STACK" -e "$BOUNDARY_STACK" <<<"$all"
+  } || true
 }
 
 # is_boundary_stack <stack>: it holds the shukkatest-shukka-* managed policies.
@@ -27,19 +33,21 @@ project_stacks() {
   q=$(qualifier_stacks)
   for s in $(our_stacks); do
     [[ "$s" =~ ^[Ss]tandin- ]] && continue
+    [[ "$s" == "$BOUNDARY_STACK" ]] && continue
     grep -qx -- "$s" <<<"$q" && continue
     is_boundary_stack "$s" && continue
     printf '%s\n' "$s"
   done
 }
 
+# boundary_stacks: Shukka-Boundary-shukkatest by name (found even when DELETE_FAILED has left it without
+# its policies), and any other shukkatest-named stack that holds the shukkatest-shukka-* policies.
 boundary_stacks() {
   local s q
   q=$(qualifier_stacks)
-  for s in $(our_stacks) $(aws cloudformation list-stacks --query "StackSummaries[?StackStatus!='DELETE_COMPLETE'].StackName" --output text 2>/dev/null | text_items | grep -i shukka || true); do
+  for s in $(our_stacks); do
     grep -qx -- "$s" <<<"$q" && continue
-    [[ "$s" == Shukka-Account ]] && continue
-    is_boundary_stack "$s" && printf '%s\n' "$s"
+    if [[ "$s" == "$BOUNDARY_STACK" ]] || is_boundary_stack "$s"; then printf '%s\n' "$s"; fi
   done | sort -u
 }
 
@@ -117,7 +125,7 @@ stack_settled() {
 # began) to finish, then deletes, retrying while the stack is still there. Non-zero if it remains.
 delete_stack() {
   local s=$1 attempt st
-  if ! is_ours "$s" && ! grep -qx -- "$s" <<<"$(qualifier_stacks)" && ! is_boundary_stack "$s"; then
+  if ! is_ours "$s" && ! grep -qx -- "$s" <<<"$(qualifier_stacks)"; then
     die "refusing to delete stack '$s'"
   fi
   for attempt in 1 2 3 4; do
