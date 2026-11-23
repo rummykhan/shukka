@@ -17,6 +17,7 @@ setup_preflight() {
   state_set account "$ACCOUNT"
   log "AWS account from profile '$AWS_PROFILE', region $AWS_REGION (account id not printed)"
 
+  setup_check_tag
   RC_SHA=$(gh api "repos/$SHUKKA_REPO/commits/$RC_TAG" --jq .sha 2>/dev/null) ||
     die "tag $RC_TAG does not exist in $SHUKKA_REPO"
   state_set rc_sha "$RC_SHA"
@@ -33,6 +34,17 @@ setup_preflight() {
     printf '%s\n' "$left" >&2
     die "shukkatest resources from an earlier run still exist; run 'bash test/acceptance/run.sh --teardown' first"
   fi
+}
+
+# GitHub does not start a caller of pipeline.yml pinned to an annotated tag ("workflow file issue",
+# no jobs): it resolves pipeline.yml's nested ./.github/workflows/ calls at the tag object, not at the
+# commit. Release tags are lightweight (git tag <name> <sha>, no -a, -s or -m).
+setup_check_tag() {
+  local type
+  type=$(gh api "repos/$SHUKKA_REPO/git/ref/tags/$RC_TAG" --jq .object.type 2>/dev/null) ||
+    die "tag $RC_TAG does not exist in $SHUKKA_REPO"
+  [[ "$type" == commit ]] ||
+    die "tag $RC_TAG is an annotated tag; GitHub will not start pipeline.yml from it (nested ./ workflow calls). Recreate it as a lightweight tag: git tag -f $RC_TAG $RC_TAG^{commit} && git push -f origin refs/tags/$RC_TAG"
 }
 
 setup_discover() {
