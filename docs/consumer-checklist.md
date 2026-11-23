@@ -10,10 +10,10 @@ Example values: project `acme`, repository `acme-org/acme`, account `12345678901
 
 ## Before you start
 
-- [ ] Tools on the setup machine: Node 22, `git`, AWS CLI v2, `gh` signed in with admin on the repository.
+- [ ] Tools on the setup machine: Node 22, `git`, AWS CLI v2, `gh` signed in with admin on the repository, and Docker for the emergency deploy (`shukka diff` and `deploy` run your project's code in containers and refuse without Docker unless `--trust-project-code`).
 
   ```bash
-  node --version && git --version && aws --version && gh auth status
+  node --version && git --version && aws --version && gh auth status && docker info --format '{{.ServerVersion}}'
   ```
 
 - [ ] Admin credentials for the account work (not an SSO profile; see the README's v1 limits).
@@ -65,20 +65,28 @@ Example values: project `acme`, repository `acme-org/acme`, account `12345678901
   node -e "JSON.parse(require('fs').readFileSync('shukka.json','utf8'))" && echo ok
   ```
 
-- [ ] Install shukka's constructs and tsx in the infra directory, and commit the lockfile:
+- [ ] Install shukka's constructs and tsx in the infra directory, from the exact tag your caller workflow pins (`v1.0.0-rc.N` while testing a release candidate), and commit the lockfile:
 
   ```bash
   cd ~/src/acme/infra
-  npm install --save github:rummykhan/shukka#v1.2.3 aws-cdk-lib constructs tsx   # an exact tag
+  npm install --save github:rummykhan/shukka#v1.2.3 aws-cdk-lib constructs tsx   # the tag in your caller's uses:
   npm install --save-dev --save-exact aws-cdk@2.1148.0                          # shukka's pinned cdk CLI
   git add package.json package-lock.json
   ```
 
 - [ ] `cdk.json` runs the app with tsx: `"app": "npx tsx bin/app.ts"`.
 
-- [ ] In the CDK app (README, step 3): `shukkaSynthesizer('<qualifier>')` on every stack; a CI stack `<Project>-Ci` holding `ShukkaAccess` with your `githubRepo` subject and deploy bucket; `Tags.of(app).add('Project', '<project>')`; `applyBoundary(app, '<project>')`. Import from `shukka`.
+- [ ] In the CDK app (README, step 3): `shukkaSynthesizer('<qualifier>')` on every stack; a CI stack `<Project>-Ci` holding `ShukkaAccess` with your `githubRepo` subject and deploy bucket; `Tags.of(app).add('Project', '<project>')`; `applyBoundary(app, '<project>')`. Import from `shukka`, never from files under it. Testing a release candidate: `allowPrerelease: true` on `ShukkaAccess` (never in production), or AWS refuses the pre-release tag.
 
-- [ ] Every stack is named `<project>-...` or `<Project>-...`; every resource you name starts with the project name. Stacks use only the services the fence covers (README, "What the fence stops").
+- [ ] Every stack is named `<project>-...` or `<Project>-...`, at the top level of the app (not inside a CDK `Stage`); every resource you name starts with the project name. Stacks use only the services the fence covers (README, "What the fence stops").
+
+- [ ] Tags use only letters, digits, spaces and `_ . : / = + - @` (no commas, parentheses or `?`); keys have no `=` and do not start with `aws:`.
+
+- [ ] File assets ending `.json`, `.yaml`, `.yml` or `.template` are JSON (no YAML file assets).
+
+- [ ] Nothing in the stacks lets an outside principal in: role trusts only name AWS services, your account's roles, or what `ShukkaAccess` makes; resource policies name no `*` or other account, and services carry `aws:SourceAccount`/`aws:SourceArn`; SNS email subscriptions only to your `fence.mailDomains`. Public resources (function URL auth `NONE`, public bucket) need a run by hand with `allow_replacement` on every merge that deploys the infrastructure.
+
+- [ ] The app passes no ACL on S3 uploads (`s3:PutObjectAcl` is denied, even `ACL: 'private'`).
 
 - [ ] A stack creates the deploy bucket `<project>-deploy-<account>` (a custom `aws.deployBucket` must start with the project name; public access blocked, SSL enforced, 30-day expiry on `<project>/`).
 
@@ -93,7 +101,7 @@ Example values: project `acme`, repository `acme-org/acme`, account `12345678901
   git add cdk.context.json
   ```
 
-- [ ] One configure hook per app at `server.configure` (README, step 8): idempotent, enables its units, never starts or restarts them, units point at `/opt/<project>/<app>/current`, the app user's writable data outside `/opt/<project>`, prints no secrets.
+- [ ] One configure hook per app at `server.configure` (README, step 8): idempotent, enables its units, never starts or restarts them, units point at `/opt/<project>/<app>/current`, writes nothing under `/opt/<project>/<app>` (settings under `/etc/<project>`, root-owned), the app user's writable data outside `/opt/<project>`, prints no secrets.
 
 - [ ] Each app has its bundle script (`build.bundle`), or uses `scripts/bundle.sh` for Next.js standalone output.
 
@@ -121,6 +129,8 @@ Example values: project `acme`, repository `acme-org/acme`, account `12345678901
 
   Add `--emergency-principal <role or user ARN>` for each principal that may run `shukka deploy` (default: whoever runs this; the account root is refused). Re-running without it resets the principals to whoever runs it.
 
+  If it refuses because resources named `<project>*` belong to no stack of the project (tables, buckets, queues, topics, functions, log groups, alarms, roles, instance profiles, SES configuration sets, SSM documents), delete or rename them, or choose another project name: the fence would hand them to this project's pipeline.
+
 - [ ] Check the stacks and the repository variables exist:
 
   ```bash
@@ -129,11 +139,18 @@ Example values: project `acme`, repository `acme-org/acme`, account `12345678901
   gh variable list --repo acme-org/acme
   ```
 
-- [ ] Deploy the CI stack once by hand, from a clean checkout you trust:
+- [ ] Deploy the CI stack once by hand, from a clean checkout you trust (later changes to its three roles also need an admin deploy; the fence refuses them):
 
   ```bash
   cd ~/src/acme/infra && npm ci && npx cdk deploy Acme-Ci --profile admin
   for r in infra app diff; do aws iam get-role --role-name acme-shukka-$r --profile admin --query Role.Arn; done
+  ```
+
+- [ ] Moving an existing server? Remove or rename any `current` or `previous` in `/opt/<project>/<app>` that is not a symbolic link; the release script refuses to release over it (exit 10).
+
+  ```bash
+  aws ssm send-command --document-name AWS-RunShellScript --targets Key=tag:Project,Values=acme \
+    --parameters 'commands=["ls -ld /opt/acme/*/current /opt/acme/*/previous"]' --profile admin --query Command.CommandId
   ```
 
 - [ ] Moving existing stacks? No pending change sets on any project stack:
@@ -169,13 +186,13 @@ Example values: project `acme`, repository `acme-org/acme`, account `12345678901
 ## Afterwards
 
 - [ ] Protect `main` if your plan allows it: whoever can push to `main` can change the project's resources.
-- [ ] Prepare the emergency deploy now, while GitHub is up:
+- [ ] Prepare the emergency deploy now, while GitHub is up: a clone at your pinned tag, and one `diff` to build the project image (needs Docker; `--trust-project-code` runs your code on the host instead, able to read your home directory):
 
   ```bash
-  git clone --branch v1 https://github.com/rummykhan/shukka ~/shukka && (cd ~/shukka && npm ci)
+  git clone --branch v1.2.3 https://github.com/rummykhan/shukka ~/shukka && (cd ~/shukka && npm ci)
   cd ~/src/acme && node ~/shukka/bin/shukka diff --profile admin
   ```
 
 - [ ] Set an AWS budget alert and watch Actions minutes for the first month.
 - [ ] Decide on a pin: `@v1` or `@v1.x.y` in the caller. The constructs stay on the commit in `package-lock.json` until you run `npm install github:rummykhan/shukka#<tag>` and commit the lockfile; bump them with the caller pin, in one commit.
-- [ ] Review every pull request that changes `<Project>-Ci`: a merge can make your CI roles trust an outside principal.
+- [ ] Read the policy guard's verdict before ticking `allow_replacement`: it lets both guards through, including roles or resource policies that trust an outside principal.
