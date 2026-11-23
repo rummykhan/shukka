@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { writeFileSync } from 'node:fs';
+import { readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { gunzipSync } from 'node:zlib';
 import { DescribeInstancesCommand } from '@aws-sdk/client-ec2';
@@ -286,3 +286,15 @@ test('shu-9bj.7: release refuses a missing or malformed bundle digest before any
     '--health', 'http://127.0.0.1/', '--bucket', 'b-bucket', '--sha', SHA, '--checkout', options.checkout]);
   assert.equal(code, 2);
 }));
+
+test('shu-9bj.15: SC2317 is disabled only on the trap-only cleanup function of box/shukka-release.sh, so older shellcheck (0.9) passes', () => {
+  const lines = readFileSync('box/shukka-release.sh', 'utf8').split('\n');
+  const at = lines.indexOf('cleanup() {');
+  assert.ok(at > 0, 'cleanup() { not found');
+  assert.match(lines[at - 1] ?? '', /^# shellcheck disable=(\S*,)?SC2317(,\S*)? /, 'the line above cleanup() disables SC2317');
+  assert.ok(lines.slice(at).includes('trap cleanup EXIT'), 'cleanup is the EXIT trap');
+  // Nothing broader: no file-wide directive and no other SC2317 in the shellchecked scripts.
+  const shellchecked = ['box', 'scripts'].flatMap((dir) => readdirSync(dir, { recursive: true, encoding: 'utf8' }).filter((f) => f.endsWith('.sh')).map((f) => `${dir}/${f}`));
+  const hits = shellchecked.flatMap((f) => readFileSync(f, 'utf8').split('\n').map((l, i) => ({ f, i, l })).filter(({ l }) => l.includes('SC2317')));
+  assert.deepEqual(hits.map(({ f, i }) => `${f}:${i}`), [`box/shukka-release.sh:${at - 1}`]);
+});
