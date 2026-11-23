@@ -114,11 +114,13 @@ delete_table() {
   aws dynamodb wait table-not-exists --table-name "$1" 2>/dev/null
 }
 
-# stack_settled <name>: the stack is absent or in a terminal state (nothing in progress).
+# stack_settled <name>: the stack is absent, in a terminal state (nothing in progress), or in
+# REVIEW_IN_PROGRESS: a stack created by a change set that was never executed. It has no resources,
+# nothing will move it on by itself, and delete-stack works on it, so it is deleted at once.
 stack_settled() {
   local st
   st=$(stack_status "$1")
-  [[ "$st" != *_IN_PROGRESS ]]
+  [[ "$st" == REVIEW_IN_PROGRESS || "$st" != *_IN_PROGRESS ]]
 }
 
 # delete_stack <name>: waits for any operation in progress (a deploy that was running when teardown
