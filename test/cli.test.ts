@@ -535,7 +535,7 @@ test('shu-5ix: deploy dry run prints the workflow steps in order: checks, build,
     new RegExp(`^${box}bash \\S+/shukka-tree-\\S+/\\.shukka-bundle-\\S+/bundle\\.sh$`), // shukka's script, copied into the tree
     new RegExp(`^${box}npm ci$`),
     new RegExp(`^${box}npx --no-install cdk synth --quiet --output \\S+$`),
-    /^node scripts\/assembly\.mjs check \S+$/,
+    /^node scripts\/assembly\.mjs check \S+ --project shukkatest$/,
     new RegExp(`^node scripts/policy-guard\\.mjs \\S+ --account ${ACCOUNT} --mail-domain example\\.com$`),
     new RegExp(`^assume arn:aws:iam::${ACCOUNT}:role/cdk-shukkatest-deploy-role-${ACCOUNT}-us-east-1 as shukka-emergency; cdk gets only that session$`),
     new RegExp(`^${reEscape(CDK)} diff --app \\S+ --no-color$`),
@@ -563,11 +563,11 @@ function bundleInTree(bundle: string, cwd: string) {
 }
 
 /** A spawn for a real deploy run: commands succeed, cdk synth writes a manifest, cdk diff prints `diff`, the bundle script bundles `bundle`. */
-function deploySpawn(diff: string, bundle: string, diffStatus = 0) {
+function deploySpawn(diff: string, bundle: string, diffStatus = 0, artifacts: Record<string, unknown> = { 'shukkatest-App': { type: 'aws:cloudformation:stack', properties: { tags: { Project: 'shukkatest' } } } }) {
   return recordingSpawn(({ cmd, args, options }) => {
     if (cmd === 'npx' && args.includes('synth')) {
       const out = args[args.indexOf('--output') + 1]!;
-      write(join(out, 'manifest.json'), JSON.stringify({ artifacts: { 'shukkatest-App': { type: 'aws:cloudformation:stack', properties: { tags: { Project: 'shukkatest' } } } } }));
+      write(join(out, 'manifest.json'), JSON.stringify({ artifacts }));
       return { status: 0, stdout: '' };
     }
     if (cmd === process.execPath && args[1] === 'diff') return { status: diffStatus, stdout: diff };
@@ -1756,4 +1756,25 @@ test('shu-9bj.8: bootstrap orb refuses on Orbitary\'s alarms, instance profiles,
   assert.ok(!r.err.includes('orb-prod-setup'), "orb's own document is not a clash");
   assert.match(r.err, /4 resource\(s\) in this account/);
   assert.deepEqual(MUTATING(calls), [], 'nothing ran');
+}));
+
+test('shu-9bj.12: shukka deploy never deploys the CI stack, passes the project to the assembly check, and says when the diff changes the CI stack', withTmp(async (tmp) => {
+  const { dir, sha } = consumer(tmp);
+  const bundle = bundleDir(tmp);
+  const tags = { Project: 'shukkatest' };
+  const artifacts = {
+    'Shukkatest-Ci': { type: 'aws:cloudformation:stack', displayName: 'Shukkatest-Ci', properties: { tags }, dependencies: ['shukkatest-App'] },
+    'shukkatest-App': { type: 'aws:cloudformation:stack', properties: { tags } },
+  };
+  const ciDiff = 'Stack Shukkatest-Ci\nResources\n[~] AWS::IAM::Role InfraRole InfraRoleABC\n\nStack shukkatest-App\nThere were no differences\n\n✨  Number of stacks with differences: 1\n';
+  const { calls, spawn } = deploySpawn(ciDiff, bundle, 0, artifacts);
+  const c = releaseClients();
+  const checked: unknown[] = [];
+  const r = await cli(['deploy', '--profile', 'stelking'], { cwd: dir, spawn, aws: awsWith(c).aws, checkAssembly: (_d: string, o?: unknown) => { checked.push(o); return []; } });
+  assert.equal(r.code, 0, r.out + r.err);
+  assert.deepEqual(checked, [{ project: 'shukkatest' }]);
+  const deploys = calls.filter((x) => isCdk(x, 'deploy')).map((x) => x.args.slice(x.args.indexOf('--no-color') + 1));
+  assert.deepEqual(deploys, [['--exclusively', 'shukkatest-App', '--tags=Project=shukkatest', `--tags=shukka:revision=${sha}`]], 'the CI stack is neither deployed nor pulled in as a dependency');
+  assert.match(r.out + r.err, /not deploying Shukkatest-Ci: the CI stack is deployed by hand with admin credentials/);
+  assert.match(r.out, /guard: Shukkatest-Ci changes, and the pipeline never deploys it: an admin deploys it by hand/);
 }));

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { checkAssembly, main, stackNames } from '../scripts/assembly.mjs';
+import { checkAssembly, ciStackName, deployCommands, main, stackNames } from '../scripts/assembly.mjs';
 
 const scratch = mkdtempSync(join(tmpdir(), 'shu-9zr-assembly-'));
 after(() => rmSync(scratch, { recursive: true, force: true }));
@@ -197,4 +197,96 @@ test('shu-9bj.5: stacks (the GITHUB_OUTPUT value) contains only validated names 
     process.stderr.write = errWrite;
   }
   assert.deepEqual(writes, [], 'nothing reaches stdout (and so GITHUB_OUTPUT)');
+});
+
+// A stack as shukkaSynthesizer emits it (deploy and execution roles) and as shukkaCiSynthesizer emits it (neither).
+const ROLES = {
+  assumeRoleArn: 'arn:${AWS::Partition}:iam::123456789012:role/cdk-shukkatest-deploy-role-123456789012-us-east-1',
+  cloudFormationExecutionRoleArn: 'arn:${AWS::Partition}:iam::123456789012:role/cdk-shukkatest-cfn-exec-role-123456789012-us-east-1',
+};
+function rolesAssembly(stacks: Record<string, Loose>, nested?: Record<string, Loose>): string {
+  const dir = mkdtempSync(join(scratch, 'cdk.out-'));
+  const artifacts: Loose = {};
+  for (const [id, props] of Object.entries(stacks)) {
+    artifacts[id] = { type: 'aws:cloudformation:stack', properties: { templateFile: `${id}.template.json`, ...props } };
+    writeFileSync(join(dir, `${id}.template.json`), '{}');
+  }
+  if (nested) {
+    artifacts.Stage = { type: 'cdk:cloud-assembly', properties: { directoryName: 'stage' } };
+    mkdirSync(join(dir, 'stage'));
+    const inner: Loose = {};
+    for (const [id, props] of Object.entries(nested)) {
+      inner[id] = { type: 'aws:cloudformation:stack', properties: { templateFile: `${id}.template.json`, ...props } };
+      writeFileSync(join(dir, 'stage', `${id}.template.json`), '{}');
+    }
+    writeFileSync(join(dir, 'stage', 'manifest.json'), JSON.stringify({ version: '40.0.0', artifacts: inner }));
+  }
+  writeFileSync(join(dir, 'manifest.json'), JSON.stringify({ version: '40.0.0', artifacts }));
+  return dir;
+}
+
+test('shu-9bj.12: the CI stack is <Project>-Ci', () => {
+  assert.equal(ciStackName('shukkatest'), 'Shukkatest-Ci');
+  assert.equal(ciStackName('acme'), 'Acme-Ci');
+});
+
+test('shu-9bj.12: with --project only <Project>-Ci may name no deploy or execution role; any other stack name is refused', () => {
+  const ok = rolesAssembly({ 'Shukkatest-Ci': {}, 'Shukkatest-Box': ROLES });
+  assert.deepEqual(checkAssembly(ok, { project: 'shukkatest' }), []);
+  assert.equal(main(['check', ok, '--project', 'shukkatest']), 0);
+
+  const other = rolesAssembly({ 'Shukkatest-Ci': {}, 'Shukkatest-Box': {} });
+  const problems = checkAssembly(other, { project: 'shukkatest' });
+  assert.equal(problems.length, 1, problems.join('\n'));
+  assert.match(problems[0]!, /stack Shukkatest-Box names no assumeRoleArn and no cloudFormationExecutionRoleArn: only Shukkatest-Ci may deploy with the caller's own credentials/);
+  assert.equal(main(['check', other, '--project', 'shukkatest']), 1);
+
+  // Another project's CI stack name, a stackName that is not the CI stack's, a CI stack in a nested assembly.
+  assert.match(checkAssembly(rolesAssembly({ 'Acme-Ci': {} }), { project: 'shukkatest' }).join('\n'), /stack Acme-Ci names no assumeRoleArn/);
+  assert.match(checkAssembly(rolesAssembly({ 'Shukkatest-Ci': { stackName: 'Shukkatest-Box' } }), { project: 'shukkatest' }).join('\n'), /stack Shukkatest-Ci names no assumeRoleArn/);
+  assert.match(checkAssembly(rolesAssembly({}, { 'Shukkatest-Ci': {} }), { project: 'shukkatest' }).join('\n'), /stage\/manifest.json: stack Shukkatest-Ci names no/);
+  // Half a synthesizer (a deploy role but CloudFormation acting as it) is refused, the CI stack included.
+  for (const id of ['Shukkatest-Ci', 'Shukkatest-Box']) {
+    assert.match(checkAssembly(rolesAssembly({ [id]: { assumeRoleArn: ROLES.assumeRoleArn } }), { project: 'shukkatest' }).join('\n'), /names no cloudFormationExecutionRoleArn: only Shukkatest-Ci/);
+  }
+  // The CI stack may still use shukkaSynthesizer (it is never deployed by the pipeline either way).
+  assert.deepEqual(checkAssembly(rolesAssembly({ 'Shukkatest-Ci': ROLES }), { project: 'shukkatest' }), []);
+  // Without --project the check is the asset check alone; a bad --project is a usage error.
+  assert.deepEqual(checkAssembly(other), []);
+  assert.equal(main(['check', ok, '--project', '--all']), 2);
+  assert.equal(main(['check', ok, '--project']), 2);
+});
+
+test('shu-9bj.12: deployCommands leaves the CI stack out and never lets cdk pull it in', () => {
+  const tags = { Project: 'shukkatest' };
+  const same = {
+    'Shukkatest-Ci.assets': { type: 'cdk:asset-manifest' },
+    'Shukkatest-Ci': { type: 'aws:cloudformation:stack', displayName: 'Shukkatest-Ci', properties: { tags }, dependencies: ['Shukkatest-Box', 'Shukkatest-Ci.assets'] },
+    'Shukkatest-Box': { type: 'aws:cloudformation:stack', displayName: 'Shukkatest-Box', properties: { tags }, dependencies: [] },
+    'shukkatest-data': { type: 'aws:cloudformation:stack', properties: { tags, stackName: 'shukkatest-data' }, dependencies: ['Shukkatest-Ci'] },
+  };
+  assert.deepEqual(deployCommands(same, 'shukkatest', 'abc'), {
+    commands: [['--exclusively', 'Shukkatest-Box', 'shukkatest-data', '--tags=Project=shukkatest', '--tags=shukka:revision=abc']],
+    skipped: ['Shukkatest-Ci'],
+  });
+  const each = {
+    'Shukkatest-Ci': { type: 'aws:cloudformation:stack', properties: { tags: { ...tags, Part: 'Ci' } } },
+    'Shukkatest-Box': { type: 'aws:cloudformation:stack', properties: { tags: { ...tags, Part: 'Box' } }, dependencies: ['Shukkatest-Ci', 'shukkatest-data'] },
+    'shukkatest-data': { type: 'aws:cloudformation:stack', properties: { tags: { ...tags, Part: 'Data' } } },
+  };
+  assert.deepEqual(deployCommands(each, 'shukkatest', 'abc'), {
+    commands: [
+      ['--exclusively', 'shukkatest-data', '--tags=Project=shukkatest', '--tags=Part=Data', '--tags=shukka:revision=abc'],
+      ['--exclusively', 'Shukkatest-Box', '--tags=Project=shukkatest', '--tags=Part=Box', '--tags=shukka:revision=abc'],
+    ],
+    skipped: ['Shukkatest-Ci'],
+  });
+  // No CI stack in the app: unchanged, one --all.
+  const noCi = Object.fromEntries(Object.entries(same).filter(([id]) => !id.startsWith('Shukkatest-Ci')));
+  assert.deepEqual(deployCommands(noCi, 'shukkatest', 'abc').commands, [['--all', '--tags=Project=shukkatest', '--tags=shukka:revision=abc']]);
+  // Only the CI stack: nothing to deploy.
+  assert.deepEqual(deployCommands({ 'Shukkatest-Ci': same['Shukkatest-Ci'] }, 'shukkatest', 'abc'), { commands: [], skipped: ['Shukkatest-Ci'] });
+  // The CI stack is matched by CloudFormation name, not by artifact id.
+  assert.deepEqual(deployCommands({ X: { type: 'aws:cloudformation:stack', properties: { stackName: 'Shukkatest-Ci' } } }, 'shukkatest', 'abc').skipped, ['X']);
+  assert.throws(() => deployCommands({ '--plugin=x': { type: 'aws:cloudformation:stack' } }, 'shukkatest', 'abc'), /could be read as a cdk option/);
 });

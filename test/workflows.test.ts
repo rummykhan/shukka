@@ -327,7 +327,7 @@ executable('npx', `#!/usr/bin/env bash
 printf '%s\\n' "$*" >>"$FAKE_CDK_LOG"
 [[ "$1 $2 $3" == "--no-install cdk synth" && "$5" == --output ]] || { echo "fake npx: unexpected $*" >&2; exit 97; }
 mkdir -p "$6"
-echo '{"artifacts":{"Shukkatest-Box":{"type":"aws:cloudformation:stack","properties":{"templateFile":"Shukkatest-Box.template.json"}}}}' >"$6/manifest.json"
+echo '{"artifacts":{"Shukkatest-Box":{"type":"aws:cloudformation:stack","properties":{"templateFile":"Shukkatest-Box.template.json","assumeRoleArn":"arn:\${AWS::Partition}:iam::123456789012:role/cdk-shukkatest-deploy-role-123456789012-us-east-1","cloudFormationExecutionRoleArn":"arn:\${AWS::Partition}:iam::123456789012:role/cdk-shukkatest-cfn-exec-role-123456789012-us-east-1"}}}}' >"$6/manifest.json"
 echo '{}' >"$6/Shukkatest-Box.template.json"
 `);
 executable('npm', `#!/usr/bin/env bash
@@ -468,7 +468,9 @@ interface StepResult { code: number; out: string; outputs: Record<string, string
  * Run one step's `run:` script the way GitHub does (bash --noprofile --norc -eo pipefail), with
  * its env: values; every ${{ }} in them must be given in `exprs`.
  */
-async function runStep(ws: Workspace, doc: Loose, jobId: string, name: string, exprs: Record<string, string>, extraEnv: Record<string, string> = {}): Promise<StepResult> {
+async function runStep(ws: Workspace, doc: Loose, jobId: string, name: string, given: Record<string, string>, extraEnv: Record<string, string> = {}): Promise<StepResult> {
+  // The project of fixtureConfig, as the jobs' "Read shukka.json" step outputs it.
+  const exprs: Record<string, string> = { 'steps.config.outputs.project': 'shukkatest', ...given };
   const s = step(doc, jobId, name);
   const env: Record<string, string> = {};
   for (const [key, value] of Object.entries((s.env ?? {}) as Record<string, string>)) {
@@ -686,15 +688,15 @@ test('shu-9zr: infra deploy tags every stack shukka:revision=<sha>, keeping each
   const same = await runStep(ws, infra, 'deploy', 'Deploy', {});
   assert.equal(same.code, 0, same.out);
   assert.equal(same.outputs.deployed, 'true');
-  assert.deepEqual(same.cdk, [`deploy --app ${assembly} --require-approval never --no-color --all --tags=Project=shukkatest --tags=shukka:revision=${head}`]);
+  // shu-9bj.12: the CI stack is never deployed by the pipeline, so the others are named (--exclusively), not --all.
+  assert.deepEqual(same.cdk, [`deploy --app ${assembly} --require-approval never --no-color --exclusively Shukkatest-Box --tags=Project=shukkatest --tags=shukka:revision=${head}`]);
 
   writeFileSync(join(assembly, 'manifest.json'), manifest((id) => ({ Project: 'shukkatest', Part: id })));
   const each = await runStep(ws, infra, 'deploy', 'Deploy', {});
   assert.equal(each.code, 0, each.out);
   assert.deepEqual(each.cdk, [
     `deploy --app ${assembly} --require-approval never --no-color --exclusively Shukkatest-Box --tags=Project=shukkatest --tags=Part=Box --tags=shukka:revision=${head}`,
-    `deploy --app ${assembly} --require-approval never --no-color --exclusively Shukkatest-Ci --tags=Project=shukkatest --tags=Part=Ci --tags=shukka:revision=${head}`,
-  ], 'dependencies first');
+  ], 'dependencies first; never the CI stack');
 
   const failed = await runStep(ws, infra, 'deploy', 'Deploy', {}, { FAKE_DEPLOY_STATUS: '1' });
   assert.equal(failed.code, 1);
@@ -1025,4 +1027,51 @@ test('shu-9zr: the comment job refuses diff text another job swapped, and shares
   const names = steps(infra.jobs.comment).map((x) => x.name ?? x.uses);
   assert.ok(names.indexOf('Verify the diff') < names.indexOf('Comment on the pull request'));
   assert.deepEqual(infra.jobs.comment.concurrency, { group: infra.jobs.diff.concurrency.group, 'cancel-in-progress': false });
+});
+
+test('shu-9bj.12: infra deploy never deploys <Project>-Ci, checks every other stack goes through the bootstrap, and the diff says an admin deploy is needed', async () => {
+  const ws = workspace();
+  const assembly = join(ws.temp, 'cdk.out');
+  mkdirSync(assembly);
+  const head = sh(ws.project, 'rev-parse', 'HEAD');
+  const tags = { Project: 'shukkatest' };
+  writeFileSync(join(assembly, 'manifest.json'), JSON.stringify({
+    artifacts: {
+      'Shukkatest-Ci': { type: 'aws:cloudformation:stack', displayName: 'Shukkatest-Ci', properties: { tags } },
+      'Shukkatest-Box': { type: 'aws:cloudformation:stack', displayName: 'Shukkatest-Box', properties: { tags }, dependencies: ['Shukkatest-Ci'] },
+    },
+  }));
+  const r = await runStep(ws, infra, 'deploy', 'Deploy', {});
+  assert.equal(r.code, 0, r.out);
+  assert.deepEqual(r.cdk, [`deploy --app ${assembly} --require-approval never --no-color --exclusively Shukkatest-Box --tags=Project=shukkatest --tags=shukka:revision=${head}`]);
+  assert.match(r.out, /::notice::shukka: not deploying Shukkatest-Ci: the CI stack is deployed by hand with admin credentials/);
+  writeFileSync(join(assembly, 'manifest.json'), JSON.stringify({ artifacts: { 'Shukkatest-Ci': { type: 'aws:cloudformation:stack', properties: { tags } } } }));
+  const only = await runStep(ws, infra, 'deploy', 'Deploy', {});
+  assert.equal(only.code, 0, only.out);
+  assert.deepEqual(only.cdk, []);
+  assert.equal(only.outputs.deployed, 'true');
+
+  // Both credentialed jobs check the assembly with the project: a role-less stack under another name is refused.
+  for (const job of ['deploy', 'diff']) {
+    assert.match(step(infra, job, 'Check the assembly').run, /assembly\.mjs check "\$RUNNER_TEMP\/cdk\.out" --project "\$PROJECT"/, job);
+    assert.equal(step(infra, job, 'Check the assembly').env.PROJECT, '${{ steps.config.outputs.project }}', job);
+  }
+  const roleless = join(ws.dir, 'roleless');
+  mkdirSync(roleless);
+  writeFileSync(join(roleless, 'manifest.json'), JSON.stringify({ artifacts: { 'Shukkatest-Box': { type: 'aws:cloudformation:stack', properties: {} } } }));
+  const checked = spawnSync(process.execPath, [join(root, 'scripts', 'assembly.mjs'), 'check', roleless, '--project', 'shukkatest'], { encoding: 'utf8' });
+  assert.equal(checked.status, 1);
+  assert.match(checked.stdout, /stack Shukkatest-Box names no assumeRoleArn and no cloudFormationExecutionRoleArn: only Shukkatest-Ci may/);
+
+  // Merge and pull-request diffs both still show the CI stack's changes and say who has to deploy them.
+  const diffFile = join(ws.dir, 'ci-diff.txt');
+  writeFileSync(diffFile, 'Stack Shukkatest-Ci\nResources\n[~] AWS::IAM::Role InfraRole InfraRole1234\n\nStack Shukkatest-Box\nThere were no differences\n\n✨  Number of stacks with differences: 1\n');
+  const merge = await runStep(ws, infra, 'deploy', 'Diff and guard', deployExprs('false', 'push'), { FAKE_DIFF: diffFile });
+  assert.equal(merge.code, 0, merge.out);
+  assert.match(merge.out, /\[~\] AWS::IAM::Role InfraRole/);
+  assert.match(merge.out, /^guard: Shukkatest-Ci changes, and the pipeline never deploys it: an admin deploys it by hand/m);
+  assert.match(merge.summary, /\*\*Admin deploy needed:\*\* Shukkatest-Ci changes/);
+  const pr = await runStep(ws, infra, 'diff', 'Diff and guard', {}, { FAKE_DIFF: diffFile });
+  assert.equal(pr.code, 0, pr.out);
+  assert.match(readFileSync(join(ws.temp, 'shukka-pr-diff', 'guard.txt'), 'utf8'), /^guard: Shukkatest-Ci changes, and the pipeline never deploys it/m, 'the pull-request comment carries it');
 });

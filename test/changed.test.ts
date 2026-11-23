@@ -5,7 +5,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { computeChanges, globToRegExp, main, matchesAny, revisionScript } from '../scripts/changed.mjs';
+import { computeChanges, globToRegExp, main, matchesAny, readStackRevisions, revisionScript } from '../scripts/changed.mjs';
 import { validateConfig, type Config } from '../scripts/config.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -531,4 +531,19 @@ test('shu-9zr: a malformed --part is a usage error and an unknown app fails', as
   const unknown = await runMain(deployedAtHead(), ['--part', 'app:nope']);
   assert.equal(unknown.code, 1);
   assert.match(unknown.errors, /no app "nope"/);
+});
+
+test('shu-9bj.12: the CI stack never counts as one of the stacks the pipeline deploys (it carries no pipeline revision)', async () => {
+  const stacks = [
+    { StackName: 'Shukkatest-Box', Tags: [{ Key: 'shukka:revision', Value: 'aaaaaaa' }] },
+    { StackName: 'Shukkatest-Ci', Tags: [] },
+    { StackName: 'shukkatest-data', Tags: [{ Key: 'shukka:revision', Value: 'bbbbbbb' }] },
+  ];
+  const asked: unknown[] = [];
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const cfn = { async send(c: any) { asked.push(c.input.StackName); return { Stacks: stacks.filter((x) => !c.input.StackName || x.StackName === c.input.StackName) }; } };
+  assert.deepEqual(await readStackRevisions(cfn, 'shukkatest'), ['aaaaaaa', 'bbbbbbb']);
+  asked.length = 0;
+  assert.deepEqual(await readStackRevisions(cfn, 'shukkatest', ['Shukkatest-Box', 'Shukkatest-Ci']), ['aaaaaaa']);
+  assert.deepEqual(asked, ['Shukkatest-Box'], 'the CI stack is not even read');
 });

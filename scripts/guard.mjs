@@ -4,11 +4,15 @@
 // run the workflow by hand with allow_replacement (`--allow`) to go ahead on purpose.
 // Port of Trendigle's diff-guard.sh with the same rules, plus: a removed stack Output is not destructive.
 //
-// Usage: npx cdk diff --no-color 2>&1 | node scripts/guard.mjs [--allow] [--summary <file>]
+// With --project, it also says when the diff changes the project's CI stack (<Project>-Ci): the pipeline and
+// `shukka deploy` never deploy it, so an admin has to (README step 5). That never changes the exit code.
+//
+// Usage: npx cdk diff --no-color 2>&1 | node scripts/guard.mjs [--allow] [--summary <file>] [--project <name>]
 // Exit 0: nothing is deleted or replaced (or it was allowed). Exit 1: something is, or the diff is incomplete.
 // Exit 2: bad arguments.
 import { appendFileSync, readFileSync, realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
+import { ciStackName } from './assembly.mjs';
 
 const CLOSING_LINE = 'Number of stacks with differences:';
 // Colour codes would hide the markers below, so they are removed first.
@@ -57,6 +61,41 @@ export function guard(diff, options = {}) {
   if (found.length === 0) return { verdict: 'safe', code: 0, found };
   if (options.allow) return { verdict: 'allowed', code: 0, found };
   return { verdict: 'destructive', code: 1, found };
+}
+
+/**
+ * Whether the diff shows changes to the stack named `name`: its `Stack <name>` section is there and does not say
+ * "There were no differences". False when the stack is not in the diff.
+ * @param {string} diff full `cdk diff` output, colour codes allowed
+ * @param {string} name
+ * @returns {boolean}
+ */
+export function stackDiffers(diff, name) {
+  let inside = false;
+  let found = false;
+  for (const line of stripColour(diff).split(/\r?\n/)) {
+    const header = /^Stack (\S+)(?: \((\S+)\))?\s*$/.exec(line);
+    if (header) {
+      inside = header[1] === name || header[2] === name;
+      found ||= inside;
+      continue;
+    }
+    if (line.includes(CLOSING_LINE)) inside = false;
+    if (inside && line.startsWith('There were no differences')) return false;
+  }
+  return found;
+}
+
+/**
+ * The notice for a diff that changes the project's CI stack, which only an admin deploys; '' when it does not.
+ * @param {string} diff
+ * @param {string} project
+ * @returns {string}
+ */
+export function adminNotice(diff, project) {
+  const ci = ciStackName(project);
+  if (!stackDiffers(diff, ci)) return '';
+  return `guard: ${ci} changes, and the pipeline never deploys it: an admin deploys it by hand (npx cdk deploy ${ci} with admin credentials, README step 5)\n`;
 }
 
 /**
@@ -114,12 +153,14 @@ export function summary(result) {
 
 /**
  * @param {string[]} args
- * @returns {{ allow: boolean, summaryFile?: string } | { error: string }}
+ * @returns {{ allow: boolean, summaryFile?: string, project?: string } | { error: string }}
  */
 export function parseArgs(args) {
   let allow = false;
   /** @type {string | undefined} */
   let summaryFile;
+  /** @type {string | undefined} */
+  let project;
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (arg === '--allow') {
@@ -129,11 +170,16 @@ export function parseArgs(args) {
       if (file === undefined || file === '' || file.startsWith('--')) return { error: '--summary needs a file' };
       summaryFile = file;
       i++;
+    } else if (arg === '--project') {
+      const name = args[i + 1];
+      if (name === undefined || !/^[a-z][a-z0-9-]{1,20}$/.test(name)) return { error: '--project needs a project name' };
+      project = name;
+      i++;
     } else {
       return { error: `unknown argument: ${arg}` };
     }
   }
-  return summaryFile === undefined ? { allow } : { allow, summaryFile };
+  return { allow, ...(summaryFile === undefined ? {} : { summaryFile }), ...(project === undefined ? {} : { project }) };
 }
 
 /**
@@ -143,12 +189,16 @@ export function parseArgs(args) {
 export function main(args) {
   const parsed = parseArgs(args);
   if ('error' in parsed) {
-    process.stderr.write(`guard: ${parsed.error}\nusage: node guard.mjs [--allow] [--summary <file>] < cdk-diff.txt\n`);
+    process.stderr.write(`guard: ${parsed.error}\nusage: node guard.mjs [--allow] [--summary <file>] [--project <name>] < cdk-diff.txt\n`);
     return 2;
   }
-  const result = guard(readFileSync(0, 'utf8'), { allow: parsed.allow });
-  process.stdout.write(report(result));
-  if (parsed.summaryFile !== undefined) appendFileSync(parsed.summaryFile, summary(result));
+  const diff = readFileSync(0, 'utf8');
+  const result = guard(diff, { allow: parsed.allow });
+  const notice = parsed.project === undefined ? '' : adminNotice(diff, parsed.project);
+  process.stdout.write(report(result) + notice);
+  if (parsed.summaryFile !== undefined) {
+    appendFileSync(parsed.summaryFile, summary(result) + (notice === '' ? '' : `**Admin deploy needed:** ${notice.replace(/^guard: /, '')}\n`));
+  }
   return result.code;
 }
 

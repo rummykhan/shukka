@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { App, Tags } from 'aws-cdk-lib';
-import { applyBoundary, shukkaSynthesizer } from 'shukka';
+import { applyBoundary, shukkaCiSynthesizer, shukkaSynthesizer } from 'shukka';
 import { CiStack } from '../lib/ci-stack.mjs';
 import { BoxStack } from '../lib/box-stack.mjs';
 import { EscapeStack } from '../lib/escape-stack.mjs';
@@ -34,7 +34,8 @@ if (existsSync(new URL('probe.on', infraDir))) {
 const app = new App();
 const stackEnv = { account: env.account, region: env.region };
 
-new CiStack(app, 'Shukkatest-Ci', { env: stackEnv, synthesizer: shukkaSynthesizer('shukkatest'), shukkatest: env });
+// The CI stack is deployed by hand with admin credentials (setup_ci_stack), never by the pipeline (shu-9bj.12).
+new CiStack(app, 'Shukkatest-Ci', { env: stackEnv, synthesizer: shukkaCiSynthesizer('shukkatest'), shukkatest: env });
 new BoxStack(app, 'Shukkatest-Box', { env: stackEnv, synthesizer: shukkaSynthesizer('shukkatest'), shukkatest: env, settings });
 if (settings.escape === true) {
   new EscapeStack(app, 'Shukkatest-Escape', { env: stackEnv, synthesizer: shukkaSynthesizer('shukkatest'), targets });

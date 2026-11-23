@@ -83,6 +83,11 @@ const cases = [
   ['exec', 'explicitDeny', 'iam:AttachRolePolicy', `arn:aws:iam::${A}:role/trendigle-shukka-app`, { 'iam:PermissionsBoundary': BOUNDARY }],
   ['exec', 'explicitDeny', 'iam:DetachRolePolicy', `arn:aws:iam::${A}:role/trendigle-shukka-infra`],
   ['exec', 'explicitDeny', 'iam:DeleteRolePolicy', `arn:aws:iam::${A}:role/Trendigle-shukka-infra`],
+  // shu-9bj.12: NoChangeToCiRoles stays as it is, so the execution role cannot give the CI roles their inline policies
+  // even while creating them (CreateRole then PutRolePolicy): the CI stack is deployed by hand with the admin's own
+  // credentials (shukkaCiSynthesizer), never through the execution role.
+  ['exec', 'explicitDeny', 'iam:PutRolePolicy', `arn:aws:iam::${A}:role/trendigle-shukka-app`, { 'iam:PermissionsBoundary': BOUNDARY }],
+  ['exec', 'explicitDeny', 'iam:PutRolePolicy', `arn:aws:iam::${A}:role/trendigle-shukka-diff`, { 'iam:PermissionsBoundary': BOUNDARY }],
   ['exec', 'allowed', 'iam:UpdateAssumeRolePolicy', `arn:aws:iam::${A}:role/Trendigle-prod-Instance-Role1ABCC5F0-5uGLbHErVSKT`],
   ['exec', 'implicitDeny', 'cloudformation:DeleteStack', `arn:aws:cloudformation:${R}:${A}:stack/Orbitary-prod-Data/x`],
   // What today's Trendigle roles do, which the boundary must still allow (identity policy allows everything, so

@@ -10,6 +10,7 @@
 //   prints {"infra": bool, "apps": {"<name>": bool}, "base": {"infra": sha|null, "apps": {"<name>": sha|null}}}
 //   exit 0: printed; exit 1: config invalid, unknown app or git failed; exit 2: usage error
 //   --stacks names the project's stacks instead of listing every stack whose name starts with the project
+//   (either way without the CI stack <Project>-Ci, which only an admin deploys)
 //   --part (repeatable) decides only the parts named and reads AWS only for them: `infra` reads the
 //   stack tags (the workflows run it under the infrastructure deploy role), `app:<name>` reads that
 //   app's REVISION on the servers (under the app role). Parts not named are left out of the output
@@ -25,6 +26,7 @@ import { fileURLToPath } from 'node:url';
 import { CloudFormationClient, DescribeStacksCommand } from '@aws-sdk/client-cloudformation';
 import { DescribeInstancesCommand, EC2Client } from '@aws-sdk/client-ec2';
 import { GetCommandInvocationCommand, SSMClient, SendCommandCommand } from '@aws-sdk/client-ssm';
+import { ciStackName } from './assembly.mjs';
 import { loadConfig } from './config.mjs';
 
 /**
@@ -244,7 +246,8 @@ export function decidePart(repo, head, revisions, globs, label, warn) {
 /**
  * The `shukka:revision` tag of each of the project's stacks; null for a stack without it.
  * Without `stacks`, the project's stacks are every stack whose name starts with the project
- * name (any case), the same prefix the fence uses.
+ * name (any case), the same prefix the fence uses. The CI stack (`<Project>-Ci`) is left out either
+ * way: the pipeline never deploys it (an admin does, by hand), so it never carries a pipeline revision.
  * @param {Client} cfn
  * @param {string} project
  * @param {string[]} [stacks]
@@ -253,8 +256,9 @@ export function decidePart(repo, head, revisions, globs, label, warn) {
 export async function readStackRevisions(cfn, project, stacks) {
   /** @type {any[]} */
   const found = [];
+  const ci = ciStackName(project);
   if (stacks) {
-    for (const name of stacks) {
+    for (const name of stacks.filter((n) => n !== ci)) {
       try {
         const out = await cfn.send(new DescribeStacksCommand({ StackName: name }));
         found.push(...(out.Stacks ?? []));
@@ -268,7 +272,7 @@ export async function readStackRevisions(cfn, project, stacks) {
     do {
       const out = await cfn.send(new DescribeStacksCommand(token ? { NextToken: token } : {}));
       const prefix = project.toLowerCase();
-      found.push(...(out.Stacks ?? []).filter((/** @type {any} */ s) => String(s.StackName ?? '').toLowerCase().startsWith(prefix)));
+      found.push(...(out.Stacks ?? []).filter((/** @type {any} */ s) => String(s.StackName ?? '').toLowerCase().startsWith(prefix) && s.StackName !== ci));
       token = out.NextToken;
     } while (token);
   }

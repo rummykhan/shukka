@@ -195,3 +195,27 @@ test('shu-bp6: --summary without a file is refused', () => {
   assert.equal(code, 2);
   assert.match(stderr, /--summary/);
 });
+
+test('shu-9bj.12: with --project the guard says when the diff changes the CI stack, which only an admin deploys; the verdict is unchanged', () => {
+  const changed = `${ESC}[1mStack ${ESC}[1mShukkatest-Ci${ESC}[22m\nIAM Statement Changes\nResources\n[~] AWS::IAM::Role InfraRole InfraRole1234\n\nStack Shukkatest-Box\nThere were no differences\n\n${closing}\n`;
+  const notice = /^guard: Shukkatest-Ci changes, and the pipeline never deploys it: an admin deploys it by hand \(npx cdk deploy Shukkatest-Ci with admin credentials, README step 5\)$/m;
+  const dir = mkdtempSync(join(tmpdir(), 'shu-9bj12-guard-'));
+  try {
+    const summary = join(dir, 'summary.md');
+    const r = runGuard(changed, ['--project', 'shukkatest', '--summary', summary]);
+    assert.equal(r.code, 0, r.stderr);
+    assert.match(r.stdout, /^guard: nothing is deleted or replaced$/m);
+    assert.match(r.stdout, notice);
+    assert.match(readFileSync(summary, 'utf8'), /\*\*Admin deploy needed:\*\* Shukkatest-Ci changes/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+  // No changes to the CI stack, no CI stack, or no --project: no notice.
+  const same = `Stack Shukkatest-Ci\nThere were no differences\n\nStack Shukkatest-Box\nResources\n[+] AWS::SNS::Topic T T1\n\n${closing}\n`;
+  assert.doesNotMatch(runGuard(same, ['--project', 'shukkatest']).stdout, /admin/);
+  assert.doesNotMatch(runGuard(`Stack Shukkatest-Box\n[+] AWS::SNS::Topic T T1\n\n${closing}\n`, ['--project', 'shukkatest']).stdout, /admin/);
+  assert.doesNotMatch(runGuard(changed).stdout, /admin/);
+  // Another project's CI stack is not this one's.
+  assert.doesNotMatch(runGuard(changed, ['--project', 'acme']).stdout, /admin/);
+  assert.equal(runGuard(changed, ['--project', '--allow']).code, 2);
+});

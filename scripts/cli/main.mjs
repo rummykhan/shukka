@@ -103,6 +103,8 @@ export const COMMANDS = [
       'cdk diff and the guard, cdk deploy with the shukka:revision tag, then for each app upload the bundle',
       '(scripts/upload.mjs) and release it on the servers (scripts/release.mjs), and the smoke test. Every part',
       'deploys, whatever changed. It builds from a fresh worktree of origin/main and reads shukka.json from there.',
+      'It never deploys the CI stack <Project>-Ci (there is no flag for it): the diff says when that stack changed,',
+      'and an admin deploys it by hand (npx cdk deploy <Project>-Ci with admin credentials; README step 5).',
       '',
       ...PROJECT_CODE_HELP,
       '',
@@ -226,7 +228,7 @@ function list(flags, name) {
  *   aws?: (target: { profile?: string, region: string }, io: import('./exec.mjs').Io) => import('./aws.mjs').Aws,
  *   cwd?: string,
  *   env?: Record<string, string | undefined>,
- *   checkAssembly?: (dir: string) => string[],
+ *   checkAssembly?: (dir: string, options?: { project?: string }) => string[],
  *   keepTemp?: boolean,
  * }} Deps
  */

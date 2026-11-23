@@ -215,18 +215,22 @@ qualifier_stacks() {
   } | grep . | sort -u || true
 }
 
-# The Ci stack (ShukkaAccess) is deployed by hand once, with admin credentials, through the project's
-# bootstrap, as a consumer does before its first merge.
+# The Ci stack (ShukkaAccess) is deployed by hand with admin credentials, as a consumer does before its
+# first merge and after every change to it (README step 5). It uses shukkaCiSynthesizer: CloudFormation
+# acts with these admin credentials, not the fenced execution role, which may not change the CI roles
+# (NoChangeToCiRoles); the pipeline never deploys it.
 setup_ci_stack() {
   local infra="$RUN_DIR/consumer/infra"
   (cd "$infra" && npm install --no-audit --no-fund --loglevel=error) || die "npm install in the consumer's infra failed"
   state_set ci_stack_started 1
   (cd "$infra" && npx cdk deploy Shukkatest-Ci --require-approval never --progress events) ||
     die "deploying Shukkatest-Ci by hand failed"
-  local r
+  local r role
   for r in infra app diff; do
     aws iam get-role --role-name "$PROJECT-shukka-$r" >/dev/null 2>&1 || die "role $PROJECT-shukka-$r was not created"
   done
+  role=$(aws cloudformation describe-stacks --stack-name Shukkatest-Ci --query 'Stacks[0].RoleARN' --output text 2>/dev/null)
+  [[ "$role" == None || -z "$role" ]] || die "Shukkatest-Ci was deployed through a CloudFormation role ($role), not the admin's own credentials"
 }
 
 # Clean the test repository of earlier probes, then push the baseline as the first merge to main.
