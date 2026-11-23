@@ -480,3 +480,68 @@ test('shu-9bj.17: phase B enables the probe workflows before its first push, and
   assert.match(j, /enable_workflow "\$CALLER_WORKFLOW" && state_set workflow_disabled 0/);
   assert.doesNotMatch(j, /gh workflow enable/);
 });
+
+// A stub aws for delete_stack's waits: $STUB_DIR/stacks holds "name status" lines; a stack whose status
+// is an *_IN_PROGRESS other than REVIEW_IN_PROGRESS settles to UPDATE_COMPLETE on the third
+// describe-stacks. Every sleep is logged, so a wait shows up in $STUB_DIR/aws.log as a "sleep" line.
+const settlingStub = `#!/usr/bin/env bash
+log="$STUB_DIR/aws.log"
+st="$STUB_DIR/stacks"
+( IFS=$'\\x1f'; printf '%s\\n' "$*" ) >>"$log"
+arg() { local k=$1; shift; while (($#)); do [[ "$1" == "$k" ]] && { printf '%s' "$2"; return; }; shift; done; }
+name=$(arg --stack-name "$@")
+status_of() { awk -v n="$1" '$1 == n && $2 != "DELETE_COMPLETE" {print $2}' "$st"; }
+set_status() { awk -v n="$1" -v s="$2" '$1 == n {$2 = s} {print}' "$st" >"$st.new" && mv "$st.new" "$st"; }
+case "$1 $2" in
+  "sts get-caller-identity") printf '123456789012\\n'; exit 0 ;;
+  "cloudformation list-stacks") awk '$2 != "DELETE_COMPLETE" {print $1}' "$st" | paste -sd '\\t' -; exit 0 ;;
+  "cloudformation describe-stacks")
+    s=$(status_of "$name"); [[ -n "$s" ]] || { echo "Stack with id $name does not exist" >&2; exit 254; }
+    n=$(( $(cat "$STUB_DIR/describes" 2>/dev/null || echo 0) + 1 )); echo "$n" >"$STUB_DIR/describes"
+    if [[ "$s" == *_IN_PROGRESS && "$s" != REVIEW_IN_PROGRESS && "$s" != DELETE_IN_PROGRESS && $n -ge 3 ]]; then
+      s=UPDATE_COMPLETE; set_status "$name" "$s"
+    fi
+    printf '%s\\n' "$s"; exit 0 ;;
+  "cloudformation delete-stack") set_status "$name" DELETE_COMPLETE; exit 0 ;;
+esac
+for a in "$@"; do
+  if [[ "$a" == text ]]; then printf 'None\\n'; exit 0; fi
+done
+exit 0
+`;
+const loggingSleep = 'sleep() { printf "sleep\\x1f%s\\n" "$*" >>"$STUB_DIR/aws.log"; }; ';
+
+test('shu-9bj.19: a stack in REVIEW_IN_PROGRESS is deleted on the first attempt with no wait', () => {
+  const r = withStubs(`${loggingSleep}delete_stack Shukkatest-Escape`, {
+    aws: settlingStub,
+    stacks: 'Shukkatest-Escape REVIEW_IN_PROGRESS',
+  });
+  assert.equal(r.status, 0, r.stderr);
+  const del = r.calls.findIndex((c) => c[1] === 'delete-stack' && c.includes('Shukkatest-Escape'));
+  assert.ok(del >= 0, 'delete-stack was called');
+  assert.deepEqual(
+    r.calls.slice(0, del).filter((c) => c[0] === 'sleep'),
+    [],
+    'no sleep before the delete',
+  );
+  assert.equal(r.calls.filter((c) => c[1] === 'delete-stack').length, 1, 'one delete attempt');
+  assert.match(r.stderr, /Shukkatest-Escape \(REVIEW_IN_PROGRESS\), delete attempt 1/);
+});
+
+test('shu-9bj.19: a stack in another *_IN_PROGRESS state is still waited out before it is deleted', () => {
+  const r = withStubs(`${loggingSleep}delete_stack Shukkatest-Box`, {
+    aws: settlingStub,
+    stacks: 'Shukkatest-Box UPDATE_IN_PROGRESS',
+  });
+  assert.equal(r.status, 0, r.stderr);
+  const del = r.calls.findIndex((c) => c[1] === 'delete-stack' && c.includes('Shukkatest-Box'));
+  assert.ok(del >= 0, 'delete-stack was called');
+  const before = r.calls.slice(0, del);
+  assert.equal(before.filter((c) => c[1] === 'describe-stacks').length, 4, 'polled until it settled, then read its status');
+  assert.deepEqual(
+    before.filter((c) => c[0] === 'sleep'),
+    [['sleep', '20'], ['sleep', '20']],
+    'waited at the usual 20s interval while it was in progress',
+  );
+  assert.match(r.stderr, /Shukkatest-Box \(UPDATE_COMPLETE\), delete attempt 1/);
+});
