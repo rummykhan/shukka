@@ -21,8 +21,9 @@ import { randomBytes } from 'node:crypto';
 import { copyFileSync, cpSync, existsSync, lstatSync, mkdtempSync, readFileSync, realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { deployCommands } from '../assembly.mjs';
 import { loadConfig } from '../config.mjs';
-import { guard, report } from '../guard.mjs';
+import { adminNotice, guard, report } from '../guard.mjs';
 import { githubRepoFromUrl, policyGuard, report as policyReport } from '../policy-guard.mjs';
 import { release } from '../release.mjs';
 import { checkBundle, upload } from '../upload.mjs';
@@ -277,7 +278,7 @@ function cdk(io, config, session, assembly, args, options = {}) {
 /**
  * The assembly checks the workflows use (scripts/assembly.mjs: no file asset built by a command, no Docker image
  * asset, nothing outside the assembly), loaded by path so this file does not fail to load where it is absent.
- * @returns {Promise<(dir: string) => string[]>}
+ * @returns {Promise<(dir: string, options?: { project?: string }) => string[]>}
  */
 async function loadAssemblyCheck() {
   const specifier = '../assembly.mjs';
@@ -294,17 +295,19 @@ async function loadAssemblyCheck() {
 }
 
 /**
- * Refuse an assembly with executable or Docker assets (or paths leaving it) before cdk gets credentials.
+ * Refuse an assembly with executable or Docker assets (or paths leaving it), or a stack other than the CI stack that
+ * does not deploy through the project's bootstrap, before cdk gets credentials.
  * @param {Io} io
  * @param {string} assembly
- * @param {((dir: string) => string[]) | undefined} check
+ * @param {string} project
+ * @param {((dir: string, options?: { project?: string }) => string[]) | undefined} check
  */
-async function checkAssemblySafe(io, assembly, check) {
+async function checkAssemblySafe(io, assembly, project, check) {
   if (io.dryRun) {
-    io.out(`+ node scripts/assembly.mjs check ${assembly}   [dry run: not run]\n`);
+    io.out(`+ node scripts/assembly.mjs check ${assembly} --project ${project}   [dry run: not run]\n`);
     return;
   }
-  const problems = (check ?? (await loadAssemblyCheck()))(assembly);
+  const problems = (check ?? (await loadAssemblyCheck()))(assembly, { project });
   if (problems.length > 0) throw new CliError(`refusing to deploy the synthesized assembly:\n${problems.join('\n')}`);
   io.say('assembly checked: no asset runs a command, no Docker image asset');
 }
@@ -355,13 +358,14 @@ function diffAndGuard(io, config, session, assembly, allow) {
   }
   io.out(r.stdout.endsWith('\n') || r.stdout === '' ? r.stdout : `${r.stdout}\n`);
   const result = guard(r.stdout, { allow });
-  io.out(report(result));
+  io.out(report(result) + adminNotice(r.stdout, config.project));
   return { result, diffStatus: r.status };
 }
 
 /**
- * Stack deploys with the shukka:revision tag, as infra.yml does: one `--all` when every stack has the same tags,
- * otherwise each stack alone after its dependencies, so each keeps its own tags.
+ * Stack deploys with the shukka:revision tag, as infra.yml does (scripts/assembly.mjs deployCommands): one `--all`
+ * when every stack has the same tags, otherwise each stack alone after its dependencies, so each keeps its own tags.
+ * The CI stack (<Project>-Ci) is never deployed here: an admin deploys it by hand (README step 5).
  * @param {Io} io
  * @param {Config} config
  * @param {Session | null} session
@@ -372,48 +376,28 @@ function deployStacks(io, config, session, assembly, sha) {
   const manifestFile = join(assembly, 'manifest.json');
   /** @type {Record<string, any>} */
   const artifacts = existsSync(manifestFile) ? (JSON.parse(readFileSync(manifestFile, 'utf8')).artifacts ?? {}) : {};
-  const stacks = Object.entries(artifacts).filter(([, a]) => a.type === 'aws:cloudformation:stack');
-  const ids = new Set(stacks.map(([id]) => id));
-  /** @param {any} a */
-  const tagArgs = (a) => Object.entries({ ...(a.properties?.tags ?? {}), [REVISION_TAG]: sha }).map(([k, v]) => `--tags=${k}=${v}`);
-  // Nothing from the assembly may become a cdk option: each tag is one --tags=k=v token (above), and every stack
-  // selector is checked again (scripts/assembly.mjs SELECTOR) before cdk starts.
-  /** @param {string} id */
-  const selector = (id) => artifacts[id].displayName ?? id;
-  for (const [id] of stacks) {
-    const s = selector(id);
-    if (typeof s !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9/_.-]*$/.test(s)) throw new CliError(`refusing stack selector ${JSON.stringify(s)}: it could be read as a cdk option`);
-  }
   /** @param {string[]} args */
   const deploy = (args) => {
     const r = cdk(io, config, session, assembly, ['deploy', '--app', assembly, '--require-approval', 'never', '--no-color', ...args]);
     if (r.status !== 0) throw new CliError(`cdk deploy failed (exit ${r.status})`);
   };
-  const keys = new Set(stacks.map(([, a]) => JSON.stringify(Object.entries(a.properties?.tags ?? {}).sort())));
-  if (io.dryRun && stacks.length === 0) {
-    io.out('  (dry run: nothing was synthesized; the real cdk deploy commands depend on the synthesized assembly: one --all when every stack has the same tags, else one --exclusively per stack)\n');
-    deploy(['--all', `--tags=${REVISION_TAG}=${sha}`]);
-  } else if (stacks.length === 0) {
-    io.say('the app has no stacks');
-  } else if (keys.size === 1) {
-    deploy(['--all', ...tagArgs(/** @type {[string, any]} */ (stacks[0])[1])]);
-  } else {
-    /** @type {Set<string>} */
-    const done = new Set();
-    /**
-     * @param {string} id
-     * @param {Set<string>} seen
-     */
-    const visit = (id, seen = new Set()) => {
-      if (done.has(id) || seen.has(id)) return;
-      seen.add(id);
-      const a = artifacts[id];
-      for (const dep of a.dependencies ?? []) if (ids.has(dep)) visit(dep, seen);
-      deploy(['--exclusively', selector(id), ...tagArgs(a)]);
-      done.add(id);
-    };
-    for (const [id] of stacks) visit(id);
+  // Nothing from the assembly may become a cdk option: each tag is one --tags=k=v token, and every stack selector is
+  // checked again (scripts/assembly.mjs SELECTOR) before cdk starts.
+  let plan;
+  try {
+    plan = deployCommands(artifacts, config.project, sha);
+  } catch (error) {
+    throw new CliError(/** @type {Error} */ (error).message);
   }
+  const hasStacks = Object.values(artifacts).some((a) => a?.type === 'aws:cloudformation:stack');
+  if (io.dryRun && !hasStacks) {
+    io.out('  (dry run: nothing was synthesized; the real cdk deploy commands depend on the synthesized assembly: one --all when every stack has the same tags, else one --exclusively per stack; never the CI stack)\n');
+    deploy(['--all', `--tags=${REVISION_TAG}=${sha}`]);
+    return;
+  }
+  for (const skipped of plan.skipped) io.say(`not deploying ${skipped}: the CI stack is deployed by hand with admin credentials (npx cdk deploy ${skipped}, README step 5)`);
+  if (plan.commands.length === 0) io.say(hasStacks ? 'no stack to deploy but the CI stack' : 'the app has no stacks');
+  for (const args of plan.commands) deploy(args);
 }
 
 /**
@@ -588,7 +572,7 @@ async function prepare({ io, makeAws, target, configPath, cwd }) {
  * `shukka diff`: synth, cdk diff and the guard's verdict. Exit 0 when nothing is deleted or replaced.
  * @param {{
  *   io: Io, makeAws: (region: string) => Aws, target: Target, configPath: string, cwd: string,
- *   trustProjectCode?: boolean, checkAssembly?: (dir: string) => string[],
+ *   trustProjectCode?: boolean, checkAssembly?: (dir: string, options?: { project?: string }) => string[],
  * }} options
  * @returns {Promise<number>}
  */
@@ -598,7 +582,7 @@ export async function diffCommand(options) {
   try {
     const steps = projectSteps(io, tree, config, options.trustProjectCode ?? false);
     const assembly = synth(steps, tree, config);
-    await checkAssemblySafe(io, assembly, options.checkAssembly);
+    await checkAssemblySafe(io, assembly, config.project, options.checkAssembly);
     const session = await fencedSession(io, aws, config);
     const { result, diffStatus } = diffAndGuard(io, config, session, assembly, false);
     if (diffStatus !== 0) throw new CliError(`cdk diff failed (exit ${diffStatus})`);
@@ -613,7 +597,7 @@ export async function diffCommand(options) {
  * @param {{
  *   io: Io, makeAws: (region: string) => Aws, target: Target, configPath: string, cwd: string,
  *   bucket?: string, allowReplacement?: boolean, skipChecks?: boolean, trustProjectCode?: boolean,
- *   env?: Record<string, string | undefined>, checkAssembly?: (dir: string) => string[],
+ *   env?: Record<string, string | undefined>, checkAssembly?: (dir: string, options?: { project?: string }) => string[],
  * }} options
  * @returns {Promise<number>}
  */
@@ -635,7 +619,7 @@ export async function deployCommand(options) {
     for (const app of config.apps) bundles.set(app.name, await build(io, steps, aws, tree, config, app, options.env ?? process.env));
 
     const assembly = synth(steps, tree, config);
-    await checkAssemblySafe(io, assembly, options.checkAssembly);
+    await checkAssemblySafe(io, assembly, config.project, options.checkAssembly);
     checkPoliciesSafe(io, root, assembly, config, options.allowReplacement ?? false);
     const session = await fencedSession(io, aws, config);
     const { result, diffStatus } = diffAndGuard(io, config, session, assembly, options.allowReplacement ?? false);

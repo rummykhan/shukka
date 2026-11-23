@@ -22,7 +22,8 @@
 #            or resource policy that lets a principal outside the project in (policy-guard.mjs, before
 #            any role is assumed; allow_replacement on a run by hand goes ahead); skip when the
 #            stacks are already at a later commit; cdk diff, ### Infrastructure changes and ### Guard
-#            in the step summary, guard.mjs, cdk deploy tagged shukka:revision=<sha>
+#            in the step summary, guard.mjs, cdk deploy tagged shukka:revision=<sha> of every stack but
+#            the CI stack <Project>-Ci (deployed by hand by an admin; the guard says when it changed)
 #   diff     diff mode (pull requests): the same diff under the read-only diff role with
 #            --method=template; the diff, the guard's and policy-guard.mjs's verdicts go to the
 #            artifact shukka-diff; a destructive diff or policy never fails it. Skipped with a notice when GitHub gives the job no
@@ -419,11 +420,13 @@ jobs:
           path: ${{ runner.temp }}/shukka-assembly
 
       # cdk-assets runs on this runner with the deploy role: no asset may run a command, build a
-      # Docker image or read outside the assembly.
+      # Docker image or read outside the assembly. Every stack deploys through the project's bootstrap;
+      # only <Project>-Ci may name no deploy role (an admin deploys it by hand; Deploy leaves it out).
       - name: Check the assembly
         id: assembly
         env:
           DIGEST: ${{ needs.synth.outputs.digest }}
+          PROJECT: ${{ steps.config.outputs.project }}
         run: |
           set -euo pipefail
           digest() {
@@ -446,7 +449,7 @@ jobs:
           rm -rf -- "$RUNNER_TEMP/cdk.out"
           mkdir -p -- "$RUNNER_TEMP/cdk.out"
           tar -xzf "$RUNNER_TEMP/shukka-assembly/cdk.out.tgz" -C "$RUNNER_TEMP/cdk.out" --no-same-owner --no-same-permissions
-          node .shukka/scripts/assembly.mjs check "$RUNNER_TEMP/cdk.out"
+          node .shukka/scripts/assembly.mjs check "$RUNNER_TEMP/cdk.out" --project "$PROJECT"
           stacks=$(node .shukka/scripts/assembly.mjs stacks "$RUNNER_TEMP/cdk.out")
           echo "stacks=$stacks" >>"$GITHUB_OUTPUT"
 
@@ -526,6 +529,7 @@ jobs:
           CDK: .shukka/node_modules/.bin/cdk
           ALLOW_REPLACEMENT: ${{ inputs.allow_replacement }}
           EVENT_NAME: ${{ github.event_name }}
+          PROJECT: ${{ steps.config.outputs.project }}
         run: |
           set +e -uo pipefail
           diff="$RUNNER_TEMP/shukka-diff.txt"
@@ -545,7 +549,7 @@ jobs:
               echo "::warning::shukka: allow_replacement is honoured only when the workflow is run by hand; ignoring it"
             fi
           fi
-          node .shukka/scripts/guard.mjs ${allow[@]+"${allow[@]}"} --summary "$GITHUB_STEP_SUMMARY" <"$diff"
+          node .shukka/scripts/guard.mjs ${allow[@]+"${allow[@]}"} --project "$PROJECT" --summary "$GITHUB_STEP_SUMMARY" <"$diff"
           guard_status=$?
           if [[ $guard_status -ne 0 ]]; then
             echo "::error::shukka: the guard stopped the infrastructure deploy"
@@ -558,57 +562,45 @@ jobs:
 
       # cdk deploy --tags replaces a stack's own tags, so each stack gets its synthesized tags plus
       # shukka:revision. Stacks with the same tags deploy together; otherwise one by one in
-      # dependency order. Nothing from the assembly may become a cdk option: each tag is one
-      # --tags=k=v token, and every stack selector is checked again (assembly.mjs SELECTOR) before
-      # cdk starts.
+      # dependency order (assembly.mjs deployCommands, which shukka deploy uses too). The CI stack
+      # <Project>-Ci is never deployed here: the execution role may not change the CI roles, so an
+      # admin deploys it by hand (README step 5); the diff above says when it changed. Nothing from
+      # the assembly may become a cdk option: each tag is one --tags=k=v token, and every stack
+      # selector is checked again (assembly.mjs SELECTOR) before cdk starts.
       - name: Deploy
         id: deploy
         if: steps.order.outputs.skip != 'true'
         env:
           CDK: .shukka/node_modules/.bin/cdk
+          PROJECT: ${{ steps.config.outputs.project }}
         run: |
           set -euo pipefail
           sha=$(git -C project rev-parse HEAD)
-          node --input-type=module - "$RUNNER_TEMP/cdk.out" "$sha" <<'JS'
+          node --input-type=module - "$RUNNER_TEMP/cdk.out" "$sha" "$PWD/.shukka/scripts/assembly.mjs" <<'JS'
           import { readFileSync } from 'node:fs';
           import { join } from 'node:path';
           import { spawnSync } from 'node:child_process';
-          const [assembly, sha] = process.argv.slice(2);
+          import { pathToFileURL } from 'node:url';
+          const [assembly, sha, script] = process.argv.slice(2);
+          const { deployCommands } = await import(pathToFileURL(script).href);
           const { artifacts = {} } = JSON.parse(readFileSync(join(assembly, 'manifest.json'), 'utf8'));
-          const stacks = Object.entries(artifacts).filter(([, a]) => a.type === 'aws:cloudformation:stack');
-          const ids = new Set(stacks.map(([id]) => id));
-          const tagArgs = (a) => Object.entries({ ...(a.properties?.tags ?? {}), 'shukka:revision': sha }).map(([k, v]) => `--tags=${k}=${v}`);
-          const selector = (id) => artifacts[id].displayName ?? id;
-          for (const [id] of stacks) {
-            const s = selector(id);
-            if (typeof s !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9/_.-]*$/.test(s)) {
-              console.log(`::error::shukka: refusing stack selector ${JSON.stringify(s)}: it could be read as a cdk option`);
-              process.exit(1);
-            }
+          let plan;
+          try {
+            plan = deployCommands(artifacts, process.env.PROJECT, sha);
+          } catch (error) {
+            console.log(`::error::shukka: ${error.message}`);
+            process.exit(1);
           }
-          const deploy = (args) => {
+          for (const s of plan.skipped) {
+            console.log(`::notice::shukka: not deploying ${s}: the CI stack is deployed by hand with admin credentials (npx cdk deploy ${s}, README step 5)`);
+          }
+          if (plan.commands.length === 0) console.log(plan.skipped.length > 0 ? 'shukka: no stack to deploy but the CI stack' : 'shukka: the app has no stacks');
+          for (const args of plan.commands) {
             const r = spawnSync(process.env.CDK, ['deploy', '--app', assembly, '--require-approval', 'never', '--no-color', ...args], { stdio: 'inherit' });
             if (r.status !== 0) {
               console.log(`::error::shukka: cdk deploy failed (exit ${r.status ?? r.signal})`);
               process.exit(1);
             }
-          };
-          const keys = new Set(stacks.map(([, a]) => JSON.stringify(Object.entries(a.properties?.tags ?? {}).sort())));
-          if (stacks.length === 0) {
-            console.log('shukka: the app has no stacks');
-          } else if (keys.size === 1) {
-            deploy(['--all', ...tagArgs(stacks[0][1])]);
-          } else {
-            const done = new Set();
-            const visit = (id, seen = new Set()) => {
-              if (done.has(id) || seen.has(id)) return;
-              seen.add(id);
-              const a = artifacts[id];
-              for (const dep of a.dependencies ?? []) if (ids.has(dep)) visit(dep, seen);
-              deploy(['--exclusively', selector(id), ...tagArgs(a)]);
-              done.add(id);
-            };
-            for (const [id] of stacks) visit(id);
           }
           JS
           echo "shukka: infrastructure deployed at $sha"
@@ -729,6 +721,7 @@ jobs:
         if: steps.token.outputs.available == 'true'
         env:
           DIGEST: ${{ needs.synth.outputs.digest }}
+          PROJECT: ${{ steps.config.outputs.project }}
         run: |
           set -euo pipefail
           digest() {
@@ -751,7 +744,7 @@ jobs:
           rm -rf -- "$RUNNER_TEMP/cdk.out"
           mkdir -p -- "$RUNNER_TEMP/cdk.out"
           tar -xzf "$RUNNER_TEMP/shukka-assembly/cdk.out.tgz" -C "$RUNNER_TEMP/cdk.out" --no-same-owner --no-same-permissions
-          node .shukka/scripts/assembly.mjs check "$RUNNER_TEMP/cdk.out"
+          node .shukka/scripts/assembly.mjs check "$RUNNER_TEMP/cdk.out" --project "$PROJECT"
 
       # The same policy check as deploy, before the diff role; its verdict goes to the comment and never
       # fails the job.
@@ -788,6 +781,7 @@ jobs:
         if: steps.token.outputs.available == 'true'
         env:
           CDK: .shukka/node_modules/.bin/cdk
+          PROJECT: ${{ steps.config.outputs.project }}
         run: |
           set +e -uo pipefail
           out="$RUNNER_TEMP/shukka-pr-diff"
@@ -799,7 +793,7 @@ jobs:
           const fence = '`'.repeat(Math.max(3, ...(text.match(/`+/g) ?? []).map((r) => r.length + 1)));
           process.stdout.write(`### Infrastructure changes\n\n${fence}\n${text.replace(/\n*$/, '')}\n${fence}\n\n`);
           JS
-          node .shukka/scripts/guard.mjs --summary "$GITHUB_STEP_SUMMARY" <"$out/diff.txt" | tee "$out/guard.txt"
+          node .shukka/scripts/guard.mjs --project "$PROJECT" --summary "$GITHUB_STEP_SUMMARY" <"$out/diff.txt" | tee "$out/guard.txt"
           guard_status=${PIPESTATUS[0]}
           echo "$guard_status" >"$out/guard-status"
           if [[ $guard_status -ne 0 ]]; then

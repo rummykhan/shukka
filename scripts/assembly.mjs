@@ -26,8 +26,14 @@
 //     tag rules (key 1-128 characters, not aws:..., value at most 256, letters, digits, spaces and _ . : / = + - @)
 //     or, for a key, contains = (cdk splits --tags=k=v at the first =).
 //
+// With --project (the workflows and `shukka deploy` always pass it), every stack must also deploy through the
+// project's bootstrap (a deploy role and an execution role in its manifest entry): only the top-level stack named
+// <Project>-Ci may name neither (shukkaCiSynthesizer: deployed by hand with admin credentials, never by the pipeline;
+// deployCommands leaves it out).
+//
 // CLI:
-//   node scripts/assembly.mjs check <dir>    exit 0: safe; exit 1: refused, one line per problem
+//   node scripts/assembly.mjs check <dir> [--project <name>]
+//                                            exit 0: safe; exit 1: refused, one line per problem
 //   node scripts/assembly.mjs stacks <dir>   prints the top-level stacks' CloudFormation names, comma-separated;
 //                                            exit 1, printing nothing, when any is not a valid stack name
 //   exit 2: usage error
@@ -193,14 +199,116 @@ function inside(root, base, path) {
 }
 
 /**
+ * The name of a project's CI stack, the one holding ShukkaAccess: `<Project>-Ci` (the project name capitalised, as
+ * ShukkaAccess names its stacks' prefix). It is deployed by hand with admin credentials (lib/synthesizer.ts
+ * shukkaCiSynthesizer), never by the pipeline or `shukka deploy`.
+ * @param {string} project
+ * @returns {string}
+ */
+export function ciStackName(project) {
+  return `${project.charAt(0).toUpperCase()}${project.slice(1)}-Ci`;
+}
+
+/**
+ * A stack's CloudFormation name: its stackName, or its artifact id.
+ * @param {string} id
+ * @param {any} artifact
+ * @returns {string}
+ */
+function cfnName(id, artifact) {
+  return artifact?.properties?.stackName ?? id;
+}
+
+/**
+ * Problems with how a stack deploys. Every stack deploys through the project's bootstrap: cdk assumes a deploy role
+ * and CloudFormation runs as the execution role (shukkaSynthesizer). The one exception is the top-level stack named
+ * `<project's>-Ci`, which may name neither (shukkaCiSynthesizer: an admin deploys it by hand with their own
+ * credentials); the pipeline and `shukka deploy` leave it out (deployCommands).
+ * @param {string} id
+ * @param {any} artifact
+ * @param {string} where
+ * @param {{ project: string, topLevel: boolean }} options
+ * @returns {string[]}
+ */
+export function synthesizerProblems(id, artifact, where, { project, topLevel }) {
+  const props = artifact?.properties ?? {};
+  const roles = ['assumeRoleArn', 'cloudFormationExecutionRoleArn'];
+  const missing = roles.filter((key) => typeof props[key] !== 'string' || props[key] === '');
+  if (missing.length === 0) return [];
+  const name = cfnName(id, artifact);
+  const ci = ciStackName(project);
+  if (topLevel && name === ci && missing.length === roles.length) return [];
+  const at = `assembly: ${where}: stack ${SELECTOR.test(id) ? id : JSON.stringify(id)}`;
+  return [
+    `${at} names no ${missing.join(' and no ')}: only ${ci} may deploy with the caller's own credentials (shukkaCiSynthesizer); every other stack deploys through the project's bootstrap (shukkaSynthesizer); refused`,
+  ];
+}
+
+/**
+ * The cdk deploy argument lists the pipeline (infra.yml) and `shukka deploy` run for an assembly's top-level stacks,
+ * with the shukka:revision tag: one `--all` when every stack has the same tags, otherwise each stack alone
+ * (`--exclusively`) after its dependencies, so each keeps its own tags. The CI stack (ciStackName) is left out: it is
+ * deployed by hand with admin credentials. When it is in the assembly, the stacks are named with `--exclusively`
+ * instead of `--all`, so cdk neither deploys it nor pulls it in as a dependency.
+ * Throws when a stack selector could be read as a cdk option.
+ * @param {Record<string, any>} artifacts the top-level manifest's artifacts
+ * @param {string} project
+ * @param {string} sha
+ * @returns {{ commands: string[][], skipped: string[] }} skipped: the selectors left out
+ */
+export function deployCommands(artifacts, project, sha) {
+  const all = Object.entries(artifacts).filter(([, a]) => a?.type === 'aws:cloudformation:stack');
+  /** @param {string} id */
+  const selector = (id) => artifacts[id].displayName ?? id;
+  for (const [id] of all) {
+    const s = selector(id);
+    if (typeof s !== 'string' || !SELECTOR.test(s)) throw new Error(`refusing stack selector ${JSON.stringify(s)}: it could be read as a cdk option`);
+  }
+  const ci = ciStackName(project);
+  const stacks = all.filter(([id, a]) => cfnName(id, a) !== ci);
+  const skipped = all.filter(([id, a]) => cfnName(id, a) === ci).map(([id]) => selector(id));
+  const ids = new Set(stacks.map(([id]) => id));
+  /** @param {any} a */
+  const tagArgs = (a) => Object.entries({ ...(a.properties?.tags ?? {}), 'shukka:revision': sha }).map(([k, v]) => `--tags=${k}=${v}`);
+  const keys = new Set(stacks.map(([, a]) => JSON.stringify(Object.entries(a.properties?.tags ?? {}).sort())));
+  /** @type {string[][]} */
+  const commands = [];
+  if (stacks.length === 0) return { commands, skipped };
+  if (keys.size === 1) {
+    const first = /** @type {[string, any]} */ (stacks[0]);
+    commands.push(skipped.length === 0 ? ['--all', ...tagArgs(first[1])] : ['--exclusively', ...stacks.map(([id]) => selector(id)), ...tagArgs(first[1])]);
+    return { commands, skipped };
+  }
+  /** @type {Set<string>} */
+  const done = new Set();
+  /**
+   * @param {string} id
+   * @param {Set<string>} seen
+   */
+  const visit = (id, seen = new Set()) => {
+    if (done.has(id) || seen.has(id)) return;
+    seen.add(id);
+    const a = artifacts[id];
+    for (const dep of a.dependencies ?? []) if (ids.has(dep)) visit(dep, seen);
+    commands.push(['--exclusively', selector(id), ...tagArgs(a)]);
+    done.add(id);
+  };
+  for (const [id] of stacks) visit(id);
+  return { commands, skipped };
+}
+
+/**
  * Problems that make the assembly unsafe to publish and deploy with credentials.
  * Asset manifests are found by what the manifests say (any `cdk:asset-manifest` artifact's
  * `properties.file`), never by file name; and every JSON file in the assembly that carries `files`
  * or `dockerImages` is checked as an asset manifest too.
+ * With `project`, every stack must also deploy through the project's bootstrap, but for the CI stack
+ * (synthesizerProblems).
  * @param {string} dir
+ * @param {{ project?: string }} [options]
  * @returns {string[]}
  */
-export function checkAssembly(dir) {
+export function checkAssembly(dir, options = {}) {
   /** @type {string[]} */
   const problems = [];
   let root;
@@ -280,6 +388,7 @@ export function checkAssembly(dir) {
       }
       if (a.type === 'aws:cloudformation:stack') {
         problems.push(...stackProblems(id, a, where));
+        if (options.project !== undefined) problems.push(...synthesizerProblems(id, a, where, { project: options.project, topLevel: base === '' }));
         for (const [path, entries] of Object.entries(a.metadata ?? {})) {
           if (Array.isArray(entries) && entries.some((e) => e?.type === 'aws:cdk:asset')) {
             problems.push(`assembly: ${where}: stack ${id} carries legacy asset metadata (aws:cdk:asset at ${path}); refused`);
@@ -414,7 +523,9 @@ export function stackNames(dir) {
   return names;
 }
 
-const USAGE = 'usage: node scripts/assembly.mjs check|stacks <dir>';
+const USAGE = 'usage: node scripts/assembly.mjs check <dir> [--project <name>] | stacks <dir>';
+// A project name as shukka.json and ShukkaAccess take it.
+const PROJECT = /^[a-z][a-z0-9-]{1,20}$/;
 
 /**
  * @param {string[]} argv
@@ -422,8 +533,13 @@ const USAGE = 'usage: node scripts/assembly.mjs check|stacks <dir>';
  */
 export function main(argv) {
   const [command, dir, ...rest] = argv;
-  if (!dir || rest.length > 0 || (command !== 'check' && command !== 'stacks')) {
+  const projectArg = command === 'check' && rest.length === 2 && rest[0] === '--project' ? rest[1] : undefined;
+  if (!dir || (rest.length > 0 && projectArg === undefined) || (command !== 'check' && command !== 'stacks')) {
     process.stderr.write(`${USAGE}\n`);
+    return 2;
+  }
+  if (projectArg !== undefined && !PROJECT.test(projectArg)) {
+    process.stderr.write(`assembly: --project ${JSON.stringify(projectArg)} is not a project name (${PROJECT.source})\n${USAGE}\n`);
     return 2;
   }
   if (command === 'stacks') {
@@ -435,13 +551,20 @@ export function main(argv) {
       return 1;
     }
   }
-  const problems = checkAssembly(dir);
+  const problems = checkAssembly(dir, projectArg === undefined ? {} : { project: projectArg });
   for (const problem of problems) process.stdout.write(`${problem}\n`);
   if (problems.length === 0) process.stdout.write('assembly: no asset runs a command, no Docker image, nothing outside the assembly\n');
   return problems.length === 0 ? 0 : 1;
 }
 
-const invoked = process.argv[1] ? realpathSync(process.argv[1]) : '';
+// Imported from a script on stdin (infra.yml's Deploy step), argv[1] is not a file.
+const invoked = (() => {
+  try {
+    return process.argv[1] ? realpathSync(process.argv[1]) : '';
+  } catch {
+    return '';
+  }
+})();
 if (invoked === realpathSync(fileURLToPath(import.meta.url))) {
   process.exitCode = main(process.argv.slice(2));
 }
