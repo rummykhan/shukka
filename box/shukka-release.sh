@@ -48,7 +48,7 @@ finish() { # finish <exit-code> <result>
   exit "$1"
 }
 
-# shellcheck disable=SC2329 # called by the EXIT trap
+# shellcheck disable=SC2317,SC2329 # called by the EXIT trap (older shellcheck reports SC2317, 0.10+ SC2329)
 cleanup() {
   [ -n "$tgz" ] && rm -f -- "$tgz"
   [ -n "$staging" ] && rm -rf -- "$staging"
