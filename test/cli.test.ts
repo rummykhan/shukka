@@ -16,6 +16,10 @@ import { checkBundlePath } from '../scripts/cli/deploy.mjs';
 import {
   CliError, HOST_CODE_WARNING, PROJECT_BASE_IMAGE, PROJECT_DOCKERFILE, PROJECT_PLATFORM, SERVICES, cdkBin, containerArgs, projectImage, quote, realSpawn,
 } from '../scripts/cli/exec.mjs';
+import { readHook } from '../scripts/release.mjs';
+import { FENCED_KINDS, realAws } from '../scripts/cli/aws.mjs';
+import { fenceDocuments } from '../lib/boundary.js';
+import { IAMClient } from '@aws-sdk/client-iam';
 import { bundleDir, stubClient } from './helpers/release-fixtures.js';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -1137,7 +1141,7 @@ test('shu-9bj.6: shukka deploy runs the policy guard after the assembly check an
       },
     },
   };
-  const synthSpawn = () => recordingSpawn(({ cmd, args }) => {
+  const synthSpawn = () => recordingSpawn(({ cmd, args, options }) => {
     if (cmd === 'npx' && args.includes('synth')) {
       const out = args[args.indexOf('--output') + 1]!;
       write(join(out, 'manifest.json'), JSON.stringify({ artifacts: { 'shukkatest-App': { type: 'aws:cloudformation:stack', properties: { templateFile: 'shukkatest-App.template.json', tags: { Project: 'shukkatest' } } } } }));
@@ -1145,7 +1149,8 @@ test('shu-9bj.6: shukka deploy runs the policy guard after the assembly check an
       return { status: 0, stdout: '' };
     }
     if (cmd === process.execPath && args[1] === 'diff') return { status: 0, stdout: CLEAN_DIFF };
-    if (cmd === 'bash' && args[0]?.endsWith('bundle.sh')) return { status: 0, stdout: `${bundleDir(tmp)}\n` };
+    // In the container (shu-9bj.8) the bundle must land inside the checkout.
+    if (cmd === 'bash' && args[0]?.endsWith('bundle.sh')) return bundleInTree(bundleDir(tmp), options.cwd);
     return { status: 0, stdout: '' };
   });
   let s = synthSpawn();
@@ -1426,7 +1431,10 @@ test('shu-9bj.8: the CLI help no longer says to run bootstrap in the project roo
   assert.ok(!/project root/i.test(helpText()), 'no "project root" in --help');
   const bootstrap = COMMANDS.find((c) => c.name === 'bootstrap')!;
   assert.match(bootstrap.summary, /reading shukka\.json from --config/);
-  assert.match(bootstrap.summary, /DynamoDB table, S3 bucket, SQS queue, SNS topic, Lambda function, log group or IAM role/);
+  const summary = bootstrap.summary.replace(/\s+/g, ' ');
+  for (const kind of ['DynamoDB table', 'S3 bucket', 'SQS queue', 'SNS topic', 'Lambda function', 'log group', 'CloudWatch alarm', 'IAM role', 'IAM instance profile', 'SES configuration set', 'SSM document']) {
+    assert.ok(summary.includes(kind), `${kind} in the bootstrap help`);
+  }
 });
 
 // ---------- shu-9bj.8, review 1: symlinked bundles, check services, the project image, the platform ----------
@@ -1602,4 +1610,150 @@ test('shu-9bj.8: a bundle holding a link that leaves it is refused before it is 
   assert.equal(r.code, 1);
   assert.match(r.err, /refusing the bundle .*:\nshukka: refused: aws is a symbolic link to an absolute path/);
   assert.equal(c.s3.calls.length, 0);
+}));
+
+/**
+ * What a container step can do to the fresh tree's `.git` (security re-check access-1): point it at a planted git
+ * directory whose HEAD is a link to the host's worktree admin HEAD (so it names the deploy SHA) and whose config makes
+ * the repository a partial clone with an ssh promisor remote and a core.sshCommand payload. Any host git that has to
+ * read an object from there fetches it lazily and runs the payload, which here writes `marker`.
+ */
+function plantGitDir(tree: string, marker: string) {
+  const admin = readFileSync(join(tree, '.git'), 'utf8').replace(/^gitdir: /, '').trim();
+  const evil = join(tree, '.evil');
+  mkdirSync(join(evil, 'refs', 'heads'), { recursive: true });
+  mkdirSync(join(evil, 'objects'), { recursive: true });
+  writeFileSync(join(evil, 'HEAD'), 'ref: refs/heads/x\n');
+  symlinkSync(join(admin, 'HEAD'), join(evil, 'refs', 'heads', 'x'));
+  writeFileSync(join(evil, 'config'), [
+    '[core]', '\trepositoryformatversion = 1', '\tbare = false', `\tsshCommand = touch ${marker}; false`,
+    '[extensions]', '\tpartialClone = origin',
+    '[remote "origin"]', '\turl = ssh://git@example.invalid/x.git', '\tpromisor = true', '',
+  ].join('\n'));
+  writeFileSync(join(tree, '.git'), 'gitdir: .evil\n');
+}
+
+test('shu-9bj.8: a container step that rewrites the tree\'s .git cannot run code on the host: the hook is read from the checked root and no git runs in the tree', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  const marker = join(tmp, 'PAYLOAD-RAN');
+  let tree = '';
+  let planted = -1;
+  const s = recordingSpawn(({ cmd, args, options }) => {
+    if (cmd === 'bash' && args.includes('npm run build')) {
+      // The build runs in the container with the tree mounted read-write: it plants a git directory.
+      tree = options.docker[options.docker.indexOf('--mount') + 1].match(/source=([^,]+)/)[1];
+      plantGitDir(tree, marker);
+      planted = s.calls.length;
+      return { status: 0, stdout: '' };
+    }
+    if (cmd === 'npx' && args.includes('synth')) {
+      const out = args[args.indexOf('--output') + 1]!;
+      write(join(out, 'manifest.json'), JSON.stringify({ artifacts: { 'shukkatest-App': { type: 'aws:cloudformation:stack', properties: { tags: { Project: 'shukkatest' } } } } }));
+      return { status: 0, stdout: '' };
+    }
+    if (cmd === process.execPath && args[1] === 'diff') return { status: 0, stdout: CLEAN_DIFF };
+    if (cmd === 'bash' && args[0]?.endsWith('bundle.sh')) return bundleInTree(bundleDir(tmp), options.cwd);
+    return { status: 0, stdout: '' };
+  });
+  const c = releaseClients();
+  const r = await cli(['deploy', '--skip-checks'], { cwd: dir, spawn: s.spawn, aws: awsWith(c).aws, checkAssembly: NO_ASSETS });
+  assert.ok(planted > 0, 'the build step planted the git directory');
+  assert.ok(!existsSync(marker), 'the planted core.sshCommand ran on the host');
+  assert.equal(r.code, 0, r.out + r.err);
+  const hook = c.s3.calls.find((x) => String(x.input.Key).endsWith('.configure.sh'))!;
+  assert.equal(hook.input.Body.toString(), '#!/usr/bin/env bash\necho configured\n', 'the hook committed at the deploy SHA, read from the root');
+  const inTree = (cwd: string | undefined) => cwd !== undefined && (cwd === tree || cwd.startsWith(`${tree}/`));
+  const gitAfter = s.calls.slice(planted).filter((x) => x.cmd === 'git' && (inTree(x.options.cwd) || x.args.some((a: string) => inTree(a) && x.args[0] !== 'worktree')));
+  assert.deepEqual(gitAfter.map((x) => `${x.options.cwd}: git ${x.args.join(' ')}`), [], 'no host git runs in the tree after a container step');
+}));
+
+test('shu-9bj.8: release reads a hook with git that never fetches lazily and ignores system config, so a planted promisor remote runs nothing', withTmp(async (tmp) => {
+  const { dir, sha } = consumer(tmp);
+  const tree = join(tmp, 'tree');
+  git(dir, 'worktree', 'add', '--quiet', '--detach', tree, sha);
+  const marker = join(tmp, 'PAYLOAD-RAN');
+  plantGitDir(tree, marker);
+  assert.throws(() => readHook(tree, 'box/configure-web.sh', sha));
+  assert.ok(!existsSync(marker), 'the planted core.sshCommand ran');
+}));
+
+test('shu-9bj.8: the kinds bootstrap lists for fence clashes are exactly the kinds boundary.ts grants by the project prefix', () => {
+  const docs = fenceDocuments({ project: 'orb', account: ACCOUNT, region: 'us-east-1', qualifier: 'orb', hostedZoneId: ZONE, sesDomains: ['example.com'] });
+  const granted = new Set<string>();
+  for (const doc of Object.values(docs)) {
+    for (const st of doc.Statement) {
+      for (const arn of [st.Resource ?? []].flat()) {
+        const at = arn.search(/(orb|Orb)\*/);
+        if (at === -1) continue;
+        const [, , service, , , ...rest] = arn.slice(0, at).split(':');
+        granted.add(`${service}:${rest.join(':')}`.replace('log-group:/aws/lambda/', 'log-group:'));
+      }
+    }
+  }
+  assert.deepEqual([...granted].sort(), Object.values(FENCED_KINDS).sort(), 'a prefix grant in boundary.ts with no listing (or a listing with no grant)');
+});
+
+test('shu-9bj.8: bootstrap lists CloudWatch alarms, instance profiles, SES configuration sets and Self-owned SSM documents with the other kinds', async () => {
+  const answers: Record<string, unknown> = {
+    'dynamodb list-tables': { TableNames: ['orbitary-posts'] },
+    's3api list-buckets': { Buckets: [{ Name: 'orbitary-media' }] },
+    'sqs list-queues': { QueueUrls: [`${SQS}/orbitary-jobs`] },
+    'sns list-topics': { Topics: [{ TopicArn: `${SNS}:orbitary-alerts` }] },
+    'lambda list-functions': { Functions: [{ FunctionName: 'orbitary-worker' }] },
+    'logs describe-log-groups': { logGroups: [{ logGroupName: '/aws/lambda/orbitary-worker' }] },
+    'cloudwatch describe-alarms': { MetricAlarms: [{ AlarmName: 'orbitary-5xx' }], CompositeAlarms: [{ AlarmName: 'Orbitary-health' }] },
+    'iam list-instance-profiles': { InstanceProfiles: [{ InstanceProfileName: 'orbitary-web', Path: '/' }, { InstanceProfileName: 'web', Path: '/orbitary/' }] },
+    'sesv2 list-configuration-sets': { ConfigurationSets: ['orbitary-mail'], NextToken: 'page2' },
+    'sesv2 list-configuration-sets --next-token page2': { ConfigurationSets: ['orbitary-bulk'] },
+    'ssm list-documents --filters Key=Owner,Values=Self': { DocumentIdentifiers: [{ Name: 'orbitary-setup' }] },
+  };
+  const ran: string[] = [];
+  const io: any = {
+    run: (cmd: string, args: string[]) => {
+      const key = args.slice(0, args.indexOf('--output')).join(' ');
+      ran.push(key);
+      assert.equal(cmd, 'aws');
+      return key in answers ? { status: 0, stdout: JSON.stringify(answers[key]) } : { status: 1, stdout: '' };
+    },
+  };
+  const send = IAMClient.prototype.send;
+  IAMClient.prototype.send = (async () => ({ Roles: [{ RoleName: 'Orbitary-WorkerRole', Path: '/' }] })) as any;
+  try {
+    const found = await realAws({ region: 'us-east-1', io }).accountResources();
+    assert.deepEqual([...new Set(found.map((r) => r.kind))].sort(), Object.keys(FENCED_KINDS).sort(), 'one listing per fenced kind');
+    for (const r of [
+      { kind: 'cloudwatch-alarm', name: 'orbitary-5xx' }, { kind: 'cloudwatch-alarm', name: 'Orbitary-health' },
+      { kind: 'iam-instance-profile', name: 'orbitary-web' }, { kind: 'iam-instance-profile', name: 'web', path: '/orbitary/' },
+      { kind: 'ses-configuration-set', name: 'orbitary-mail' }, { kind: 'ses-configuration-set', name: 'orbitary-bulk' },
+      { kind: 'ssm-document', name: 'orbitary-setup' },
+    ]) assert.ok(found.some((f) => JSON.stringify(f) === JSON.stringify(r)), `${JSON.stringify(r)} listed`);
+    assert.ok(ran.includes('ssm list-documents --filters Key=Owner,Values=Self'), 'only documents the account owns (not AWS-owned or shared)');
+  } finally {
+    IAMClient.prototype.send = send;
+  }
+});
+
+test('shu-9bj.8: bootstrap orb refuses on Orbitary\'s alarms, instance profiles, SES configuration sets and SSM documents', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp, (c) => { c.project = 'orb'; c.qualifier = 'orb'; c.apps[0].server.units = ['orb-web']; });
+  const { calls, spawn } = recordingSpawn();
+  const extra = [
+    { kind: 'cloudwatch-alarm', name: 'orbitary-prod-5xx' },
+    { kind: 'iam-instance-profile', name: 'web', path: '/orbitary/' },
+    { kind: 'ses-configuration-set', name: 'orbitary-prod-mail' },
+    { kind: 'ssm-document', name: 'Orbitary-setup' },
+    { kind: 'ssm-document', name: 'orb-prod-setup' },
+  ];
+  const { aws } = fakeAws({
+    accountResources: async () => extra,
+    stacksWithTags: async () => [{ name: 'orb-data', tags: { Project: 'orb' } }],
+    stackPhysicalIds: async () => ['orb-prod-setup'],
+  });
+  const r = await cli(['bootstrap', 'orb', '--repo', 'owner/consumer'], { cwd: dir, spawn, aws });
+  assert.equal(r.code, 1, r.out + r.err);
+  for (const line of ['CloudWatch alarm orbitary-prod-5xx', 'IAM instance profile /orbitary/web', 'SES configuration set orbitary-prod-mail', 'SSM document Orbitary-setup']) {
+    assert.ok(r.err.includes(`shukka: ${line} matches the fence (orb*, Orb*) but is in no stack of orb`), `${line} in ${r.err}`);
+  }
+  assert.ok(!r.err.includes('orb-prod-setup'), "orb's own document is not a clash");
+  assert.match(r.err, /4 resource\(s\) in this account/);
+  assert.deepEqual(MUTATING(calls), [], 'nothing ran');
 }));

@@ -30,9 +30,10 @@ import { CliError } from './exec.mjs';
  * @typedef {{ send(command: any): Promise<any> }} Client
  * @typedef {{ name: string, arn: string, defaultVersionId: string }} LocalPolicy
  * @typedef {{ accessKeyId: string, secretAccessKey: string, sessionToken: string }} Session
- * @typedef {'dynamodb-table' | 's3-bucket' | 'sqs-queue' | 'sns-topic' | 'lambda-function' | 'log-group' | 'iam-role'} ResourceKind
+ * @typedef {keyof typeof FENCED_KINDS} ResourceKind
  * @typedef {{ kind: ResourceKind, name: string, path?: string }} AccountResource name as CloudFormation's physical id
- *   gives it (a queue's URL, a topic's ARN, otherwise the name); path for an IAM role whose path is not `/`
+ *   gives it (a queue's URL, a topic's ARN, otherwise the name); path for an IAM role or instance profile whose path
+ *   is not `/`
  * @typedef {{
  *   callerArn: () => Promise<{ account: string, arn: string }>,
  *   roleArn: (roleName: string) => Promise<string>,
@@ -62,6 +63,25 @@ function notFound(error) {
   const e = /** @type {{ name?: string, message?: string }} */ (error);
   return e.name === 'ParameterNotFound' || e.name === 'NoSuchEntity' || /does not exist/.test(e.message ?? '');
 }
+
+/**
+ * Every kind of resource the fence grants by name prefix (lib/boundary.ts: an ARN ending `<project>*` or `<Project>*`),
+ * with the part of that ARN before the prefix (`<service>:<resource type>`), and so every kind bootstrap lists to find
+ * names the new fence would reach. A test keeps this in step with boundary.ts.
+ */
+export const FENCED_KINDS = Object.freeze({
+  'dynamodb-table': 'dynamodb:table/',
+  's3-bucket': 's3:',
+  'sqs-queue': 'sqs:',
+  'sns-topic': 'sns:',
+  'lambda-function': 'lambda:function:',
+  'log-group': 'logs:log-group:',
+  'cloudwatch-alarm': 'cloudwatch:alarm:',
+  'iam-role': 'iam:role/',
+  'iam-instance-profile': 'iam:instance-profile/',
+  'ses-configuration-set': 'ses:configuration-set/',
+  'ssm-document': 'ssm:document/',
+});
 
 /**
  * The real reads, with the caller's profile (or the default credential chain) and region.
@@ -202,7 +222,7 @@ export function realAws({ profile, region, io }) {
     },
     async accountResources() {
       // Through the AWS CLI (read-only; it pages by itself), as STS and Route 53: no SDK client per service. S3 and
-      // IAM list the whole account; the others, this region.
+      // IAM list the whole account; the others, this region. One listing per kind in FENCED_KINDS.
       /**
        * @param {string[]} args
        * @returns {any}
@@ -220,6 +240,21 @@ export function realAws({ profile, region, io }) {
       for (const t of list(['sns', 'list-topics']).Topics ?? []) found.push({ kind: 'sns-topic', name: String(t.TopicArn) });
       for (const f of list(['lambda', 'list-functions']).Functions ?? []) found.push({ kind: 'lambda-function', name: String(f.FunctionName) });
       for (const g of list(['logs', 'describe-log-groups']).logGroups ?? []) found.push({ kind: 'log-group', name: String(g.logGroupName) });
+      const alarms = list(['cloudwatch', 'describe-alarms']);
+      for (const a of [...(alarms.MetricAlarms ?? []), ...(alarms.CompositeAlarms ?? [])]) found.push({ kind: 'cloudwatch-alarm', name: String(a.AlarmName) });
+      for (const p of list(['iam', 'list-instance-profiles']).InstanceProfiles ?? []) {
+        const name = String(p.InstanceProfileName);
+        found.push(p.Path && p.Path !== '/' ? { kind: 'iam-instance-profile', name, path: String(p.Path) } : { kind: 'iam-instance-profile', name });
+      }
+      // The CLI does not page sesv2 list-configuration-sets by itself.
+      /** @type {string | undefined} */
+      let next;
+      do {
+        const r = list(['sesv2', 'list-configuration-sets', ...(next ? ['--next-token', next] : [])]);
+        for (const name of r.ConfigurationSets ?? []) found.push({ kind: 'ses-configuration-set', name: String(name) });
+        next = r.NextToken || undefined;
+      } while (next);
+      for (const d of list(['ssm', 'list-documents', '--filters', 'Key=Owner,Values=Self']).DocumentIdentifiers ?? []) found.push({ kind: 'ssm-document', name: String(d.Name) });
       /** @type {string | undefined} */
       let marker;
       do {

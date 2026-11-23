@@ -127,12 +127,17 @@ const KIND_NAMES = /** @type {const} */ ({
   'lambda-function': 'Lambda function',
   'log-group': 'log group',
   'iam-role': 'IAM role',
+  'cloudwatch-alarm': 'CloudWatch alarm',
+  'iam-instance-profile': 'IAM instance profile',
+  'ses-configuration-set': 'SES configuration set',
+  'ssm-document': 'SSM document',
 });
 const LAMBDA_LOGS = '/aws/lambda/';
 
 /**
  * The part of a resource's name the fence matches: a queue's name (last part of its URL), a topic's name (last part
- * of its ARN), a log group's name without /aws/lambda/ (the fence allows both), a role's path and name after `role/`.
+ * of its ARN), a log group's name without /aws/lambda/ (the fence allows both), a role's or instance profile's path
+ * and name after `role/` or `instance-profile/`.
  * @param {import('./aws.mjs').AccountResource} r
  * @returns {string}
  */
@@ -141,14 +146,16 @@ function fenceName(r) {
     case 'sqs-queue': return r.name.slice(r.name.lastIndexOf('/') + 1);
     case 'sns-topic': return r.name.slice(r.name.lastIndexOf(':') + 1);
     case 'log-group': return r.name.startsWith(LAMBDA_LOGS) ? r.name.slice(LAMBDA_LOGS.length) : r.name;
-    case 'iam-role': return `${r.path ? r.path.replace(/^\//, '') : ''}${r.name}`;
+    case 'iam-role':
+    case 'iam-instance-profile': return `${r.path ? r.path.replace(/^\//, '') : ''}${r.name}`;
     default: return r.name;
   }
 }
 
 /**
  * Resources the new fence (`<project>*`, `<Project>*`) would reach that are no part of this project: every DynamoDB
- * table, S3 bucket, SQS queue, SNS topic, Lambda function, log group and IAM role whose name is in the fence but which
+ * table, S3 bucket, SQS queue, SNS topic, Lambda function, log group, CloudWatch alarm, IAM role, IAM instance profile,
+ * SES configuration set and SSM document (aws.mjs FENCED_KINDS) whose name is in the fence but which
  * is in no stack tagged Project=<project> or shukka:project=<project> (a Lambda function's own /aws/lambda/<name> log
  * group counts as the function's). A project named orb would otherwise fence in Orbitary's orbitary-* resources.
  * @param {Aws} aws

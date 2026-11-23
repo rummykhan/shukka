@@ -657,9 +657,12 @@ export async function deployCommand(options) {
       }
       const uploaded = await upload({ dir, bucket, project: config.project, app: app.name, sha, region: config.aws.region, s3: clients.s3 });
       io.say(`uploaded ${uploaded.bytes} bytes to ${uploaded.url}`);
+      // The hook is read with git from the root, never from the tree: the root was checked clean at `sha` and its .git
+      // is never mounted, while any container step could have rewritten the tree's .git (a planted promisor remote's
+      // core.sshCommand runs on the next host git that needs an object there).
       const released = await release({
         project: config.project, app: app.name, sha, bucket, region: config.aws.region,
-        checkout: tree, configure: app.server.configure, units: app.server.units, health: app.server.health,
+        checkout: root, configure: app.server.configure, units: app.server.units, health: app.server.health,
         bundleSha256: uploaded.sha256,
         s3: clients.s3, ssm: clients.ssm, ec2: clients.ec2, out: io.out,
       });
