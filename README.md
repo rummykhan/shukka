@@ -446,6 +446,8 @@ Limits:
 
 shukka is versioned by git tags on this repository. `v1.x.y` tags never move. `v1` moves to the newest `v1.x.y` after shukka's CI is green. Release candidates are `v1.0.0-rc.N`. The workflows, the constructs, the CLI and the schema are versioned together.
 
+Releases are lightweight tags (`git tag v1.2.3 <sha>`, never `-a`, `-s` or `-m`). GitHub does not start a caller pinned to an annotated tag: it reports a "workflow file issue" and runs no job, because it resolves `pipeline.yml`'s nested `./.github/workflows/infra.yml` and `ec2.yml` calls at the tag object instead of the commit.
+
 There are four places a project names a version. Keep them on the same one:
 
 | Where | `@v1` (follow v1) | Pinned |

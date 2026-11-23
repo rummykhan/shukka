@@ -192,3 +192,57 @@ test('shu-9bj.14: teardown empties the assets bucket, deletes the bootstrap stac
   assert.ok(bucketGone > bootstrap, 'the retained bucket is deleted after its stack');
   assert.ok(!r.calls.some((c) => c[1] === 'delete-stack' && c.includes('CDKToolkit')), 'the default CDKToolkit is never deleted');
 });
+
+// GitHub refuses to start a caller of pipeline.yml pinned to an annotated tag ("workflow file issue",
+// no jobs): pipeline.yml calls infra.yml and ec2.yml as ./.github/workflows/..., and GitHub resolves
+// those nested calls at the tag object, not the commit it points to. The same commit started from a
+// branch and from its SHA; rc.2 and rc.3 (annotated) did not. Release tags must be lightweight.
+function checkTag(objectType: string | null): { status: number | null; stderr: string } {
+  const dir = mkdtempSync(join(tmpdir(), 'shu-9bj16-'));
+  try {
+    const bin = join(dir, 'bin');
+    spawnSync('mkdir', ['-p', bin, join(dir, 'run', 'runs')]);
+    // A stub gh answering `gh api repos/<repo>/git/ref/tags/<tag> --jq .object.type`.
+    const answer = objectType === null ? 'echo "gh: Not Found (HTTP 404)" >&2; exit 1' : `printf '%s\\n' '${objectType}'`;
+    writeFileSync(
+      join(bin, 'gh'),
+      `#!/usr/bin/env bash\n[[ "$1 $2" == "api repos/rummykhan/shukka/git/ref/tags/v1.0.0-rc.9" ]] || { echo "unexpected gh $*" >&2; exit 3; }\n${answer}\n`,
+    );
+    chmodSync(join(bin, 'gh'), 0o755);
+    const r = spawnSync('bash', ['-c', `set -uo pipefail; source "${lib}/common.sh"; source "${lib}/setup.sh"; RC_TAG=v1.0.0-rc.9; setup_check_tag`], {
+      encoding: 'utf8',
+      timeout: 60_000,
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, RUN_DIR: join(dir, 'run') },
+    });
+    return { status: r.status, stderr: r.stderr };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test('shu-9bj.16: acceptance refuses an annotated release tag, which GitHub will not start pipeline.yml from', () => {
+  const r = checkTag('tag');
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /v1\.0\.0-rc\.9 is an annotated tag/);
+  assert.match(r.stderr, /lightweight/);
+});
+
+test('shu-9bj.16: acceptance accepts a lightweight release tag', () => {
+  const r = checkTag('commit');
+  assert.equal(r.status, 0, r.stderr);
+});
+
+test('shu-9bj.16: acceptance stops on a release tag that does not exist', () => {
+  const r = checkTag(null);
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /tag v1\.0\.0-rc\.9 does not exist/);
+});
+
+test('shu-9bj.16: pipeline.yml calls its nested workflows by ./ path, and the README says release tags are lightweight', () => {
+  // The nested ./ calls are why the tag kind matters; if they ever go, this pin can go with them.
+  const pipeline = readFileSync(resolve(import.meta.dirname, '..', '.github', 'workflows', 'pipeline.yml'), 'utf8');
+  assert.match(pipeline, /uses: \.\/\.github\/workflows\/infra\.yml/);
+  const readme = readFileSync(resolve(import.meta.dirname, '..', 'README.md'), 'utf8');
+  assert.match(readme, /lightweight tags/);
+  assert.match(readme, /annotated tag/);
+});
