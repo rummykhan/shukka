@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { checkAssembly, ciStackName, ciPublishProblems, ciStackPlan, deployCommands, main, stackNames } from '../scripts/assembly.mjs';
+import { bootstrapVersionArgs, checkAssembly, ciStackName, ciPublishProblems, ciStackPlan, deployCommands, main, stackNames } from '../scripts/assembly.mjs';
 
 const scratch = mkdtempSync(join(tmpdir(), 'shu-9zr-assembly-'));
 after(() => rmSync(scratch, { recursive: true, force: true }));
@@ -336,4 +336,11 @@ test('shu-ecn: ciPublishProblems accepts what shukkaCiSynthesizer writes and ref
     'Shukkatest-Ci.assets': { type: 'cdk:asset-manifest', properties: { file: 'Shukkatest-Ci.assets.json' } },
     'Shukkatest-Ci': { type: 'aws:cloudformation:stack', dependencies: ['Shukkatest-Ci.assets'], properties: { lookupRole: { arn: 'arn:aws:iam::999999999999:role/x' } } },
   }, 'shukkatest', env).selector, null);
+});
+
+test('shu-r5f: bootstrapVersionArgs names the qualifier\'s version parameter and refuses anything but a valid qualifier', () => {
+  assert.deepEqual(bootstrapVersionArgs('trendigle'), ['--parameters', 'BootstrapVersion=/cdk-bootstrap/trendigle/version']);
+  for (const bad of ['', 'Trendigle', 'a b', '--plugin=x', 'q/../x', 'abcdefghijk', undefined, null, 7]) {
+    assert.throws(() => bootstrapVersionArgs(bad as unknown as string), /qualifier .* must match/, JSON.stringify(bad));
+  }
 });

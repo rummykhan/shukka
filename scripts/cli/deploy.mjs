@@ -25,7 +25,7 @@ import { randomBytes } from 'node:crypto';
 import { copyFileSync, cpSync, existsSync, lstatSync, mkdtempSync, readFileSync, realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { ciStackName, ciStackPlan, deployCommands } from '../assembly.mjs';
+import { bootstrapVersionArgs, ciStackName, ciStackPlan, deployCommands } from '../assembly.mjs';
 import { loadConfig } from '../config.mjs';
 import { adminNotice, guard, report } from '../guard.mjs';
 import { githubRepoFromUrl, policyGuard, report as policyReport } from '../policy-guard.mjs';
@@ -346,6 +346,19 @@ function checkPoliciesSafe(io, root, assembly, config, allow) {
 }
 
 /**
+ * `--parameters BootstrapVersion=/cdk-bootstrap/<qualifier>/version` for cdk diff and deploy (scripts/assembly.mjs
+ * bootstrapVersionArgs): a stack first deployed through CDK's default bootstrap moves to the project's.
+ * @param {Config} config
+ */
+function cdkBootstrapArgs(config) {
+  try {
+    return bootstrapVersionArgs(config.qualifier);
+  } catch (error) {
+    throw new CliError(/** @type {Error} */ (error).message);
+  }
+}
+
+/**
  * cdk diff of the assembly, then the guard. Returns the guard's result; prints the diff and the verdict.
  * @param {Io} io
  * @param {Config} config
@@ -355,7 +368,8 @@ function checkPoliciesSafe(io, root, assembly, config, allow) {
  */
 function diffAndGuard(io, config, session, assembly, allow) {
   // In a dry run nothing was synthesized, so there is nothing to diff: the step is printed, not run.
-  const r = cdk(io, config, session, assembly, ['diff', '--app', assembly, '--no-color'], { capture: 'merged' });
+  // The same BootstrapVersion parameter as the deploy, so the diff shows what the deploy will do.
+  const r = cdk(io, config, session, assembly, ['diff', '--app', assembly, '--no-color', ...cdkBootstrapArgs(config)], { capture: 'merged' });
   if (io.dryRun) {
     io.out(`+ node scripts/guard.mjs${allow ? ' --allow' : ''} < the diff   [dry run: not run]\n`);
     return { result: /** @type {import('../guard.mjs').GuardResult} */ ({ verdict: 'safe', code: 0, found: [] }), diffStatus: 0 };
@@ -382,7 +396,7 @@ function deployStacks(io, config, session, assembly, sha) {
   const artifacts = existsSync(manifestFile) ? (JSON.parse(readFileSync(manifestFile, 'utf8')).artifacts ?? {}) : {};
   /** @param {string[]} args */
   const deploy = (args) => {
-    const r = cdk(io, config, session, assembly, ['deploy', '--app', assembly, '--require-approval', 'never', '--no-color', ...args]);
+    const r = cdk(io, config, session, assembly, ['deploy', '--app', assembly, '--require-approval', 'never', '--no-color', ...cdkBootstrapArgs(config), ...args]);
     if (r.status !== 0) throw new CliError(`cdk deploy failed (exit ${r.status})`);
   };
   // Nothing from the assembly may become a cdk option: each tag is one --tags=k=v token, and every stack selector is

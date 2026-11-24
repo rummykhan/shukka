@@ -69,7 +69,7 @@ function runDeployStep(assembly: string) {
     cwd,
     input: deploySnippet(),
     encoding: 'utf8',
-    env: { ...offlineEnv(), CDK: wrapper, PROJECT: 'demo' },
+    env: { ...offlineEnv(), CDK: wrapper, PROJECT: 'demo', QUALIFIER: 'demo' },
     timeout: 120_000,
   });
   return { code: r.status, out: `${r.stdout}${r.stderr}` };
