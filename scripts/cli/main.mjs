@@ -45,7 +45,7 @@ export const COMMANDS = [
     name: 'bootstrap',
     usage: 'shukka bootstrap --account [--oidc-provider-arn <arn>] [--projects <a,b>] [--profile <name>] --region <region> [--dry-run]\n'
       + 'shukka bootstrap <project> [--config <path>] [--hosted-zone-id <id>] [--mail-domain <domain>]... [--repo <owner/name>]\n'
-      + '    [--emergency-principal <arn>]... [--allow-private-types] [--profile <name>] [--region <region>] [--dry-run]',
+      + '    [--emergency-principal <arn>]... [--allow-private-types] [--bound-existing-roles] [--profile <name>] [--region <region>] [--dry-run]',
     summary: [
       'Once per AWS account, with admin credentials: --account deploys the Shukka-Account stack (cdk deploy), which owns',
       "the account's GitHub OIDC provider, or imports an existing one with --oidc-provider-arn, and lists the account's",
@@ -63,6 +63,11 @@ export const COMMANDS = [
       'execution role carries the three execution policies, its roles trust the infra role and the emergency',
       'principals), copies each buildEnv value from Parameter Store /<project>/prod/<NAME> to a GitHub repository',
       "variable (gh variable set), and adds the project to Shukka-Account's list when that stack exists.",
+      '',
+      "With --bound-existing-roles (a project moving onto shukka), roles named like the project without any boundary that",
+      'are in a stack tagged Project=<project> or shukka:project=<project> do not refuse: right after Shukka-Boundary-<project>',
+      'is deployed, each gets the boundary (aws iam put-role-permissions-boundary, printed), the roles are checked again, and',
+      'the bootstrap goes on. Without the flag, the refusal names it when every such role is in the project\'s own stacks.',
     ].join('\n'),
     flags: [
       { name: 'account', help: 'bootstrap the account (Shukka-Account) instead of a project' },
@@ -74,6 +79,7 @@ export const COMMANDS = [
       { name: 'repo', value: '<owner/name>', help: "GitHub repository for buildEnv variables (default: origin's)" },
       { name: 'emergency-principal', value: '<arn>', repeat: true, help: 'role or user ARN (pattern) that may deploy from a laptop (default: whoever runs this)' },
       { name: 'allow-private-types', help: 'go ahead although the account has private CloudFormation extensions (each is listed with its execution role)' },
+      { name: 'bound-existing-roles', help: 'for a project moving onto shukka: after deploying Shukka-Boundary-<project>, put its boundary on the roles named like the project that have none and are in a stack tagged Project=<project> or shukka:project=<project> (aws iam put-role-permissions-boundary, each printed), re-check, then go on; any other such role still refuses' },
       PROFILE,
       REGION,
       DRY_RUN,
@@ -315,7 +321,7 @@ export async function main(argv, deps = {}) {
       const { bootstrapAccount, bootstrapProject } = await import('./bootstrap.mjs');
       if (flags.account === true) {
         if (positional.length > 0) throw new CliError('bootstrap: give --account or a project name, not both', 2);
-        const projectOnly = ['config', 'hosted-zone-id', 'mail-domain', 'repo', 'emergency-principal', 'allow-private-types'].filter((f) => f in flags);
+        const projectOnly = ['config', 'hosted-zone-id', 'mail-domain', 'repo', 'emergency-principal', 'allow-private-types', 'bound-existing-roles'].filter((f) => f in flags);
         if (projectOnly.length > 0) throw new CliError(`bootstrap --account: --${projectOnly[0]} is for a project bootstrap`, 2);
         const r = region ?? env.AWS_REGION ?? env.AWS_DEFAULT_REGION;
         if (!r) throw new CliError('bootstrap --account: give --region', 2);
@@ -346,6 +352,7 @@ export async function main(argv, deps = {}) {
         ...(str(flags, 'repo') ? { repo: str(flags, 'repo') } : {}),
         ...(list(flags, 'emergency-principal') ? { emergencyPrincipals: list(flags, 'emergency-principal') } : {}),
         allowPrivateTypes: flags['allow-private-types'] === true,
+        boundExistingRoles: flags['bound-existing-roles'] === true,
       });
       return 0;
     }
