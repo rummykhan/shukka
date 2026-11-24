@@ -567,11 +567,12 @@ function bundleInTree(bundle: string, cwd: string) {
 }
 
 /** A spawn for a real deploy run: commands succeed, cdk synth writes a manifest, cdk diff prints `diff`, the bundle script bundles `bundle`. */
-function deploySpawn(diff: string, bundle: string, diffStatus = 0, artifacts: Record<string, unknown> = { 'shukkatest-App': { type: 'aws:cloudformation:stack', properties: { tags: { Project: 'shukkatest' } } } }) {
+function deploySpawn(diff: string, bundle: string, diffStatus = 0, artifacts: Record<string, unknown> = { 'shukkatest-App': { type: 'aws:cloudformation:stack', properties: { tags: { Project: 'shukkatest' } } } }, files: Record<string, unknown> = {}) {
   return recordingSpawn(({ cmd, args, options }) => {
     if (cmd === 'npx' && args.includes('synth')) {
       const out = args[args.indexOf('--output') + 1]!;
       write(join(out, 'manifest.json'), JSON.stringify({ artifacts }));
+      for (const [name, content] of Object.entries(files)) write(join(out, name), JSON.stringify(content));
       return { status: 0, stdout: '' };
     }
     if (cmd === process.execPath && args[1] === 'diff') return { status: diffStatus, stdout: diff };
@@ -1784,16 +1785,36 @@ test('shu-9bj.12: shukka deploy never deploys the CI stack, passes the project t
 }));
 
 // shu-ecn: the CI stack's admin deploy never runs the project's code with admin credentials.
-const CI_ARTIFACTS = (deps: string[] = ['Shukkatest-Ci.assets']) => ({
-  'Shukkatest-Ci.assets': { type: 'cdk:asset-manifest' },
-  'Shukkatest-Ci': { type: 'aws:cloudformation:stack', displayName: 'Shukkatest-Ci', properties: { tags: { Project: 'shukkatest' } }, dependencies: deps },
+// As shukkaCiSynthesizer writes them (synthesized with aws-cdk-lib 2.278): the template is the only asset, published to
+// the project's bootstrap bucket, and the lookup role is the project's deploy role.
+const CI_BUCKET = `cdk-shukkatest-assets-${ACCOUNT}-us-east-1`;
+const CI_KEY = 'abc123.json';
+const CI_ARTIFACTS = (deps: string[] = ['Shukkatest-Ci.assets'], props: Record<string, unknown> = {}) => ({
+  'Shukkatest-Ci.assets': { type: 'cdk:asset-manifest', properties: { file: 'Shukkatest-Ci.assets.json' } },
+  'Shukkatest-Ci': {
+    type: 'aws:cloudformation:stack', displayName: 'Shukkatest-Ci', environment: `aws://${ACCOUNT}/us-east-1`, dependencies: deps,
+    properties: {
+      tags: { Project: 'shukkatest' }, templateFile: 'Shukkatest-Ci.template.json', stackTemplateAssetObjectUrl: `s3://${CI_BUCKET}/${CI_KEY}`,
+      lookupRole: { arn: 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/cdk-shukkatest-deploy-role-${AWS::AccountId}-${AWS::Region}', requiresBootstrapStackVersion: 8, bootstrapStackVersionSsmParameter: '/cdk-bootstrap/shukkatest/version' },
+      ...props,
+    },
+  },
   'shukkatest-App': { type: 'aws:cloudformation:stack', properties: { tags: { Project: 'shukkatest' } } },
+});
+const CI_DEST = { bucketName: CI_BUCKET, objectKey: CI_KEY, region: 'us-east-1' };
+const CI_FILES = (extraFiles: Record<string, unknown> = {}, dest: Record<string, unknown> = CI_DEST) => ({
+  'Shukkatest-Ci.template.json': { Resources: {} },
+  'Shukkatest-Ci.assets.json': {
+    version: '55.0.0',
+    files: { abc123: { source: { path: 'Shukkatest-Ci.template.json', packaging: 'file' }, destinations: { [`${ACCOUNT}-us-east-1`]: dest } }, ...extraFiles },
+    dockerImages: {},
+  },
 });
 const CI_DIFF = 'Stack Shukkatest-Ci\nResources\n[~] AWS::IAM::Role InfraRole InfraRoleABC\n\n✨  Number of stacks with differences: 1\n';
 
 test('shu-ecn: deploy-ci synthesizes in Docker without credentials, checks the assembly, and gives the admin profile only to shukka\'s cdk on that cdk.out, for the CI stack alone, from an empty directory', withTmp(async (tmp) => {
   const { dir, sha } = consumer(tmp);
-  const { calls, spawn } = deploySpawn(CI_DIFF, bundleDir(tmp), 0, CI_ARTIFACTS());
+  const { calls, spawn } = deploySpawn(CI_DIFF, bundleDir(tmp), 0, CI_ARTIFACTS(), CI_FILES());
   const checked: unknown[] = [];
   const checkAssembly = (_d: string, o?: unknown) => { checked.push(o); return []; };
   const r = await cli(['deploy-ci', 'shukkatest', '--profile', 'admin', '--yes'], { cwd: dir, spawn, aws: fakeAws().aws, checkAssembly });
@@ -1816,8 +1837,9 @@ test('shu-ecn: deploy-ci synthesizes in Docker without credentials, checks the a
   for (const c of cdks) {
     assert.ok(!c.options.docker, 'cdk runs on the host with the admin profile');
     assert.ok(!c.options.cwd.startsWith(dir) && readdirSync(c.options.cwd).length === 0, 'cdk runs from an empty directory, not the checkout');
-    assert.notEqual(c.options.env.HOME, homedir(), 'with an empty HOME');
-    assert.equal(readdirSync(c.options.env.HOME).length, 0);
+    assert.notEqual(c.options.fullEnv.HOME, homedir(), 'with an empty HOME');
+    assert.equal(readdirSync(c.options.fullEnv.HOME).length, 0);
+    assert.equal(c.options.env, undefined, 'nothing of this process\'s environment is merged in');
   }
   assert.match(r.out, /\[~\] AWS::IAM::Role InfraRole/);
   assert.match(r.out, /guard: nothing is deleted or replaced/);
@@ -1827,20 +1849,20 @@ test('shu-ecn: deploy-ci synthesizes in Docker without credentials, checks the a
 test('shu-ecn: deploy-ci asks before it deploys, refuses when the answer is no, and refuses without a terminal unless --yes', withTmp(async (tmp) => {
   const { dir } = consumer(tmp);
   const questions: string[] = [];
-  let s = deploySpawn(CI_DIFF, bundleDir(tmp), 0, CI_ARTIFACTS());
+  let s = deploySpawn(CI_DIFF, bundleDir(tmp), 0, CI_ARTIFACTS(), CI_FILES());
   let r = await cli(['deploy-ci', 'shukkatest', '--profile', 'admin'], { cwd: dir, spawn: s.spawn, aws: fakeAws().aws, checkAssembly: NO_ASSETS, confirm: async (q) => { questions.push(q); return false; } });
   assert.equal(r.code, 1, r.out);
   assert.match(questions.join('\n'), /Deploy Shukkatest-Ci .*profile admin/);
   assert.match(r.err, /not deployed/);
   assert.deepEqual(s.calls.filter((x) => x.cmd === process.execPath).map((x) => x.args[1]), ['diff'], 'the diff is shown, nothing deployed');
 
-  s = deploySpawn(CI_DIFF, bundleDir(tmp), 0, CI_ARTIFACTS());
+  s = deploySpawn(CI_DIFF, bundleDir(tmp), 0, CI_ARTIFACTS(), CI_FILES());
   r = await cli(['deploy-ci', 'shukkatest'], { cwd: dir, spawn: s.spawn, aws: fakeAws().aws, checkAssembly: NO_ASSETS, confirm: async () => true });
   assert.equal(r.code, 0, r.out + r.err);
   assert.deepEqual(s.calls.filter((x) => x.cmd === process.execPath).map((x) => x.args[1]), ['diff', 'deploy']);
 
   // The default confirmation with no terminal on stdin: refused, with --yes named.
-  s = deploySpawn(CI_DIFF, bundleDir(tmp), 0, CI_ARTIFACTS());
+  s = deploySpawn(CI_DIFF, bundleDir(tmp), 0, CI_ARTIFACTS(), CI_FILES());
   r = await cli(['deploy-ci', 'shukkatest'], { cwd: dir, spawn: s.spawn, aws: fakeAws().aws, checkAssembly: NO_ASSETS, confirm: async () => confirmOnTerminal('q?', { isTTY: false } as any) });
   assert.equal(r.code, 1);
   assert.match(r.err, /no terminal to confirm on; read the diff and run again with --yes/);
@@ -1852,7 +1874,7 @@ test('shu-ecn: deploy-ci needs the project named, and it must be shukka.json\'s'
   let r = await cli(['deploy-ci', '--yes'], { cwd: dir, aws: fakeAws().aws });
   assert.equal(r.code, 2);
   assert.match(r.err, /deploy-ci: give the project name/);
-  const s = deploySpawn(CI_DIFF, bundleDir(tmp), 0, CI_ARTIFACTS());
+  const s = deploySpawn(CI_DIFF, bundleDir(tmp), 0, CI_ARTIFACTS(), CI_FILES());
   r = await cli(['deploy-ci', 'other', '--yes'], { cwd: dir, spawn: s.spawn, aws: fakeAws().aws, checkAssembly: NO_ASSETS });
   assert.equal(r.code, 1);
   assert.match(r.err, /shukka\.json on origin\/main is for project shukkatest, not other/);
@@ -1862,19 +1884,19 @@ test('shu-ecn: deploy-ci needs the project named, and it must be shukka.json\'s'
 test('shu-ecn: deploy-ci refuses a CI stack that depends on another stack, a destructive diff, and runs no project code without Docker', withTmp(async (tmp) => {
   const { dir } = consumer(tmp);
   for (const deps of [['shukkatest-App'], ['Shukkatest-Ci.assets', 'shukkatest-App']]) {
-    const { calls, spawn } = deploySpawn(CI_DIFF, bundleDir(tmp), 0, CI_ARTIFACTS(deps));
+    const { calls, spawn } = deploySpawn(CI_DIFF, bundleDir(tmp), 0, CI_ARTIFACTS(deps), CI_FILES());
     const r = await cli(['deploy-ci', 'shukkatest', '--profile', 'admin', '--yes'], { cwd: dir, spawn, aws: fakeAws().aws, checkAssembly: NO_ASSETS });
     assert.equal(r.code, 1, r.out);
     assert.match(r.err, /Shukkatest-Ci depends on "shukkatest-App": the CI stack must depend on nothing but its own assets/);
     assert.ok(!calls.some((x) => x.cmd === process.execPath), 'cdk never gets the admin credentials');
   }
   const destructive = 'Stack Shukkatest-Ci\nResources\n[-] AWS::IAM::Role InfraRole InfraRoleABC destroy\n\n✨  Number of stacks with differences: 1\n';
-  const d = deploySpawn(destructive, bundleDir(tmp), 0, CI_ARTIFACTS());
+  const d = deploySpawn(destructive, bundleDir(tmp), 0, CI_ARTIFACTS(), CI_FILES());
   let r = await cli(['deploy-ci', 'shukkatest', '--yes'], { cwd: dir, spawn: d.spawn, aws: fakeAws().aws, checkAssembly: NO_ASSETS });
   assert.equal(r.code, 1, r.out);
   assert.match(r.err, /the guard stopped the CI stack deploy/);
   assert.ok(!d.calls.some((x) => isCdk(x, 'deploy')));
-  const bad = deploySpawn(CI_DIFF, bundleDir(tmp), 0, CI_ARTIFACTS());
+  const bad = deploySpawn(CI_DIFF, bundleDir(tmp), 0, CI_ARTIFACTS(), CI_FILES());
   r = await cli(['deploy-ci', 'shukkatest', '--yes'], { cwd: dir, spawn: bad.spawn, aws: fakeAws().aws, checkAssembly: () => ['assembly: an asset runs a command'] });
   assert.equal(r.code, 1);
   assert.match(r.err, /an asset runs a command/);
@@ -1890,24 +1912,24 @@ test('shu-ecn: deploy-ci prints the CI stack\'s stored CloudFormation service ro
   const { dir } = consumer(tmp);
   const exec = `arn:aws:iam::${ACCOUNT}:role/cdk-shukkatest-cfn-exec-role-${ACCOUNT}-us-east-1`;
   const stack = (roleArn?: string) => fakeAws({ describeStack: async (name: string) => (name === 'Shukkatest-Ci' ? { name, outputs: {}, tags: {}, ...(roleArn ? { roleArn } : {}) } : null) });
-  let s = deploySpawn(CI_DIFF, bundleDir(tmp), 0, CI_ARTIFACTS());
+  let s = deploySpawn(CI_DIFF, bundleDir(tmp), 0, CI_ARTIFACTS(), CI_FILES());
   let r = await cli(['deploy-ci', 'shukkatest', '--yes'], { cwd: dir, spawn: s.spawn, aws: stack(exec).aws, checkAssembly: NO_ASSETS });
   assert.equal(r.code, 1, r.out);
   assert.match(r.err, new RegExp(`Shukkatest-Ci keeps the project's execution role ${reEscape(exec)} as its CloudFormation service role`));
   assert.match(r.err, /delete Shukkatest-Ci .* and run deploy-ci again/);
   assert.ok(!s.calls.some((x) => isCdk(x, 'deploy')), 'never deployed');
 
-  s = deploySpawn(CI_DIFF, bundleDir(tmp), 0, CI_ARTIFACTS());
+  s = deploySpawn(CI_DIFF, bundleDir(tmp), 0, CI_ARTIFACTS(), CI_FILES());
   r = await cli(['deploy-ci', 'shukkatest', '--yes'], { cwd: dir, spawn: s.spawn, aws: stack(`arn:aws:iam::${ACCOUNT}:role/cfn-admin`).aws, checkAssembly: NO_ASSETS });
   assert.equal(r.code, 0, r.out + r.err);
   assert.match(r.err, /Shukkatest-Ci keeps arn:aws:iam::123456789012:role\/cfn-admin as its CloudFormation service role: CloudFormation updates it as that role, not with your credentials/);
 
-  s = deploySpawn(CI_DIFF, bundleDir(tmp), 0, CI_ARTIFACTS());
+  s = deploySpawn(CI_DIFF, bundleDir(tmp), 0, CI_ARTIFACTS(), CI_FILES());
   r = await cli(['deploy-ci', 'shukkatest', '--yes'], { cwd: dir, spawn: s.spawn, aws: stack().aws, checkAssembly: NO_ASSETS });
   assert.equal(r.code, 0, r.out + r.err);
   assert.match(r.out, /Shukkatest-Ci has no stored service role: CloudFormation acts with your credentials/);
 
-  s = deploySpawn(CI_DIFF, bundleDir(tmp), 0, CI_ARTIFACTS());
+  s = deploySpawn(CI_DIFF, bundleDir(tmp), 0, CI_ARTIFACTS(), CI_FILES());
   r = await cli(['deploy-ci', 'shukkatest', '--yes'], { cwd: dir, spawn: s.spawn, aws: fakeAws().aws, checkAssembly: NO_ASSETS });
   assert.equal(r.code, 0, r.out + r.err);
   assert.match(r.out, /Shukkatest-Ci does not exist yet: CloudFormation creates it with your credentials/);
@@ -1933,4 +1955,41 @@ test('shu-ecn: describeStack returns the RoleARN CloudFormation keeps for a stac
   } finally {
     CloudFormationClient.prototype.send = send;
   }
+});
+
+test('shu-ecn: deploy-ci refuses a CI stack whose assets would be published anywhere but its template in the project\'s bootstrap bucket, or whose lookup role is not the project\'s deploy role', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  const foreign = { bucketName: `otherproject-deploy-${ACCOUNT}`, objectKey: 'releases/app.tar.gz', region: 'us-east-1' };
+  const cases: [string, ReturnType<typeof CI_ARTIFACTS>, ReturnType<typeof CI_FILES>, RegExp][] = [
+    ['a foreign bucket', CI_ARTIFACTS(undefined, { stackTemplateAssetObjectUrl: `s3://${foreign.bucketName}/${foreign.objectKey}` }), CI_FILES({}, foreign),
+      /published to the bucket "otherproject-deploy-123456789012", not the project's bootstrap bucket cdk-shukkatest-assets-123456789012-us-east-1/],
+    ['an extra asset', CI_ARTIFACTS(), CI_FILES({ evil: { source: { path: 'app.tar.gz', packaging: 'file' }, destinations: { x: foreign } } }),
+      /2 file assets; the CI stack may publish its template and nothing else/],
+    ['an assumeRoleArn', CI_ARTIFACTS(), CI_FILES({}, { ...CI_DEST, assumeRoleArn: 'arn:aws:iam::999999999999:role/other' }),
+      /published as the role "arn:aws:iam::999999999999:role\/other"/],
+    ['another region', CI_ARTIFACTS(), CI_FILES({}, { ...CI_DEST, region: 'eu-west-1' }), /published in region "eu-west-1", not us-east-1/],
+    ['a template url elsewhere', CI_ARTIFACTS(undefined, { stackTemplateAssetObjectUrl: `s3://${CI_BUCKET}/other.json` }), CI_FILES(),
+      /stackTemplateAssetObjectUrl .* is not where its template is published/],
+    ['a foreign lookup role', CI_ARTIFACTS(undefined, { lookupRole: { arn: 'arn:aws:iam::999999999999:role/other' } }), CI_FILES(),
+      /lookup role is "arn:aws:iam::999999999999:role\/other", not the project's deploy role arn:aws:iam::123456789012:role\/cdk-shukkatest-deploy-role-123456789012-us-east-1/],
+  ];
+  for (const [what, artifacts, files, re] of cases) {
+    const s = deploySpawn(CI_DIFF, bundleDir(tmp), 0, artifacts, files);
+    // --allow-replacement lets the policy guard through, so the refusal is this check's alone.
+    const r = await cli(['deploy-ci', 'shukkatest', '--profile', 'admin', '--yes', '--allow-replacement'], { cwd: dir, spawn: s.spawn, aws: fakeAws().aws, checkAssembly: NO_ASSETS });
+    assert.equal(r.code, 1, `${what}: ${r.out}${r.err}`);
+    assert.match(r.err, re, what);
+    assert.ok(!s.calls.some((x) => x.cmd === process.execPath), `${what}: cdk never gets the admin credentials`);
+  }
+}));
+
+test('shu-ecn: the admin\'s cdk gets a minimal environment, never NODE_OPTIONS or CDK settings of this process', async () => {
+  const { adminEnv } = await import('../scripts/cli/deploy.mjs');
+  const env = adminEnv('us-east-1', '/tmp/empty-home', { PATH: '/bin', NODE_OPTIONS: '--require /tmp/x.js', CDK_HOME: '/x', AWS_PROFILE: 'admin', AWS_ACCESS_KEY_ID: 'AKIA', HOME: '/Users/me', npm_config_userconfig: '/x' });
+  assert.equal(env.PATH, '/bin');
+  assert.equal(env.AWS_PROFILE, 'admin');
+  assert.equal(env.AWS_ACCESS_KEY_ID, 'AKIA');
+  assert.equal(env.HOME, '/tmp/empty-home');
+  assert.equal(env.AWS_REGION, 'us-east-1');
+  for (const k of ['NODE_OPTIONS', 'CDK_HOME', 'npm_config_userconfig']) assert.equal(env[k], undefined, k);
 });

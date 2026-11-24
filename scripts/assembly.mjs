@@ -39,7 +39,7 @@
 //   exit 2: usage error
 
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
-import { isAbsolute, join, relative, sep } from 'node:path';
+import { basename, isAbsolute, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 /** What a stack's id or displayName must look like to be passed to cdk as a stack selector. */
@@ -302,11 +302,14 @@ export function deployCommands(artifacts, project, sha) {
  * synthesized with shukkaCiSynthesizer (no deploy or execution role), depending on nothing but its own asset manifest.
  * A dependency on another stack is refused, not just left out: the admin deploys exactly one stack, with
  * `--exclusively`, and a CI stack that needs another stack (or another stack's assets) first is not one shukka deploys.
+ * With `env` it also checks what cdk will do with the admin's credentials besides the deploy (ciPublishProblems):
+ * where the stack's assets are published and which lookup role it reads through.
  * @param {Record<string, any>} artifacts the top-level manifest's artifacts
  * @param {string} project
+ * @param {CiEnv} [env]
  * @returns {{ selector: string | null, problems: string[] }}
  */
-export function ciStackPlan(artifacts, project) {
+export function ciStackPlan(artifacts, project, env) {
   const ci = ciStackName(project);
   const found = Object.entries(artifacts).filter(([id, a]) => a?.type === 'aws:cloudformation:stack' && cfnName(id, a) === ci);
   if (found.length !== 1) {
@@ -327,7 +330,95 @@ export function ciStackPlan(artifacts, project) {
       problems.push(`${ci} depends on ${JSON.stringify(dep)}: the CI stack must depend on nothing but its own assets (only it is deployed with admin credentials); refused`);
     }
   }
+  if (env) problems.push(...ciPublishProblems(artifacts, id, ci, env));
   return { selector: problems.length === 0 ? selector : null, problems };
+}
+
+/**
+ * @typedef {{ dir: string, account: string, region: string, qualifier: string }} CiEnv dir: the assembly directory
+ */
+
+/**
+ * What cdk does with the admin's credentials for the CI stack besides the deploy, checked against the project's own
+ * bootstrap: cdk-assets publishes every file in the stack's asset manifest to whatever bucket, key, region and role
+ * the merged code wrote, and reads the deployed template through the stack's lookup role. So the asset manifest must
+ * hold the stack's template and nothing else, published only to the project's bootstrap bucket
+ * (cdk-<qualifier>-assets-<account>-<region>) in the project's region with no role to assume, at the very object the
+ * stack's stackTemplateAssetObjectUrl names; and the lookup role must be the project's deploy role.
+ * @param {Record<string, any>} artifacts
+ * @param {string} id the CI stack's artifact id
+ * @param {string} ci its name, for messages
+ * @param {CiEnv} env
+ * @returns {string[]}
+ */
+export function ciPublishProblems(artifacts, id, ci, { dir, account, region, qualifier }) {
+  /** @type {string[]} */
+  const problems = [];
+  const refuse = (/** @type {string} */ why) => problems.push(`${ci}: ${why}; refused (cdk publishes and reads it with your admin credentials)`);
+  const props = artifacts[id]?.properties ?? {};
+  const bucket = `cdk-${qualifier}-assets-${account}-${region}`;
+  const env = artifacts[id]?.environment;
+  if (env !== undefined && env !== `aws://${account}/${region}`) refuse(`its environment is ${JSON.stringify(env)}, not aws://${account}/${region}`);
+
+  const deployRole = [
+    `arn:\${AWS::Partition}:iam::\${AWS::AccountId}:role/cdk-${qualifier}-deploy-role-\${AWS::AccountId}-\${AWS::Region}`,
+    `arn:aws:iam::${account}:role/cdk-${qualifier}-deploy-role-${account}-${region}`,
+  ];
+  const lookup = props.lookupRole;
+  if (!lookup || !deployRole.includes(lookup.arn)) {
+    refuse(`its lookup role is ${JSON.stringify(lookup?.arn ?? null)}, not the project's deploy role ${deployRole[1]}`);
+  } else {
+    if (lookup.assumeRoleExternalId !== undefined || lookup.assumeRoleAdditionalOptions !== undefined) refuse('its lookup role carries extra assume options');
+    if (lookup.bootstrapStackVersionSsmParameter !== undefined && lookup.bootstrapStackVersionSsmParameter !== `/cdk-bootstrap/${qualifier}/version`) {
+      refuse(`its lookup role reads ${JSON.stringify(lookup.bootstrapStackVersionSsmParameter)}, not /cdk-bootstrap/${qualifier}/version`);
+    }
+  }
+  if (props.assumeRoleExternalId !== undefined || props.assumeRoleAdditionalOptions !== undefined) refuse('it carries assume options');
+
+  const manifestId = `${id}.assets`;
+  const file = artifacts[manifestId]?.properties?.file;
+  if (artifacts[manifestId] === undefined) {
+    refuse(`it has no asset manifest ${manifestId}, so where its template is published cannot be checked`);
+    return problems;
+  }
+  if (typeof file !== 'string' || file !== basename(file) || file.startsWith('.')) {
+    refuse(`its asset manifest names the file ${JSON.stringify(file)}`);
+    return problems;
+  }
+  /** @type {any} */
+  let manifest;
+  try {
+    manifest = JSON.parse(readFileSync(join(dir, file), 'utf8'));
+  } catch {
+    refuse(`its asset manifest ${file} cannot be read`);
+    return problems;
+  }
+  const dockerImages = Object.keys(manifest?.dockerImages ?? {});
+  if (dockerImages.length > 0) refuse(`its asset manifest has Docker images (${dockerImages.join(', ')})`);
+  const files = Object.entries(manifest?.files ?? {});
+  if (files.length !== 1) {
+    refuse(`its asset manifest has ${files.length} file assets; the CI stack may publish its template and nothing else`);
+    return problems;
+  }
+  const [hash, asset] = /** @type {[string, any]} */ (files[0]);
+  if (asset?.source?.path !== props.templateFile || typeof props.templateFile !== 'string' || asset?.source?.executable !== undefined
+    || (asset?.source?.packaging ?? 'file') !== 'file') {
+    refuse(`its only file asset ${JSON.stringify(hash)} is not its template file ${JSON.stringify(props.templateFile ?? null)}`);
+  }
+  const destinations = Object.values(asset?.destinations ?? {});
+  if (destinations.length === 0) refuse('its template has no destination');
+  for (const d of /** @type {any[]} */ (destinations)) {
+    const where = `s3://${d?.bucketName}/${d?.objectKey}`;
+    if (d?.bucketName !== bucket) refuse(`its template is published to the bucket ${JSON.stringify(d?.bucketName)}, not the project's bootstrap bucket ${bucket}`);
+    if (d?.region !== region) refuse(`its template is published in region ${JSON.stringify(d?.region ?? null)}, not ${region}`);
+    if (d?.assumeRoleArn !== undefined || d?.assumeRoleExternalId !== undefined || d?.assumeRoleAdditionalOptions !== undefined) {
+      refuse(`its template is published as the role ${JSON.stringify(d?.assumeRoleArn ?? null)}, not with your credentials`);
+    }
+    if (props.stackTemplateAssetObjectUrl !== where) {
+      refuse(`its stackTemplateAssetObjectUrl ${JSON.stringify(props.stackTemplateAssetObjectUrl ?? null)} is not where its template is published (${where})`);
+    }
+  }
+  return problems;
 }
 
 /**
