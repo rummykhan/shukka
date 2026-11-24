@@ -27,6 +27,9 @@ phase_J() {
   push_main || return 1
   state_set cli_sha "$sha"
   cli_try deploy
+  # What the live address serves right after this deploy; later steps here redeploy, so the case
+  # reads this saved value, not the page at case time.
+  state_set after_cli_page "$(http_get "http://$(box_ip):8080/" | one_line)"
   state_set cli_runs_for_sha "$(runs_for_sha_count "$sha")"
   snapshot after_cli
 

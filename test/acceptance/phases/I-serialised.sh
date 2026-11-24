@@ -5,7 +5,8 @@
 # critical: no
 
 phase_I() {
-  local a b ida idb
+  local a b ida idb since
+  since=$(now_iso)
   printf 'shukkatest-web-ok\nquick merge A %s\n' "$RUN_ID" >"$RUN_DIR/consumer/apps/web/page.txt"
   a=$(commit_all "shukkatest $RUN_ID: quick merge A") || return 1
   push_main || return 1
@@ -22,8 +23,9 @@ phase_I() {
   wait_run_done "$idb" >/dev/null || true
   snapshot after_serial
   # Evidence from the box itself: when A's release command ended (SSM), and when B's release was
-  # unpacked (its REVISION file, written after B takes the app's lock).
-  state_set serial_a_window "$(release_command_window web "$a")"
-  state_set serial_b_window "$(release_command_window web "$b")"
+  # unpacked (its REVISION file, written after B takes the app's lock). Each release command is the one
+  # its run's release job names in its log.
+  state_set serial_a_window "$(release_command_window web "$a" "$ida" "$since")"
+  state_set serial_b_window "$(release_command_window web "$b" "$idb" "$since")"
   state_set serial_b_unpacked "$(box_run "stat -c %Y /opt/$PROJECT/web/releases/$b/REVISION 2>/dev/null || echo none" | tr -d '[:space:]')"
 }

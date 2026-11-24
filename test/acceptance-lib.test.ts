@@ -1,7 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawn, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -837,4 +838,254 @@ test('shu-ecn: setup_ci_stack pushes the baseline with the caller disabled, then
   const enable = at(/^enable CI$/);
   const firstPush = at(/^git push -q origin HEAD:main$/);
   assert.ok(first > deploy && enable > first && firstPush > enable, 'the first merge is pushed after the CI stack, with the caller enabled');
+});
+
+// shu-9bj.22: the rc.8 run's suite defects: waits that count a laptop's sleep, gh reads that give up on a
+// network error, the live page read at case time, smoke without dig, a fix commit that changes nothing
+// live, release commands by a first page of list-commands, and box reads told apart by line number.
+
+const acceptDir = resolve(lib, '..');
+
+/** Runs a script with common.sh sourced and the given executables (name → body) first on PATH. */
+function withBin(script: string, bins: Record<string, string>, env: Record<string, string> = {}): { status: number | null; stdout: string; stderr: string; dir: string; read: (f: string) => string } {
+  const dir = mkdtempSync(join(tmpdir(), 'shu-9bj22-'));
+  const bin = join(dir, 'bin');
+  spawnSync('mkdir', ['-p', bin, join(dir, 'run', 'runs')]);
+  for (const [name, body] of Object.entries({ sleep: '#!/usr/bin/env bash\nexit 0\n', ...bins })) {
+    writeFileSync(join(bin, name), body);
+    chmodSync(join(bin, name), 0o755);
+  }
+  const r = spawnSync('bash', ['-c', `set -uo pipefail; source "${lib}/common.sh"\n${script}`], {
+    encoding: 'utf8',
+    timeout: 60_000,
+    env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, STUB_DIR: dir, RUN_DIR: join(dir, 'run'), AWS_PROFILE: 'stub', ...env },
+  });
+  const read = (f: string) => {
+    try {
+      return readFileSync(join(dir, f), 'utf8');
+    } catch {
+      return '';
+    }
+  };
+  return { status: r.status, stdout: r.stdout, stderr: r.stderr, dir, read };
+}
+
+// A date whose +%s jumps by $STEP seconds on every call (a laptop asleep between every poll).
+const jumpingDate = `#!/usr/bin/env bash
+if [[ "$1" == +%s ]]; then
+  n=$(cat "$STUB_DIR/clock" 2>/dev/null || echo 1000000)
+  echo $((n + STEP)) >"$STUB_DIR/clock"; echo "$n"; exit 0
+fi
+exec /bin/date "$@"
+`;
+
+// A gh that answers the workflows listing, and for run list answers from $STUB_DIR/answers, one line per
+// call: "neterr" (a network failure), "none" (no run yet), "run" (the run exists).
+const runListGh = `#!/usr/bin/env bash
+printf '%s\\n' "$*" >>"$STUB_DIR/gh.log"
+case "$1 $2" in
+  "api repos/rummykhan/shukka-consumer-test/actions/workflows") echo '{"id":7,"name":"CI","state":"active","path":".github/workflows/ci.yml"}'; exit 0 ;;
+  "run list")
+    n=$(($(cat "$STUB_DIR/n" 2>/dev/null || echo 0) + 1)); echo $n >"$STUB_DIR/n"
+    a=$(sed -n "\${n}p" "$STUB_DIR/answers"); a=\${a:-run}
+    case "$a" in
+      neterr) echo 'error connecting to api.github.com' >&2; echo 'check your internet connection or https://githubstatus.com' >&2; exit 1 ;;
+      none) echo '[]'; exit 0 ;;
+      run) echo '[{"databaseId":42,"workflowName":"CI","workflowDatabaseId":7,"event":"push","createdAt":"2026-11-24T00:00:00Z","headBranch":"main"}]'; exit 0 ;;
+    esac ;;
+  "run view") echo 'HTTP 404: Not Found' >&2; exit 1 ;;
+esac
+exit 0
+`;
+
+test('shu-9bj.22: run.sh keeps the Mac awake with caffeinate for as long as the run shell lives', () => {
+  const r = withBin('keep_awake; wait; cat "$STUB_DIR/caffeinate.log"; echo "pid $$"', {
+    caffeinate: '#!/usr/bin/env bash\nprintf \'%s\\n\' "$*" >>"$STUB_DIR/caffeinate.log"\n',
+  });
+  assert.equal(r.status, 0, r.stderr);
+  const pid = /pid (\d+)/.exec(r.stdout)?.[1];
+  assert.match(r.stdout, new RegExp(`^-i -s -w ${pid}$`, 'm'), 'caffeinate waits on the run shell itself');
+  const src = readFileSync(join(acceptDir, 'run.sh'), 'utf8');
+  assert.ok(src.indexOf('\nkeep_awake\n') > 0 && src.indexOf('\nkeep_awake\n') < src.indexOf('setup_preflight\n'), 'run.sh calls keep_awake before any phase');
+  const none = withBin('keep_awake; echo done', {}, { PATH: '/bin' });
+  assert.match(none.stdout, /done/, 'no caffeinate (Linux) is fine');
+  assert.doesNotMatch(none.stderr, /caffeinate/);
+});
+
+test('shu-9bj.22: gh reads retry a network error and return the answer; other gh errors are not retried', () => {
+  const r = withBin(`printf 'neterr\\nneterr\\nrun\\n' >"$STUB_DIR/answers"; run_for_sha abc CI push`, { gh: runListGh });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout.trim(), '42 CI');
+  assert.equal(r.read('n').trim(), '3', 'two network failures, then the answer');
+  const notFound = withBin('run_conclusion 99; echo "rc $?"', { gh: runListGh });
+  assert.match(notFound.stdout, /rc 1/);
+  assert.equal(notFound.read('gh.log').split('\n').filter((l) => l.startsWith('run view')).length, 1, 'a 404 is asked once');
+  assert.match(notFound.stderr, /HTTP 404/);
+});
+
+test('shu-9bj.22: a run wait does not time out because the machine slept between polls; it still times out after its awake time', () => {
+  // Every poll the clock jumps an hour; three empty answers, then the run. Wall clock: 3h > 300s.
+  const slept = withBin(`printf 'none\\nnone\\nnone\\nrun\\n' >"$STUB_DIR/answers"; wait_run_for_sha abc CI push`, { gh: runListGh, date: jumpingDate }, { STEP: '3600' });
+  assert.equal(slept.status, 0, slept.stderr);
+  assert.equal(slept.stdout.trim(), '42');
+  // Never a run: the wait ends after about 300s of capped steps (10s interval + 60s slack each).
+  const never = withBin(`printf 'none\\n%.0s' {1..50} >"$STUB_DIR/answers"; wait_run_for_sha abc CI push; echo "rc $?"`, { gh: runListGh, date: jumpingDate }, { STEP: '3600' });
+  assert.match(never.stdout, /rc 1/);
+  assert.match(never.stderr, /no 'CI' run for push at abc after 300s awake/);
+  const polls = never.read('gh.log').split('\n').filter((l) => l.includes('databaseId,workflowName')).length;
+  assert.equal(polls, 5, '300s of awake time is five polls 70s (capped) apart');
+  // wait_until counts the same way.
+  const until = withBin(`n=0; f() { n=$((n + 1)); ((n >= 4)); }; wait_until 300 10 f; echo "rc $? n $n"`, { date: jumpingDate }, { STEP: '3600' });
+  assert.match(until.stdout, /rc 0 n 4/);
+});
+
+test('shu-9bj.22: phase J saves the live page right after the CLI deploy, and the R8 case asserts on the saved page', () => {
+  const src = readFileSync(join(phasesDir, 'J-cli.sh'), 'utf8');
+  const deploy = src.indexOf('cli_try deploy\n');
+  const saved = src.indexOf('state_set after_cli_page "$(http_get "http://$(box_ip):8080/" | one_line)"');
+  assert.ok(deploy > 0 && saved > deploy && saved < src.indexOf('cli_try dirty'), 'the page is saved right after cli deploy, before anything else deploys');
+  const body = `  source "${join(casesDir, 'J01-R8-cli-deploys-head-without-actions.sh')}"; case_run`;
+  // At case time the live address serves a later release; the case must not look at it.
+  const live = `http_get() { echo "revision: ${OLD}"; }; box_ip() { echo 10.0.0.1; }`;
+  const st = `state_set cli_sha ${NEW}; state_set cli_runs_for_sha 0; state_set cli_deploy_rc 0; state_set after_cli_web_rev ${NEW}`;
+  const good = runCase(body, `${live}; ${st}; state_set after_cli_page "shukkatest-web-ok revision: ${NEW}"`);
+  assert.equal(good.status, 0, good.stderr);
+  const bad = runCase(body, `${live}; ${st}; state_set after_cli_page "shukkatest-web-ok revision: ${OLD}"`);
+  assert.notEqual(bad.status, 0);
+  const missing = runCase(body, `${live}; ${st}`);
+  assert.match(missing.stderr, /state 'after_cli_page' is missing/);
+});
+
+/** A tiny DNS server (UDP, 127.0.0.1, any port) that answers every A query with 127.0.0.1. */
+const dnsServer = `
+const dgram = require('node:dgram');
+const s = dgram.createSocket('udp4');
+s.on('message', (q, rinfo) => {
+  let o = 12; while (q[o] !== 0) o += q[o] + 1; o += 5;
+  const head = Buffer.from(q.subarray(0, 12)); head.writeUInt16BE(0x8180, 2); head.writeUInt16BE(1, 6);
+  const ans = Buffer.from([0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 127, 0, 0, 1]);
+  s.send(Buffer.concat([head, q.subarray(12, o), ans]), rinfo.port, rinfo.address);
+});
+s.bind(0, '127.0.0.1', () => console.log(s.address().port));
+`;
+
+test('shu-9bj.22: smoke.sh resolves the box at the zone name server with no dig or nslookup on PATH', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'shu-9bj22s-'));
+  const server = spawn(process.execPath, ['-e', dnsServer]);
+  try {
+    const [port] = (await once(server.stdout, 'data')) as [Buffer];
+    const smoke = join(dir, 'smoke');
+    cpSync(join(acceptDir, 'consumer', 'smoke'), smoke, { recursive: true });
+    writeFileSync(join(smoke, 'smoke.env'), `ZONE=shukkatest.example\nNS=127.0.0.1:${port.toString().trim()}\n`);
+    // PATH: only the tools the smoke test may use, linked one by one; no dig, no nslookup.
+    const bin = join(dir, 'bin');
+    mkdirSync(bin);
+    for (const t of ['bash', 'grep', 'cat', 'dirname', 'tail', 'awk']) {
+      const p = ['/bin', '/usr/bin'].map((d) => join(d, t)).find((x) => existsSync(x));
+      if (p) symlinkSync(p, join(bin, t));
+    }
+    symlinkSync(process.execPath, join(bin, 'node'));
+    writeFileSync(join(bin, 'curl'), `#!${join(bin, 'bash')}\nprintf '%s\\n' "$*" >>"${join(dir, 'curl.log')}"\ncase "$*" in *8080/health*|*8081/health*) echo ok ;; *) echo 'shukkatest-web-ok' ;; esac\n`);
+    chmodSync(join(bin, 'curl'), 0o755);
+    const child = spawn(join(bin, 'bash'), [join(smoke, 'smoke.sh')], { env: { PATH: bin } });
+    let out = '';
+    child.stdout.on('data', (d) => (out += d));
+    child.stderr.on('data', (d) => (out += d));
+    const [code] = (await once(child, 'exit')) as [number];
+    assert.equal(code, 0, out);
+    assert.match(out, /smoke: box\.shukkatest\.example is 127\.0\.0\.1/);
+    assert.match(out, /smoke: ok/);
+    assert.match(readFileSync(join(dir, 'curl.log'), 'utf8'), /http:\/\/127\.0\.0\.1:8080\/health/);
+    const src = readFileSync(join(smoke, 'smoke.sh'), 'utf8');
+    assert.doesNotMatch(src.replace(/^#.*$/gm, ''), /\b(dig|nslookup)\b/, 'no dig or nslookup left in the script');
+  } finally {
+    server.kill();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("shu-9bj.22: phase G's fix commit changes web content against what is live after the rollback, so a release must happen", () => {
+  const dir = mkdtempSync(join(tmpdir(), 'shu-9bj22g-'));
+  try {
+    const consumer = join(dir, 'run', 'consumer');
+    spawnSync('mkdir', ['-p', join(consumer, 'apps', 'web'), join(dir, 'run', 'runs')]);
+    writeFileSync(join(consumer, 'apps', 'web', 'health.json'), '{ "healthy": true }\n');
+    writeFileSync(join(consumer, 'apps', 'web', 'page.txt'), 'shukkatest-web-ok\nbaseline\n');
+    const git = (...a: string[]) => spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.com', ...a], { cwd: consumer, encoding: 'utf8' });
+    git('init', '-q', '-b', 'main');
+    git('add', '-A');
+    git('commit', '-q', '-m', 'live before the unhealthy release');
+    const fakes = 'snapshot() { :; }; push_main() { :; }; wait_run_of() { echo 1; }; box_ip() { echo 10.0.0.1; }; http_code() { echo 500; }; http_get() { echo x; }; c_git() { git -C "$RUN_DIR/consumer" -c user.name=t -c user.email=t@example.com "$@"; }';
+    const r = spawnSync('bash', ['-c', `set -uo pipefail; source "${lib}/common.sh"; source "${phasesDir}/G-rollback.sh"; ${fakes}; RUN_ID=20261124; phase_G`], {
+      encoding: 'utf8',
+      env: { ...process.env, RUN_DIR: join(dir, 'run') },
+    });
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(git('log', '--format=%s', '-1').stdout.trim(), 'shukkatest 20261124: healthy web release again');
+    // The rollback leaves the content of HEAD~2 live; the fix (HEAD) must differ from it under apps/web.
+    const d = git('diff', '--name-only', 'HEAD~2', 'HEAD', '--', 'apps/web');
+    assert.deepEqual(d.stdout.trim().split('\n'), ['apps/web/page.txt']);
+    assert.match(readFileSync(join(consumer, 'apps', 'web', 'page.txt'), 'utf8'), /^shukkatest-web-ok\n/, 'the smoke marker stays');
+    assert.equal(readFileSync(join(consumer, 'apps', 'web', 'health.json'), 'utf8'), '{ "healthy": true }\n');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// A stub aws for the release command lookup: the instance, a list-commands answer whose first entries
+// are not in time order, and invocation times per command id.
+const ssmStub = `#!/usr/bin/env bash
+( IFS=$'\\x1f'; printf '%s\\n' "$*" ) >>"$STUB_DIR/aws.log"
+arg() { local k=$1; shift; while (($#)); do [[ "$1" == "$k" ]] && { printf '%s' "$2"; return; }; shift; done; }
+case "$1 $2" in
+  "ec2 describe-instances") echo i-0abc; exit 0 ;;
+  "ssm list-commands")
+    p='{"commands":["shukka-release.sh --app web --sha ${NEW}"]}'
+    echo "{\\"Commands\\":[{\\"CommandId\\":\\"old-1\\",\\"RequestedDateTime\\":\\"2026-11-24T01:00:00.000000+00:00\\",\\"Parameters\\":$p},{\\"CommandId\\":\\"new-2\\",\\"RequestedDateTime\\":\\"2026-11-24T03:00:00.000000+00:00\\",\\"Parameters\\":$p},{\\"CommandId\\":\\"mid-3\\",\\"RequestedDateTime\\":\\"2026-11-24T02:00:00.000000+00:00\\",\\"Parameters\\":$p}]}"; exit 0 ;;
+  "ssm get-command-invocation")
+    case "$(arg --command-id "$@")" in
+      cmd-from-log) printf '2026-11-24T00:00:10.000Z\\t2026-11-24T00:00:20.000Z\\n' ;;
+      new-2) printf '2026-11-24T03:00:10.000Z\\t2026-11-24T03:00:20.000Z\\n' ;;
+      *) printf '2026-11-24T09:00:00.000Z\\t2026-11-24T09:00:01.000Z\\n' ;;
+    esac; exit 0 ;;
+esac
+exit 0
+`;
+
+test('shu-9bj.22: release_command_window takes the command id from the release job log line, else from a fully paged InvokedAfter listing, newest first', () => {
+  const logLine = `job_messages() { [[ "$1" == 77 && "$2" == "$JOB_RE_APP" ]] && printf '%s\\n' 'shukka: building web' 'shukka: sent release of shukkatest/web ${NEW} to i-0abc (command cmd-from-log)' 'shukka: shukkatest/web ${OLD} -> ${NEW} ok'; }`;
+  const fromLog = withBin(`${logLine}; release_command_window web ${NEW} 77 2026-11-24T00:00:00Z`, { aws: ssmStub });
+  assert.equal(fromLog.status, 0, fromLog.stderr);
+  const epoch = (s: string) => Date.parse(s) / 1000;
+  assert.equal(fromLog.stdout.trim(), `${epoch('2026-11-24T00:00:10Z')} ${epoch('2026-11-24T00:00:20Z')}`);
+  assert.doesNotMatch(fromLog.read('aws.log'), /list-commands/, 'no listing when the log names the command');
+  // Another app's or commit's line is not taken.
+  const otherLine = `job_messages() { printf '%s\\n' 'shukka: sent release of shukkatest/api ${NEW} to i-0abc (command cmd-api)' 'shukka: sent release of shukkatest/web ${OLD} to i-0abc (command cmd-old)'; }`;
+  const listed = withBin(`${otherLine}; release_command_window web ${NEW} 77 2026-11-24T00:00:00Z`, { aws: ssmStub });
+  assert.equal(listed.status, 0, listed.stderr);
+  assert.equal(listed.stdout.trim(), `${epoch('2026-11-24T03:00:10Z')} ${epoch('2026-11-24T03:00:20Z')}`, 'the newest matching command, not the first listed');
+  const list = listed.read('aws.log').split('\n').find((l) => l.includes('list-commands')) ?? '';
+  assert.ok(list.split(SEP).includes('key=InvokedAfter,value=2026-11-24T00:00:00Z'), list);
+  assert.doesNotMatch(list, /max-items|page-size|starting-token/, 'the listing is read in full');
+  const src = readFileSync(join(phasesDir, 'I-serialised.sh'), 'utf8');
+  assert.match(src, /release_command_window web "\$a" "\$ida" "\$since"/);
+  assert.match(src, /release_command_window web "\$b" "\$idb" "\$since"/);
+});
+
+test('shu-9bj.22: phase D keeps each box read as its own one-line value, and R3-box-role-refused-on-trendigle reads them', () => {
+  // The box's CLI error output starts with a blank line, as it did in the rc.8 run.
+  const r = runPhaseD(`if [[ "$1" == *describe-table* ]]; then printf '\\nAn error occurred (AccessDeniedException) when calling the DescribeTable operation: not authorized\\n'; else printf '\\nAn error occurred (AccessDenied) when calling the ListObjectsV2 operation:\\nAccess Denied\\n'; fi`);
+  assert.equal(r.status, 0, r.stderr);
+  const get = (k: string) => r.state.filter((l) => l.startsWith(`${k}=`)).at(-1)?.slice(k.length + 1);
+  assert.equal(get('box_trendigle_table_read'), 'An error occurred (AccessDeniedException) when calling the DescribeTable operation: not authorized');
+  assert.equal(get('box_trendigle_bucket_read'), 'An error occurred (AccessDenied) when calling the ListObjectsV2 operation: Access Denied');
+  const body = `  source "${join(casesDir, 'D04-R3-box-role-refused-on-trendigle.sh')}"; case_run`;
+  const st = r.state.filter((l) => l.startsWith('box_trendigle_')).map((l) => `state_set ${l.split('=')[0]} '${l.slice(l.indexOf('=') + 1)}'`).join('; ');
+  const denied = runCase(body, st);
+  assert.equal(denied.status, 0, denied.stderr);
+  assert.match(denied.stderr, /RESULT R3-box-role-trendigle-table-read DENIED/);
+  assert.match(denied.stderr, /RESULT R3-box-role-trendigle-bucket-read DENIED/);
+  const allowed = runCase(body, `state_set box_trendigle_table_read ACTIVE; state_set box_trendigle_bucket_read 1`);
+  assert.notEqual(allowed.status, 0);
+  assert.match(allowed.stderr, /RESULT R3-box-role-trendigle-table-read ALLOWED/);
 });

@@ -73,6 +73,8 @@ export RUN_ID RUN_DIR RESULTS_FILE
 exec > >(tee -a "$RUN_DIR/run.log") 2>&1
 
 log "shu-95y acceptance: shukka $RC_TAG against $CONSUMER_REPO, run $RUN_ID, files in $RUN_DIR"
+# A run takes hours; a Mac that sleeps in the middle drops every gh and aws call (shu-9bj.22).
+keep_awake
 
 # Preflight runs before the teardown trap: if leftovers of another run exist, stop without deleting.
 setup_preflight

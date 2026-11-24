@@ -161,13 +161,61 @@ text_items() { tr '\t' '\n' | grep -Exv '(None)?' || true; }
 # ---------------------------------------------------------------------------------------------
 # Polling
 
+# Waits count awake time, not wall-clock time (shu-9bj.22): a laptop that sleeps for hours in the middle
+# of a wait must not find the wait timed out the moment it wakes. Each pass of a polling loop adds the
+# time since the previous pass, but at most its interval plus WAIT_STEP_SLACK seconds (room for the
+# gh or aws call in between), so a sleep gap counts as one pass.
+WAIT_STEP_SLACK=${WAIT_STEP_SLACK:-60}
+
+# awake_step <last-epoch> <interval>: prints "<now> <step>", step being the capped time since last.
+awake_step() {
+  local now step
+  now=$(date +%s)
+  step=$((now - $1))
+  ((step < 0)) && step=0
+  ((step > $2 + WAIT_STEP_SLACK)) && step=$(($2 + WAIT_STEP_SLACK))
+  printf '%s %s\n' "$now" "$step"
+}
+
+# keep_awake: keeps a Mac from sleeping (idle and system sleep) for as long as this shell runs, with
+# caffeinate when there is one. A sleeping laptop drops the network under every gh and aws call.
+keep_awake() {
+  if command -v caffeinate >/dev/null 2>&1; then
+    caffeinate -i -s -w "$$" >/dev/null 2>&1 &
+    log "caffeinate keeps this machine awake while the run lasts (pid $!)"
+  fi
+}
+
+# gh_read <gh args...>: a read through gh, retried (GH_READ_TRIES times, a growing pause apart) when gh
+# fails on a network error; any other failure is returned at once. stdout is gh's; on the last failure
+# gh's stderr is passed on.
+GH_READ_TRIES=${GH_READ_TRIES:-5}
+GH_NETWORK_ERROR_RE='error connecting to|dial tcp|no such host|connection (reset|refused)|i/o timeout|TLS handshake|timeout awaiting|context deadline exceeded|unexpected EOF|network is (down|unreachable)|could not resolve|HTTP 50[234]'
+gh_read() {
+  local i errf out rc
+  errf=$(mktemp "${TMPDIR:-/tmp}/gh-read.XXXXXX") || return 1
+  for ((i = 1; ; i++)); do
+    out=$(gh "$@" 2>"$errf")
+    rc=$?
+    if ((rc == 0)) || ((i >= GH_READ_TRIES)) || ! grep -Eiq -- "$GH_NETWORK_ERROR_RE" "$errf"; then break; fi
+    log "gh $1 $2: network error (try $i of $GH_READ_TRIES): $(one_line <"$errf" | cut -c1-160)"
+    sleep $((i * 5))
+  done
+  ((rc == 0)) || cat "$errf" >&2
+  rm -f "$errf"
+  [[ -z "$out" ]] || printf '%s\n' "$out"
+  return $rc
+}
+
 # wait_until <timeout-seconds> <interval-seconds> <command...>: retries until the command succeeds.
 wait_until() {
-  local timeout=$1 interval=$2 start
+  local timeout=$1 interval=$2 last waited=0 now step
   shift 2
-  start=$(date +%s)
+  last=$(date +%s)
   until "$@"; do
-    if (($(date +%s) - start >= timeout)); then return 1; fi
+    read -r now step <<<"$(awake_step "$last" "$interval")"
+    last=$now waited=$((waited + step))
+    if ((waited >= timeout)); then return 1; fi
     sleep "$interval"
   done
 }
@@ -183,7 +231,7 @@ WORKFLOW_ACTIVE_TRIES=${WORKFLOW_ACTIVE_TRIES:-15}
 # workflow_info <workflow-name>: "<id> <state> <path>" of the test consumer's workflow with that `name:`
 # (the active one if several), or nothing. state is active, disabled_manually, disabled_inactivity, ...
 workflow_info() {
-  gh api "repos/$CONSUMER_REPO/actions/workflows" --paginate --jq '.workflows[]' 2>/dev/null |
+  gh_read api "repos/$CONSUMER_REPO/actions/workflows" --paginate --jq '.workflows[]' 2>/dev/null |
     jq -rs --arg w "$1" '[.[] | select(.name == $w)] | (map(select(.state == "active")) + .) | first // empty
       | "\(.id) \(.state) \(.path)"'
 }
@@ -216,7 +264,7 @@ enable_workflow() {
 # probe_workflows_inactive: "<id> <name> <state>" of each probe workflow (name starting with
 # $PROBE_WORKFLOW) the test consumer knows and that is not active.
 probe_workflows_inactive() {
-  gh api "repos/$CONSUMER_REPO/actions/workflows" --paginate --jq '.workflows[]' 2>/dev/null |
+  gh_read api "repos/$CONSUMER_REPO/actions/workflows" --paginate --jq '.workflows[]' 2>/dev/null |
     jq -r --arg p "$PROBE_WORKFLOW" 'select((.name | startswith($p)) and .state != "active") | "\(.id) \(.name) \(.state)"'
 }
 
@@ -244,7 +292,7 @@ enable_probe_workflows() {
 # matching run as "<id> <run name>", or nothing. A run GitHub could not start (startup failure, a workflow
 # file issue) is named by its file path, not its `name:`, so it is also matched by workflow id and path.
 run_for_sha() {
-  gh run list -R "$CONSUMER_REPO" --commit "$1" --limit 50 \
+  gh_read run list -R "$CONSUMER_REPO" --commit "$1" --limit 50 \
     --json databaseId,workflowName,workflowDatabaseId,event,createdAt,headBranch 2>/dev/null |
     jq -r --arg w "$2" --arg e "$3" --arg b "${4:-}" --arg i "${5:-}" --arg p "${6:-}" \
       '[.[] | select((.workflowName == $w or ($p != "" and .workflowName == $p)
@@ -256,9 +304,9 @@ run_for_sha() {
 # wait_run_for_sha <sha> <workflow-name> <event> [head-branch-or-tag] [appear-timeout]: echoes the run id.
 # If no run appears, says what state the workflow is in and how many runs the commit has at all.
 wait_run_for_sha() {
-  local sha=$1 wf=$2 ev=$3 head=${4:-} timeout=${5:-$RUN_APPEAR_TIMEOUT} start hit id name wid wstate wpath
+  local sha=$1 wf=$2 ev=$3 head=${4:-} timeout=${5:-$RUN_APPEAR_TIMEOUT} last waited=0 now step hit id name wid wstate wpath
   read -r wid wstate wpath <<<"$(workflow_info "$wf")"
-  start=$(date +%s)
+  last=$(date +%s)
   while :; do
     hit=$(run_for_sha "$sha" "$wf" "$ev" "$head" "${wid:-}" "${wpath:-}")
     if [[ -n "$hit" ]]; then
@@ -269,8 +317,10 @@ wait_run_for_sha() {
       printf '%s\n' "$id"
       return 0
     fi
-    if (($(date +%s) - start >= timeout)); then
-      log "no '$wf' run for $ev at $sha after ${timeout}s; caller '$wf' is $(workflow_state "$wf")${wpath:+ ($wpath)} in $CONSUMER_REPO; runs for this commit of any workflow: $(runs_for_sha_count "$sha")"
+    read -r now step <<<"$(awake_step "$last" 10)"
+    last=$now waited=$((waited + step))
+    if ((waited >= timeout)); then
+      log "no '$wf' run for $ev at $sha after ${timeout}s awake; caller '$wf' is $(workflow_state "$wf")${wpath:+ ($wpath)} in $CONSUMER_REPO; runs for this commit of any workflow: $(runs_for_sha_count "$sha")"
       return 1
     fi
     sleep 10
@@ -279,16 +329,18 @@ wait_run_for_sha() {
 
 # wait_run_done <run-id> [timeout]: waits for completion, echoes the conclusion.
 wait_run_done() {
-  local id=$1 timeout=${2:-2700} start status
-  start=$(date +%s)
+  local id=$1 timeout=${2:-2700} last waited=0 now step status
+  last=$(date +%s)
   while :; do
-    status=$(gh run view "$id" -R "$CONSUMER_REPO" --json status,conclusion -q '.status + " " + (.conclusion // "")' 2>/dev/null || true)
+    status=$(gh_read run view "$id" -R "$CONSUMER_REPO" --json status,conclusion -q '.status + " " + (.conclusion // "")' 2>/dev/null || true)
     if [[ "$status" == completed* ]]; then
       printf '%s\n' "${status#completed }"
       return 0
     fi
-    if (($(date +%s) - start >= timeout)); then
-      log "run $id still '$status' after ${timeout}s"
+    read -r now step <<<"$(awake_step "$last" 15)"
+    last=$now waited=$((waited + step))
+    if ((waited >= timeout)); then
+      log "run $id still '$status' after ${timeout}s awake"
       printf 'timeout\n'
       return 1
     fi
@@ -308,15 +360,17 @@ wait_run_of() {
 
 # dispatch_and_wait <since-iso8601> -f k=v...: runs the caller by hand on main, waits, echoes the run id.
 dispatch_and_wait() {
-  local since=$1 id start concl
+  local since=$1 id last waited=0 now step concl
   shift
   gh workflow run "$CALLER_WORKFLOW" -R "$CONSUMER_REPO" --ref main "$@" >/dev/null || return 1
-  start=$(date +%s)
+  last=$(date +%s)
   while :; do
-    id=$(gh run list -R "$CONSUMER_REPO" --workflow "$CALLER_WORKFLOW" --event workflow_dispatch --limit 10 \
+    id=$(gh_read run list -R "$CONSUMER_REPO" --workflow "$CALLER_WORKFLOW" --event workflow_dispatch --limit 10 \
       --json databaseId,createdAt -q "[.[] | select(.createdAt >= \"$since\")] | sort_by(.createdAt) | last | .databaseId // empty")
     [[ -n "$id" ]] && break
-    (($(date +%s) - start < 300)) || { log "no workflow_dispatch run appeared"; return 1; }
+    read -r now step <<<"$(awake_step "$last" 10)"
+    last=$now waited=$((waited + step))
+    ((waited < 300)) || { log "no workflow_dispatch run appeared"; return 1; }
     sleep 10
   done
   log "run $id (workflow_dispatch $*): https://github.com/$CONSUMER_REPO/actions/runs/$id"
@@ -329,24 +383,24 @@ now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 # runs_for_sha_count <sha>: how many runs of any workflow exist for a commit.
 runs_for_sha_count() {
-  gh run list -R "$CONSUMER_REPO" --commit "$1" --limit 50 --json databaseId -q 'length' 2>/dev/null || printf '0\n'
+  gh_read run list -R "$CONSUMER_REPO" --commit "$1" --limit 50 --json databaseId -q 'length' 2>/dev/null || printf '0\n'
 }
 
 # pr_diff_comments <pr-number>: JSON array of {id, updated_at, body} for comments with the marker.
 pr_diff_comments() {
-  gh api "repos/$CONSUMER_REPO/issues/$1/comments" --paginate \
+  gh_read api "repos/$CONSUMER_REPO/issues/$1/comments" --paginate \
     --jq '[.[] | select(.body | contains("<!-- shukka:diff -->")) | {id, updated_at, body}]' 2>/dev/null |
     jq -s 'add // []'
 }
 
-run_conclusion() { gh run view "$1" -R "$CONSUMER_REPO" --json conclusion -q .conclusion; }
+run_conclusion() { gh_read run view "$1" -R "$CONSUMER_REPO" --json conclusion -q .conclusion; }
 
 # run_jobs <run-id>: JSON array of {name, conclusion, startedAt, completedAt}.
 run_jobs() {
   local f="$RUN_DIR/runs/$1.jobs.json"
   if [[ ! -s "$f" ]]; then
     mkdir -p "$RUN_DIR/runs"
-    gh run view "$1" -R "$CONSUMER_REPO" --json jobs -q '[.jobs[] | {name, conclusion, status, startedAt, completedAt}]' >"$f"
+    gh_read run view "$1" -R "$CONSUMER_REPO" --json jobs -q '[.jobs[] | {name, conclusion, status, startedAt, completedAt}]' >"$f"
   fi
   cat "$f"
 }
@@ -398,7 +452,7 @@ run_log() {
   fi
   printf '%s\n' "$f"
 }
-gh_fetch_log() { gh run view "$1" -R "$CONSUMER_REPO" --log >"$2" 2>/dev/null && [[ -s "$2" ]]; }
+gh_fetch_log() { gh_read run view "$1" -R "$CONSUMER_REPO" --log >"$2" 2>/dev/null && [[ -s "$2" ]]; }
 
 # job_messages <run-id> <job-regex>: the printed lines of the matching jobs, without the job, step and
 # timestamp columns. Lines GitHub prints for a step's `env:`/`with:` are indented, so a caller that
@@ -552,15 +606,30 @@ box_run() {
 # iso_epoch: an AWS timestamp (2026-11-22T10:00:00.123000+00:00 or ...Z) as seconds since the epoch.
 iso_epoch() { jq -Rr 'sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | fromdateiso8601'; }
 
-# release_command_window <app> <sha>: "<start-epoch> <end-epoch>" of the SSM command that ran
-# shukka-release.sh for that app and commit on the box (from SSM's own records), or nothing.
+# release_command_id <app> <sha> <run-id>: the id of the SSM command the run's release job sent for that
+# app and commit, read from the job's own line (scripts/release.mjs: "shukka: sent release of
+# <project>/<app> <sha> to <instances> (command <id>)"), or nothing.
+release_command_id() {
+  job_messages "$3" "$JOB_RE_APP" |
+    sed -nE "s/^shukka: sent release of $PROJECT\/$1 $2 to .* \(command ([^ )]+)\)\$/\1/p" | tail -n 1
+}
+
+# release_command_window <app> <sha> <run-id> [invoked-after-iso8601]: "<start-epoch> <end-epoch>" of the
+# SSM command that ran shukka-release.sh for that app and commit on the box (from SSM's own records), or
+# nothing. The command id comes from the run's release job log; failing that, from SSM's listing of the
+# commands sent to the box since invoked-after, read in full (every page) and newest first (shu-9bj.22:
+# a first page of list-commands is not in time order).
 release_command_window() {
   local iid cid times
   iid=$(box_instance)
   [[ -n "$iid" ]] || return 1
-  cid=$(aws ssm list-commands --instance-id "$iid" --max-items 50 --output json 2>/dev/null |
-    jq -r --arg sha "$2" --arg app "$1" '[.Commands[] | select((.Parameters | tostring) as $p
-      | ($p | contains($sha)) and ($p | contains("--app")) and ($p | contains($app)))] | first | .CommandId // empty')
+  cid=$(release_command_id "$1" "$2" "$3")
+  if [[ -z "$cid" && -n "${4:-}" ]]; then
+    cid=$(aws ssm list-commands --instance-id "$iid" --filters "key=InvokedAfter,value=$4" --output json 2>/dev/null |
+      jq -r --arg sha "$2" --arg app "$1" '[.Commands[] | select((.Parameters | tostring) as $p
+        | ($p | contains($sha)) and ($p | contains("--app")) and ($p | contains($app)))]
+        | sort_by(.RequestedDateTime) | last | .CommandId // empty')
+  fi
   [[ -n "$cid" ]] || return 1
   times=$(aws ssm get-command-invocation --command-id "$cid" --instance-id "$iid" \
     --query '[ExecutionStartDateTime, ExecutionEndDateTime]' --output text 2>/dev/null) || return 1
