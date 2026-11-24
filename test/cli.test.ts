@@ -11,7 +11,9 @@ import { homedir, tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { validateConfig } from '../scripts/config.mjs';
-import { COMMANDS, helpText, main } from '../scripts/cli/main.mjs';
+import { COMMANDS, confirmOnTerminal, helpText, main } from '../scripts/cli/main.mjs';
+import { adminNotice } from '../scripts/guard.mjs';
+import { CloudFormationClient } from '@aws-sdk/client-cloudformation';
 import { checkBundlePath } from '../scripts/cli/deploy.mjs';
 import {
   CliError, HOST_CODE_WARNING, PROJECT_BASE_IMAGE, PROJECT_DOCKERFILE, PROJECT_PLATFORM, SERVICES, cdkBin, containerArgs, projectImage, quote, realSpawn,
@@ -189,7 +191,7 @@ function stubDockerSpawn(cmd: string, args: string[], options: any) {
   return realSpawn(cmd, args, options);
 }
 
-async function cli(argv: string[], opts: { aws?: Fake; spawn?: any; cwd?: string; env?: Record<string, string>; checkAssembly?: (dir: string) => string[]; keepTemp?: boolean } = {}) {
+async function cli(argv: string[], opts: { aws?: Fake; spawn?: any; cwd?: string; env?: Record<string, string>; checkAssembly?: (dir: string) => string[]; keepTemp?: boolean; confirm?: (question: string) => Promise<boolean> } = {}) {
   let out = '';
   let err = '';
   const code = await main(argv, {
@@ -202,6 +204,8 @@ async function cli(argv: string[], opts: { aws?: Fake; spawn?: any; cwd?: string
     env: opts.env ?? {},
     keepTemp: opts.keepTemp ?? true,
     ...(opts.checkAssembly ? { checkAssembly: opts.checkAssembly } : {}),
+    // Nobody answers a prompt in a test: a confirmation not given here fails the test.
+    confirm: opts.confirm ?? (async (q: string) => { throw new Error(`unexpected confirmation: ${q}`); }),
   });
   return { code, out, err };
 }
@@ -1775,6 +1779,158 @@ test('shu-9bj.12: shukka deploy never deploys the CI stack, passes the project t
   assert.deepEqual(checked, [{ project: 'shukkatest' }]);
   const deploys = calls.filter((x) => isCdk(x, 'deploy')).map((x) => x.args.slice(x.args.indexOf('--no-color') + 1));
   assert.deepEqual(deploys, [['--exclusively', 'shukkatest-App', '--tags=Project=shukkatest', `--tags=shukka:revision=${sha}`]], 'the CI stack is neither deployed nor pulled in as a dependency');
-  assert.match(r.out + r.err, /not deploying Shukkatest-Ci: the CI stack is deployed by hand with admin credentials/);
-  assert.match(r.out, /guard: Shukkatest-Ci changes, and the pipeline never deploys it: an admin deploys it by hand/);
+  assert.match(r.out + r.err, /not deploying Shukkatest-Ci: an admin deploys the CI stack with shukka deploy-ci shukkatest/);
+  assert.match(r.out, /guard: Shukkatest-Ci changes, and the pipeline never deploys it: an admin deploys it with shukka deploy-ci shukkatest/);
 }));
+
+// shu-ecn: the CI stack's admin deploy never runs the project's code with admin credentials.
+const CI_ARTIFACTS = (deps: string[] = ['Shukkatest-Ci.assets']) => ({
+  'Shukkatest-Ci.assets': { type: 'cdk:asset-manifest' },
+  'Shukkatest-Ci': { type: 'aws:cloudformation:stack', displayName: 'Shukkatest-Ci', properties: { tags: { Project: 'shukkatest' } }, dependencies: deps },
+  'shukkatest-App': { type: 'aws:cloudformation:stack', properties: { tags: { Project: 'shukkatest' } } },
+});
+const CI_DIFF = 'Stack Shukkatest-Ci\nResources\n[~] AWS::IAM::Role InfraRole InfraRoleABC\n\n✨  Number of stacks with differences: 1\n';
+
+test('shu-ecn: deploy-ci synthesizes in Docker without credentials, checks the assembly, and gives the admin profile only to shukka\'s cdk on that cdk.out, for the CI stack alone, from an empty directory', withTmp(async (tmp) => {
+  const { dir, sha } = consumer(tmp);
+  const { calls, spawn } = deploySpawn(CI_DIFF, bundleDir(tmp), 0, CI_ARTIFACTS());
+  const checked: unknown[] = [];
+  const checkAssembly = (_d: string, o?: unknown) => { checked.push(o); return []; };
+  const r = await cli(['deploy-ci', 'shukkatest', '--profile', 'admin', '--yes'], { cwd: dir, spawn, aws: fakeAws().aws, checkAssembly });
+  assert.equal(r.code, 0, r.out + r.err);
+  assert.deepEqual(checked, [{ project: 'shukkatest' }], 'assembly.mjs check --project');
+  assert.match(r.out, /policy-guard: no trust or resource policy lets a principal outside the project in/);
+  const synth = calls.find((x) => x.cmd === 'npx' && x.args.includes('synth'))!;
+  assert.ok(synth.options.docker, 'cdk synth runs in a container');
+  assert.ok(!synth.options.docker.join(' ').includes('admin'), 'no profile reaches the container');
+  assert.ok(!Object.keys(synth.options.fullEnv).some((k) => k.startsWith('AWS_')), 'no AWS variable in the container');
+  assert.ok(!calls.some((x) => (x.cmd === 'npm' || x.cmd === 'npx') && !x.options.docker), 'no npm or npx on the host');
+  const cdks = calls.filter((x) => x.cmd === process.execPath);
+  assert.deepEqual(cdks.map((x) => x.args[1]), ['diff', 'deploy']);
+  const [diff, deploy] = cdks as [Call, Call];
+  const assemblyDir = diff.args[3]!;
+  assert.ok(assemblyDir.endsWith('cdk.out'), 'the checked assembly, never the project directory');
+  assert.equal(synth.args[synth.args.indexOf('--output') + 1], assemblyDir, 'the assembly the container wrote and the checks read');
+  assert.deepEqual(diff.args, [cdkBin(), 'diff', '--app', assemblyDir, '--exclusively', 'Shukkatest-Ci', '--no-color', '--profile', 'admin']);
+  assert.deepEqual(deploy.args, [cdkBin(), 'deploy', '--app', assemblyDir, 'Shukkatest-Ci', '--exclusively', '--require-approval', 'never', '--no-color', '--profile', 'admin']);
+  for (const c of cdks) {
+    assert.ok(!c.options.docker, 'cdk runs on the host with the admin profile');
+    assert.ok(!c.options.cwd.startsWith(dir) && readdirSync(c.options.cwd).length === 0, 'cdk runs from an empty directory, not the checkout');
+    assert.notEqual(c.options.env.HOME, homedir(), 'with an empty HOME');
+    assert.equal(readdirSync(c.options.env.HOME).length, 0);
+  }
+  assert.match(r.out, /\[~\] AWS::IAM::Role InfraRole/);
+  assert.match(r.out, /guard: nothing is deleted or replaced/);
+  assert.match(r.out, new RegExp(`Shukkatest-Ci deployed at ${sha}`));
+}));
+
+test('shu-ecn: deploy-ci asks before it deploys, refuses when the answer is no, and refuses without a terminal unless --yes', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  const questions: string[] = [];
+  let s = deploySpawn(CI_DIFF, bundleDir(tmp), 0, CI_ARTIFACTS());
+  let r = await cli(['deploy-ci', 'shukkatest', '--profile', 'admin'], { cwd: dir, spawn: s.spawn, aws: fakeAws().aws, checkAssembly: NO_ASSETS, confirm: async (q) => { questions.push(q); return false; } });
+  assert.equal(r.code, 1, r.out);
+  assert.match(questions.join('\n'), /Deploy Shukkatest-Ci .*profile admin/);
+  assert.match(r.err, /not deployed/);
+  assert.deepEqual(s.calls.filter((x) => x.cmd === process.execPath).map((x) => x.args[1]), ['diff'], 'the diff is shown, nothing deployed');
+
+  s = deploySpawn(CI_DIFF, bundleDir(tmp), 0, CI_ARTIFACTS());
+  r = await cli(['deploy-ci', 'shukkatest'], { cwd: dir, spawn: s.spawn, aws: fakeAws().aws, checkAssembly: NO_ASSETS, confirm: async () => true });
+  assert.equal(r.code, 0, r.out + r.err);
+  assert.deepEqual(s.calls.filter((x) => x.cmd === process.execPath).map((x) => x.args[1]), ['diff', 'deploy']);
+
+  // The default confirmation with no terminal on stdin: refused, with --yes named.
+  s = deploySpawn(CI_DIFF, bundleDir(tmp), 0, CI_ARTIFACTS());
+  r = await cli(['deploy-ci', 'shukkatest'], { cwd: dir, spawn: s.spawn, aws: fakeAws().aws, checkAssembly: NO_ASSETS, confirm: async () => confirmOnTerminal('q?', { isTTY: false } as any) });
+  assert.equal(r.code, 1);
+  assert.match(r.err, /no terminal to confirm on; read the diff and run again with --yes/);
+  assert.ok(!s.calls.some((x) => isCdk(x, 'deploy')));
+}));
+
+test('shu-ecn: deploy-ci needs the project named, and it must be shukka.json\'s', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  let r = await cli(['deploy-ci', '--yes'], { cwd: dir, aws: fakeAws().aws });
+  assert.equal(r.code, 2);
+  assert.match(r.err, /deploy-ci: give the project name/);
+  const s = deploySpawn(CI_DIFF, bundleDir(tmp), 0, CI_ARTIFACTS());
+  r = await cli(['deploy-ci', 'other', '--yes'], { cwd: dir, spawn: s.spawn, aws: fakeAws().aws, checkAssembly: NO_ASSETS });
+  assert.equal(r.code, 1);
+  assert.match(r.err, /shukka\.json on origin\/main is for project shukkatest, not other/);
+  assert.ok(!s.calls.some((x) => x.cmd === 'npx' || x.cmd === process.execPath), 'refused before anything is built');
+}));
+
+test('shu-ecn: deploy-ci refuses a CI stack that depends on another stack, a destructive diff, and runs no project code without Docker', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  for (const deps of [['shukkatest-App'], ['Shukkatest-Ci.assets', 'shukkatest-App']]) {
+    const { calls, spawn } = deploySpawn(CI_DIFF, bundleDir(tmp), 0, CI_ARTIFACTS(deps));
+    const r = await cli(['deploy-ci', 'shukkatest', '--profile', 'admin', '--yes'], { cwd: dir, spawn, aws: fakeAws().aws, checkAssembly: NO_ASSETS });
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.err, /Shukkatest-Ci depends on "shukkatest-App": the CI stack must depend on nothing but its own assets/);
+    assert.ok(!calls.some((x) => x.cmd === process.execPath), 'cdk never gets the admin credentials');
+  }
+  const destructive = 'Stack Shukkatest-Ci\nResources\n[-] AWS::IAM::Role InfraRole InfraRoleABC destroy\n\n✨  Number of stacks with differences: 1\n';
+  const d = deploySpawn(destructive, bundleDir(tmp), 0, CI_ARTIFACTS());
+  let r = await cli(['deploy-ci', 'shukkatest', '--yes'], { cwd: dir, spawn: d.spawn, aws: fakeAws().aws, checkAssembly: NO_ASSETS });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.err, /the guard stopped the CI stack deploy/);
+  assert.ok(!d.calls.some((x) => isCdk(x, 'deploy')));
+  const bad = deploySpawn(CI_DIFF, bundleDir(tmp), 0, CI_ARTIFACTS());
+  r = await cli(['deploy-ci', 'shukkatest', '--yes'], { cwd: dir, spawn: bad.spawn, aws: fakeAws().aws, checkAssembly: () => ['assembly: an asset runs a command'] });
+  assert.equal(r.code, 1);
+  assert.match(r.err, /an asset runs a command/);
+  assert.ok(!bad.calls.some((x) => x.cmd === process.execPath));
+  const noDocker = recordingSpawn(({ cmd }) => (cmd === 'docker' ? { status: 1, stdout: '' } : { status: 0, stdout: '' }));
+  r = await cli(['deploy-ci', 'shukkatest', '--yes'], { cwd: dir, spawn: noDocker.spawn, aws: fakeAws().aws, checkAssembly: NO_ASSETS });
+  assert.equal(r.code, 1);
+  assert.match(r.err, /Docker is not available\. deploy-ci runs the project's code .* only in a container/);
+  assert.ok(!noDocker.calls.some((x) => x.cmd === 'npx' || x.cmd === 'npm' || x.cmd === process.execPath), 'no project code on the host');
+}));
+
+test('shu-ecn: deploy-ci prints the CI stack\'s stored CloudFormation service role and refuses the project\'s fenced execution role', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  const exec = `arn:aws:iam::${ACCOUNT}:role/cdk-shukkatest-cfn-exec-role-${ACCOUNT}-us-east-1`;
+  const stack = (roleArn?: string) => fakeAws({ describeStack: async (name: string) => (name === 'Shukkatest-Ci' ? { name, outputs: {}, tags: {}, ...(roleArn ? { roleArn } : {}) } : null) });
+  let s = deploySpawn(CI_DIFF, bundleDir(tmp), 0, CI_ARTIFACTS());
+  let r = await cli(['deploy-ci', 'shukkatest', '--yes'], { cwd: dir, spawn: s.spawn, aws: stack(exec).aws, checkAssembly: NO_ASSETS });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.err, new RegExp(`Shukkatest-Ci keeps the project's execution role ${reEscape(exec)} as its CloudFormation service role`));
+  assert.match(r.err, /delete Shukkatest-Ci .* and run deploy-ci again/);
+  assert.ok(!s.calls.some((x) => isCdk(x, 'deploy')), 'never deployed');
+
+  s = deploySpawn(CI_DIFF, bundleDir(tmp), 0, CI_ARTIFACTS());
+  r = await cli(['deploy-ci', 'shukkatest', '--yes'], { cwd: dir, spawn: s.spawn, aws: stack(`arn:aws:iam::${ACCOUNT}:role/cfn-admin`).aws, checkAssembly: NO_ASSETS });
+  assert.equal(r.code, 0, r.out + r.err);
+  assert.match(r.err, /Shukkatest-Ci keeps arn:aws:iam::123456789012:role\/cfn-admin as its CloudFormation service role: CloudFormation updates it as that role, not with your credentials/);
+
+  s = deploySpawn(CI_DIFF, bundleDir(tmp), 0, CI_ARTIFACTS());
+  r = await cli(['deploy-ci', 'shukkatest', '--yes'], { cwd: dir, spawn: s.spawn, aws: stack().aws, checkAssembly: NO_ASSETS });
+  assert.equal(r.code, 0, r.out + r.err);
+  assert.match(r.out, /Shukkatest-Ci has no stored service role: CloudFormation acts with your credentials/);
+
+  s = deploySpawn(CI_DIFF, bundleDir(tmp), 0, CI_ARTIFACTS());
+  r = await cli(['deploy-ci', 'shukkatest', '--yes'], { cwd: dir, spawn: s.spawn, aws: fakeAws().aws, checkAssembly: NO_ASSETS });
+  assert.equal(r.code, 0, r.out + r.err);
+  assert.match(r.out, /Shukkatest-Ci does not exist yet: CloudFormation creates it with your credentials/);
+}));
+
+test('shu-ecn: deploy, the guard and the help point the admin at shukka deploy-ci, never at npx cdk in the checkout', async () => {
+  const r = await cli(['--help']);
+  assert.match(r.out, /deploy-ci <project>/);
+  assert.doesNotMatch(r.out, /npx cdk deploy/);
+  assert.equal(adminNotice('Stack Shukkatest-Ci\nResources\n[~] AWS::IAM::Role R R1\n', 'shukkatest'),
+    'guard: Shukkatest-Ci changes, and the pipeline never deploys it: an admin deploys it with shukka deploy-ci shukkatest (README step 5)\n');
+});
+
+test('shu-ecn: describeStack returns the RoleARN CloudFormation keeps for a stack', async () => {
+  const send = CloudFormationClient.prototype.send;
+  let role: string | undefined = 'arn:aws:iam::123456789012:role/cfn-admin';
+  CloudFormationClient.prototype.send = (async () => ({ Stacks: [{ StackStatus: 'UPDATE_COMPLETE', Outputs: [], Tags: [], ...(role ? { RoleARN: role } : {}) }] })) as any;
+  try {
+    const aws = realAws({ region: 'us-east-1', io: {} as any });
+    assert.equal((await aws.describeStack('Shukkatest-Ci'))?.roleArn, role);
+    role = undefined;
+    assert.equal((await aws.describeStack('Shukkatest-Ci'))?.roleArn, undefined);
+  } finally {
+    CloudFormationClient.prototype.send = send;
+  }
+});

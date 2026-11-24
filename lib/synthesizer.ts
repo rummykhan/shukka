@@ -26,8 +26,10 @@ export function shukkaSynthesizer(qualifier: string): DefaultStackSynthesizer {
  * The execution role may never change the CI roles (the fence's NoChangeToCiRoles: a merge must not re-trust or widen
  * the roles the pipeline runs as), so the CI stack cannot deploy through it: CloudFormation would create the roles and
  * then be refused their inline policies. This synthesizer names no deploy role and no execution role, so `cdk deploy`
- * runs CloudFormation with the caller's own credentials: an admin's, by hand (README step 5). The template is
- * published to the project's bootstrap bucket with those credentials too. The pipeline and `shukka deploy` never
+ * runs CloudFormation with the caller's own credentials: an admin's, through `shukka deploy-ci` (README step 5), which
+ * synthesizes in a container and hands cdk only the checked assembly. The template is published to the project's
+ * bootstrap bucket with those credentials too. A stack that already keeps a CloudFormation service role is still
+ * updated as that role (CloudFormation reuses it); deploy-ci prints it. The pipeline and `shukka deploy` never
  * deploy this stack (scripts/assembly.mjs deployCommands); scripts/assembly.mjs refuses this kind of stack under any
  * other name.
  *

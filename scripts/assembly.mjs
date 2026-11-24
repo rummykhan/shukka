@@ -28,7 +28,7 @@
 //
 // With --project (the workflows and `shukka deploy` always pass it), every stack must also deploy through the
 // project's bootstrap (a deploy role and an execution role in its manifest entry): only the top-level stack named
-// <Project>-Ci may name neither (shukkaCiSynthesizer: deployed by hand with admin credentials, never by the pipeline;
+// <Project>-Ci may name neither (shukkaCiSynthesizer: an admin deploys it with `shukka deploy-ci`, never the pipeline;
 // deployCommands leaves it out).
 //
 // CLI:
@@ -200,8 +200,8 @@ function inside(root, base, path) {
 
 /**
  * The name of a project's CI stack, the one holding ShukkaAccess: `<Project>-Ci` (the project name capitalised, as
- * ShukkaAccess names its stacks' prefix). It is deployed by hand with admin credentials (lib/synthesizer.ts
- * shukkaCiSynthesizer), never by the pipeline or `shukka deploy`.
+ * ShukkaAccess names its stacks' prefix). An admin deploys it with `shukka deploy-ci` and their own credentials
+ * (lib/synthesizer.ts shukkaCiSynthesizer), never the pipeline or `shukka deploy`.
  * @param {string} project
  * @returns {string}
  */
@@ -222,8 +222,8 @@ function cfnName(id, artifact) {
 /**
  * Problems with how a stack deploys. Every stack deploys through the project's bootstrap: cdk assumes a deploy role
  * and CloudFormation runs as the execution role (shukkaSynthesizer). The one exception is the top-level stack named
- * `<project's>-Ci`, which may name neither (shukkaCiSynthesizer: an admin deploys it by hand with their own
- * credentials); the pipeline and `shukka deploy` leave it out (deployCommands).
+ * `<project's>-Ci`, which may name neither (shukkaCiSynthesizer: an admin deploys it with `shukka deploy-ci` and their
+ * own credentials); the pipeline and `shukka deploy` leave it out (deployCommands).
  * @param {string} id
  * @param {any} artifact
  * @param {string} where
@@ -248,7 +248,7 @@ export function synthesizerProblems(id, artifact, where, { project, topLevel }) 
  * The cdk deploy argument lists the pipeline (infra.yml) and `shukka deploy` run for an assembly's top-level stacks,
  * with the shukka:revision tag: one `--all` when every stack has the same tags, otherwise each stack alone
  * (`--exclusively`) after its dependencies, so each keeps its own tags. The CI stack (ciStackName) is left out: it is
- * deployed by hand with admin credentials. When it is in the assembly, the stacks are named with `--exclusively`
+ * deployed by an admin with `shukka deploy-ci` (ciStackPlan). When it is in the assembly, the stacks are named with `--exclusively`
  * instead of `--all`, so cdk neither deploys it nor pulls it in as a dependency.
  * Throws when a stack selector could be read as a cdk option.
  * @param {Record<string, any>} artifacts the top-level manifest's artifacts
@@ -295,6 +295,39 @@ export function deployCommands(artifacts, project, sha) {
   };
   for (const [id] of stacks) visit(id);
   return { commands, skipped };
+}
+
+/**
+ * The CI stack as `shukka deploy-ci` deploys it with admin credentials: the top-level stack named ciStackName(project),
+ * synthesized with shukkaCiSynthesizer (no deploy or execution role), depending on nothing but its own asset manifest.
+ * A dependency on another stack is refused, not just left out: the admin deploys exactly one stack, with
+ * `--exclusively`, and a CI stack that needs another stack (or another stack's assets) first is not one shukka deploys.
+ * @param {Record<string, any>} artifacts the top-level manifest's artifacts
+ * @param {string} project
+ * @returns {{ selector: string | null, problems: string[] }}
+ */
+export function ciStackPlan(artifacts, project) {
+  const ci = ciStackName(project);
+  const found = Object.entries(artifacts).filter(([id, a]) => a?.type === 'aws:cloudformation:stack' && cfnName(id, a) === ci);
+  if (found.length !== 1) {
+    return { selector: null, problems: [found.length === 0 ? `the app has no stack named ${ci}` : `the app has ${found.length} stacks named ${ci}`] };
+  }
+  const [id, a] = /** @type {[string, any]} */ (found[0]);
+  const selector = a.displayName ?? id;
+  /** @type {string[]} */
+  const problems = [];
+  if (typeof selector !== 'string' || !SELECTOR.test(selector)) problems.push(`refusing stack selector ${JSON.stringify(selector)}: it could be read as a cdk option`);
+  const props = a.properties ?? {};
+  if (props.assumeRoleArn !== undefined || props.cloudFormationExecutionRoleArn !== undefined) {
+    problems.push(`${ci} names a deploy or execution role: synthesize it with shukkaCiSynthesizer, so CloudFormation acts with your admin credentials (the execution role may not change the CI roles)`);
+  }
+  for (const dep of Array.isArray(a.dependencies) ? a.dependencies : []) {
+    // Its own asset manifest only (`<id>.assets`, as CDK names it): another's would be published with admin credentials.
+    if (dep !== `${id}.assets` || artifacts[dep]?.type !== 'cdk:asset-manifest') {
+      problems.push(`${ci} depends on ${JSON.stringify(dep)}: the CI stack must depend on nothing but its own assets (only it is deployed with admin credentials); refused`);
+    }
+  }
+  return { selector: problems.length === 0 ? selector : null, problems };
 }
 
 /**

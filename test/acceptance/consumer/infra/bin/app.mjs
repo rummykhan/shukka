@@ -34,7 +34,7 @@ if (existsSync(new URL('probe.on', infraDir))) {
 const app = new App();
 const stackEnv = { account: env.account, region: env.region };
 
-// The CI stack is deployed by hand with admin credentials (setup_ci_stack), never by the pipeline (shu-9bj.12).
+// The CI stack is deployed with shukka deploy-ci and admin credentials (setup_ci_stack), never by the pipeline (shu-9bj.12).
 new CiStack(app, 'Shukkatest-Ci', { env: stackEnv, synthesizer: shukkaCiSynthesizer('shukkatest'), shukkatest: env });
 new BoxStack(app, 'Shukkatest-Box', { env: stackEnv, synthesizer: shukkaSynthesizer('shukkatest'), shukkatest: env, settings });
 if (settings.escape === true) {

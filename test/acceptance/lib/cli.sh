@@ -1,6 +1,6 @@
 # shellcheck shell=bash
 # How the suite calls the shukka CLI (C7). The design names the commands (`bootstrap --account`,
-# `bootstrap <project>`, `diff`, `deploy`, run with `npx github:rummykhan/shukka#<tag>`) but not every
+# `bootstrap <project>`, `diff`, `deploy`, `deploy-ci <project>`, run with `npx github:rummykhan/shukka#<tag>`) but not every
 # flag. The flags below are the suite's reading and are the only place they appear; they were asked
 # on shu-5ix's mailbox. Change them here, nowhere else.
 
@@ -27,4 +27,11 @@ cli_deploy() { # consumer-dir [extra args...]
   local dir=$1
   shift
   (cd "$dir" && shukka deploy --profile "$AWS_PROFILE" "$@")
+}
+
+# The CI stack with admin credentials (README step 5). Run inside a clean clone at origin/main.
+cli_deploy_ci() { # consumer-dir [extra args...]
+  local dir=$1
+  shift
+  (cd "$dir" && shukka deploy-ci "$PROJECT" --profile "$AWS_PROFILE" --region "$AWS_REGION" "$@")
 }

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { checkAssembly, ciStackName, deployCommands, main, stackNames } from '../scripts/assembly.mjs';
+import { checkAssembly, ciStackName, ciStackPlan, deployCommands, main, stackNames } from '../scripts/assembly.mjs';
 
 const scratch = mkdtempSync(join(tmpdir(), 'shu-9zr-assembly-'));
 after(() => rmSync(scratch, { recursive: true, force: true }));
@@ -289,4 +289,21 @@ test('shu-9bj.12: deployCommands leaves the CI stack out and never lets cdk pull
   // The CI stack is matched by CloudFormation name, not by artifact id.
   assert.deepEqual(deployCommands({ X: { type: 'aws:cloudformation:stack', properties: { stackName: 'Shukkatest-Ci' } } }, 'shukkatest', 'abc').skipped, ['X']);
   assert.throws(() => deployCommands({ '--plugin=x': { type: 'aws:cloudformation:stack' } }, 'shukkatest', 'abc'), /could be read as a cdk option/);
+});
+
+test('shu-ecn: ciStackPlan deploys exactly <Project>-Ci, synthesized for the caller\'s credentials and depending on nothing but its own assets', () => {
+  const stack = (extra: Loose = {}) => ({ type: 'aws:cloudformation:stack', displayName: 'Shukkatest-Ci', properties: {}, dependencies: ['Shukkatest-Ci.assets'], ...extra });
+  const base = { 'Shukkatest-Ci.assets': { type: 'cdk:asset-manifest' }, 'Shukkatest-Box.assets': { type: 'cdk:asset-manifest' }, 'Shukkatest-Box': { type: 'aws:cloudformation:stack', properties: ROLES } };
+  assert.deepEqual(ciStackPlan({ ...base, 'Shukkatest-Ci': stack() }, 'shukkatest'), { selector: 'Shukkatest-Ci', problems: [] });
+  assert.deepEqual(ciStackPlan({ ...base, 'Shukkatest-Ci': stack({ dependencies: [] }) }, 'shukkatest').problems, []);
+  const refused = (artifacts: Loose, re: RegExp) => {
+    const plan = ciStackPlan(artifacts, 'shukkatest');
+    assert.equal(plan.selector, null);
+    assert.match(plan.problems.join('\n'), re);
+  };
+  refused({ ...base, 'Shukkatest-Ci': stack({ dependencies: ['Shukkatest-Ci.assets', 'Shukkatest-Box'] }) }, /depends on "Shukkatest-Box": the CI stack must depend on nothing but its own assets/);
+  refused({ ...base, 'Shukkatest-Ci': stack({ dependencies: ['Shukkatest-Box.assets'] }) }, /depends on "Shukkatest-Box.assets"/);
+  refused({ ...base, 'Shukkatest-Ci': stack({ properties: ROLES }) }, /names a deploy or execution role: synthesize it with shukkaCiSynthesizer/);
+  refused(base, /the app has no stack named Shukkatest-Ci/);
+  refused({ ...base, 'Shukkatest-Ci': stack({ displayName: '--plugin=x' }) }, /could be read as a cdk option/);
 });

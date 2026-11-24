@@ -296,7 +296,7 @@ function withGh(
     writeFileSync(join(dir, 'gh.log'), '');
     if (runs) writeFileSync(join(dir, 'runs'), JSON.stringify(runs));
     // The consumer working copy and its push are stubbed: c_git only records what it was asked to do.
-    const fakes = `clean_consumer_github() { :; }; require_consumer_remote() { :; }; commit_all() { printf '%s\\n' ${SHA}; }; c_git() { printf 'gh-stub-git %s\\n' "$*" >>"$STUB_DIR/gh.log"; }`;
+    const fakes = `clean_consumer_github() { :; }; require_consumer_remote() { :; }; commit_all() { printf '%s\\n' ${SHA}; }; c_git() { printf 'gh-stub-git %s\\n' "$*" >>"$STUB_DIR/gh.log"; if [[ "$1" == rev-parse ]]; then printf '%s\\n' ${SHA}; fi; }`;
     const r = spawnSync(
       'bash',
       ['-c', `set -uo pipefail; source "${lib}/common.sh"; source "${lib}/setup.sh"; ${fakes}; ${script}`],
@@ -811,4 +811,30 @@ test('shu-9bj.21: the R8 CLI rollback case fails when shukka deploy released not
   assert.doesNotMatch(none.stderr, /ok - web current\/REVISION is the previous release/);
   const rolled = runCase(body, `${st}; printf 'shukka: shukkatest/web ${OLD} -> ${NEW} rolled-back\\n' >"$RUN_DIR/runs/cli-unhealthy.log"`);
   assert.equal(rolled.status, 0, rolled.stderr);
+});
+
+test('shu-ecn: setup_ci_stack pushes the baseline with the caller disabled, then deploys the CI stack with shukka deploy-ci, never npm ci or npx cdk with the admin profile', () => {
+  // Every outside command is a function that logs one line: npm, the shukka CLI, gh, the consumer's git.
+  const fakes = [
+    'L() { printf \'%s\\n\' "$*" >>"$STUB_DIR/cmds.log"; }',
+    'npm() { L "npm $*"; }', 'npx() { L "npx $*"; }', 'shukka() { L "shukka $*"; }', 'gh() { L "gh $*"; }',
+    'c_git() { L "git $*"; if [[ "$1" == rev-parse ]]; then echo ' + SHA + '; fi; }',
+    'commit_all() { L "commit_all $1"; echo ' + SHA + '; }', 'clean_consumer_github() { L clean; }', 'require_consumer_remote() { :; }',
+    'enable_workflow() { L "enable $1"; }', 'wait_run_of() { echo 1; }',
+  ].join('; ');
+  const cli = resolve(lib, 'cli.sh');
+  const r = withStubs(`source "${cli}"; ${fakes}; mkdir -p "$RUN_DIR/consumer/infra"; RUN_ID=1 AWS_REGION=us-east-1 SHUKKA_REPO=x RC_TAG=v1.0.0-rc.1; setup_ci_stack && setup_push_baseline; cat "$STUB_DIR/cmds.log"`);
+  assert.equal(r.status, 0, r.stderr);
+  const lines = r.stdout.trim().split('\n');
+  const at = (re: RegExp) => lines.findIndex((l) => re.test(l));
+  assert.ok(at(/^npm install --package-lock-only --ignore-scripts /) >= 0, 'the lockfile is resolved without install scripts');
+  assert.ok(!lines.some((l) => /^npm (ci|install)(?!.*--ignore-scripts)/.test(l) || /^npx /.test(l)), `no npm ci or npx cdk here: ${lines.join(' | ')}`);
+  const disable = at(/^gh workflow disable CI /);
+  const push = at(/^git push -q --force origin HEAD:main$/);
+  const deploy = at(/^shukka deploy-ci shukkatest --profile stub --region us-east-1 --yes$/);
+  assert.ok(disable >= 0 && push > disable && deploy > push, `disable, push the baseline, then deploy-ci: ${lines.join(' | ')}`);
+  const first = at(/^git commit -q --allow-empty -m shukkatest 1: first merge$/);
+  const enable = at(/^enable CI$/);
+  const firstPush = at(/^git push -q origin HEAD:main$/);
+  assert.ok(first > deploy && enable > first && firstPush > enable, 'the first merge is pushed after the CI stack, with the caller enabled');
 });

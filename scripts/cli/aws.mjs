@@ -24,7 +24,7 @@ import { GetParameterCommand, SSMClient } from '@aws-sdk/client-ssm';
 import { CliError } from './exec.mjs';
 
 /**
- * @typedef {{ name: string, outputs: Record<string, string>, tags: Record<string, string> }} StackInfo
+ * @typedef {{ name: string, outputs: Record<string, string>, tags: Record<string, string>, roleArn?: string }} StackInfo roleArn: the service role CloudFormation keeps for the stack (RoleARN)
  * @typedef {{ kind: string, typeName: string, executionRoleArn: string | null }} PrivateType
  * @typedef {{ roleName: string, arn: string, boundaryArn?: string }} UnboundedRole
  * @typedef {{ send(command: any): Promise<any> }} Client
@@ -119,6 +119,7 @@ export function realAws({ profile, region, io }) {
           name,
           outputs: Object.fromEntries((s.Outputs ?? []).map((/** @type {any} */ o) => [o.OutputKey, o.OutputValue])),
           tags: Object.fromEntries((s.Tags ?? []).map((/** @type {any} */ t) => [t.Key, t.Value])),
+          ...(typeof s.RoleARN === 'string' && s.RoleARN !== '' ? { roleArn: s.RoleARN } : {}),
         };
       } catch (error) {
         if (notFound(error)) return null;

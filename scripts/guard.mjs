@@ -95,7 +95,7 @@ export function stackDiffers(diff, name) {
 export function adminNotice(diff, project) {
   const ci = ciStackName(project);
   if (!stackDiffers(diff, ci)) return '';
-  return `guard: ${ci} changes, and the pipeline never deploys it: an admin deploys it by hand (npx cdk deploy ${ci} with admin credentials, README step 5)\n`;
+  return `guard: ${ci} changes, and the pipeline never deploys it: an admin deploys it with shukka deploy-ci ${project} (README step 5)\n`;
 }
 
 /**
