@@ -542,9 +542,9 @@ test('shu-5ix: deploy dry run prints the workflow steps in order: checks, build,
     /^node scripts\/assembly\.mjs check \S+ --project shukkatest$/,
     new RegExp(`^node scripts/policy-guard\\.mjs \\S+ --account ${ACCOUNT} --mail-domain example\\.com$`),
     new RegExp(`^assume arn:aws:iam::${ACCOUNT}:role/cdk-shukkatest-deploy-role-${ACCOUNT}-us-east-1 as shukka-emergency; cdk gets only that session$`),
-    new RegExp(`^${reEscape(CDK)} diff --app \\S+ --no-color$`),
+    new RegExp(`^${reEscape(CDK)} diff --app \\S+ --no-color --parameters BootstrapVersion=/cdk-bootstrap/shukkatest/version$`),
     /^node scripts\/guard\.mjs < the diff$/,
-    new RegExp(`^${reEscape(CDK)} deploy --app \\S+ --require-approval never --no-color --all --tags=shukka:revision=${sha}$`),
+    new RegExp(`^${reEscape(CDK)} deploy --app \\S+ --require-approval never --no-color --parameters BootstrapVersion=/cdk-bootstrap/shukkatest/version --all --tags=shukka:revision=${sha}$`),
     new RegExp(`^upload .* to s3://shukkatest-deploy-${ACCOUNT}/shukkatest/web/${sha}\\.tgz \\(scripts/upload\\.mjs\\)$`),
     new RegExp(`^release shukkatest/web ${sha} on instances tagged Project=shukkatest \\(scripts/release\\.mjs\\)$`),
     new RegExp(`^${box}bash -c 'bash smoke\\.sh'$`),
@@ -1779,7 +1779,7 @@ test('shu-9bj.12: shukka deploy never deploys the CI stack, passes the project t
   assert.equal(r.code, 0, r.out + r.err);
   assert.deepEqual(checked, [{ project: 'shukkatest' }]);
   const deploys = calls.filter((x) => isCdk(x, 'deploy')).map((x) => x.args.slice(x.args.indexOf('--no-color') + 1));
-  assert.deepEqual(deploys, [['--exclusively', 'shukkatest-App', '--tags=Project=shukkatest', `--tags=shukka:revision=${sha}`]], 'the CI stack is neither deployed nor pulled in as a dependency');
+  assert.deepEqual(deploys, [['--parameters', 'BootstrapVersion=/cdk-bootstrap/shukkatest/version', '--exclusively', 'shukkatest-App', '--tags=Project=shukkatest', `--tags=shukka:revision=${sha}`]], 'the CI stack is neither deployed nor pulled in as a dependency');
   assert.match(r.out + r.err, /not deploying Shukkatest-Ci: an admin deploys the CI stack with shukka deploy-ci shukkatest/);
   assert.match(r.out, /guard: Shukkatest-Ci changes, and the pipeline never deploys it: an admin deploys it with shukka deploy-ci shukkatest/);
 }));
@@ -2092,3 +2092,42 @@ test('shu-ik0: bootstrap --account refuses --bound-existing-roles, and --help do
   assert.match(r.err, /--bound-existing-roles is for a project bootstrap/);
   assert.match(helpText(), /--bound-existing-roles/);
 });
+
+// shu-r5f: shukka diff and deploy point every stack's BootstrapVersion at the project's bootstrap (the qualifier from
+// shukka.json), so a stack first deployed through CDK's default bootstrap moves to the project's.
+test('shu-r5f: shukka diff and deploy pass --parameters BootstrapVersion=/cdk-bootstrap/<qualifier>/version to cdk diff and cdk deploy', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp, (c) => { c.qualifier = 'shukq'; });
+  const param = ['--parameters', 'BootstrapVersion=/cdk-bootstrap/shukq/version'];
+  const bundle = bundleDir(tmp);
+  const d = deploySpawn(CLEAN_DIFF, bundle);
+  const c = releaseClients();
+  const r = await cli(['deploy', '--profile', 'stelking'], { cwd: dir, spawn: d.spawn, aws: awsWith(c).aws, checkAssembly: NO_ASSETS });
+  assert.equal(r.code, 0, r.out + r.err);
+  const diff = d.calls.find((x) => isCdk(x, 'diff'))!;
+  assert.deepEqual(diff.args.slice(diff.args.indexOf('--no-color') + 1), param, 'the diff uses the deploy\'s parameter');
+  const deploys = d.calls.filter((x) => isCdk(x, 'deploy'));
+  assert.ok(deploys.length > 0);
+  for (const x of deploys) {
+    const rest = x.args.slice(x.args.indexOf('--no-color') + 1);
+    assert.deepEqual(rest.slice(0, 2), param, x.args.join(' '));
+  }
+
+  const s = deploySpawn(CLEAN_DIFF, '');
+  const only = await cli(['diff', '--profile', 'stelking'], { cwd: dir, spawn: s.spawn, checkAssembly: NO_ASSETS });
+  assert.equal(only.code, 0, only.err);
+  const x = s.calls.find((y) => isCdk(y, 'diff'))!;
+  assert.deepEqual(x.args.slice(x.args.indexOf('--no-color') + 1), param);
+}));
+
+test('shu-r5f: a qualifier that is not ^[a-z0-9]{1,10}$ is refused before any cdk argument is built', withTmp(async (tmp) => {
+  for (const bad of ['--plugin=/tmp/evil.cjs', 'Shukq', 'abcdefghijk']) {
+    const sub = join(tmp, String(bad.length));
+    mkdirSync(sub);
+    const { dir } = consumer(sub, (c) => { c.qualifier = bad; });
+    const s = deploySpawn(CLEAN_DIFF, '');
+    const r = await cli(['diff', '--profile', 'stelking'], { cwd: dir, spawn: s.spawn, checkAssembly: NO_ASSETS });
+    assert.notEqual(r.code, 0, `${bad}: ${r.out}`);
+    assert.match(r.err, /qualifier/);
+    assert.ok(!s.calls.some((y) => isCdk(y, 'diff') || isCdk(y, 'deploy')), `${bad}: cdk never ran`);
+  }
+}));

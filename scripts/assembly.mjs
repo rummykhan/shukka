@@ -46,6 +46,24 @@ import { fileURLToPath } from 'node:url';
 export const SELECTOR = /^[A-Za-z0-9][A-Za-z0-9/_.-]*$/;
 /** A CloudFormation stack name. */
 export const STACK_NAME = /^[A-Za-z][A-Za-z0-9-]{0,127}$/;
+/** A CDK bootstrap qualifier, as in shukka.json's schema (and lib/boundary.ts). */
+export const QUALIFIER = /^[a-z0-9]{1,10}$/;
+
+/**
+ * The cdk options that point every deployed stack's BootstrapVersion parameter at the project's own bootstrap.
+ * cdk deploy keeps a stack's previous parameter values, so a stack first deployed through CDK's default bootstrap
+ * would go on reading /cdk-bootstrap/hnb659fds/version, which the project's execution role may not read. The
+ * unprefixed key applies to every selected stack (every shukkaSynthesizer stack declares BootstrapVersion). Throws
+ * when the qualifier is not a valid one, so nothing else can become a cdk argument.
+ * @param {string} qualifier
+ * @returns {string[]}
+ */
+export function bootstrapVersionArgs(qualifier) {
+  if (typeof qualifier !== 'string' || !QUALIFIER.test(qualifier)) {
+    throw new Error(`shukka: qualifier ${JSON.stringify(qualifier)} must match ${QUALIFIER}`);
+  }
+  return ['--parameters', `BootstrapVersion=/cdk-bootstrap/${qualifier}/version`];
+}
 // CloudFormation's tag characters, with only plain spaces (no line or paragraph separators).
 const TAG_CHARS = /^[\p{L}\p{Zs}\p{N}_.:/=+\-@]*$/u;
 

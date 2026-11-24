@@ -469,8 +469,8 @@ interface StepResult { code: number; out: string; outputs: Record<string, string
  * its env: values; every ${{ }} in them must be given in `exprs`.
  */
 async function runStep(ws: Workspace, doc: Loose, jobId: string, name: string, given: Record<string, string>, extraEnv: Record<string, string> = {}): Promise<StepResult> {
-  // The project of fixtureConfig, as the jobs' "Read shukka.json" step outputs it.
-  const exprs: Record<string, string> = { 'steps.config.outputs.project': 'shukkatest', ...given };
+  // The project and qualifier of fixtureConfig, as the jobs' "Read shukka.json" step outputs them.
+  const exprs: Record<string, string> = { 'steps.config.outputs.project': 'shukkatest', 'steps.config.outputs.qualifier': 'shukkatest', ...given };
   const s = step(doc, jobId, name);
   const env: Record<string, string> = {};
   for (const [key, value] of Object.entries((s.env ?? {}) as Record<string, string>)) {
@@ -645,7 +645,7 @@ test('shu-9zr: infra deploy writes ### Infrastructure changes and ### Guard, pri
   const ws = workspace();
   const r = await runStep(ws, infra, 'deploy', 'Diff and guard', deployExprs('false', 'push'), { FAKE_DIFF: diffFixture('removed.txt') });
   assert.equal(r.code, 1, r.out);
-  assert.deepEqual(r.cdk, [`diff --app ${ws.temp}/cdk.out --no-color`], 'shukka\'s cdk on the synthesized assembly');
+  assert.deepEqual(r.cdk, [`diff --app ${ws.temp}/cdk.out --no-color --parameters BootstrapVersion=/cdk-bootstrap/shukkatest/version`], 'shukka\'s cdk on the synthesized assembly');
   const printed = lines(r.out);
   const header = printed.indexOf('guard: these changes delete or replace a resource:');
   assert.ok(header >= 0, r.out);
@@ -689,13 +689,13 @@ test('shu-9zr: infra deploy tags every stack shukka:revision=<sha>, keeping each
   assert.equal(same.code, 0, same.out);
   assert.equal(same.outputs.deployed, 'true');
   // shu-9bj.12: the CI stack is never deployed by the pipeline, so the others are named (--exclusively), not --all.
-  assert.deepEqual(same.cdk, [`deploy --app ${assembly} --require-approval never --no-color --exclusively Shukkatest-Box --tags=Project=shukkatest --tags=shukka:revision=${head}`]);
+  assert.deepEqual(same.cdk, [`deploy --app ${assembly} --require-approval never --no-color --parameters BootstrapVersion=/cdk-bootstrap/shukkatest/version --exclusively Shukkatest-Box --tags=Project=shukkatest --tags=shukka:revision=${head}`]);
 
   writeFileSync(join(assembly, 'manifest.json'), manifest((id) => ({ Project: 'shukkatest', Part: id })));
   const each = await runStep(ws, infra, 'deploy', 'Deploy', {});
   assert.equal(each.code, 0, each.out);
   assert.deepEqual(each.cdk, [
-    `deploy --app ${assembly} --require-approval never --no-color --exclusively Shukkatest-Box --tags=Project=shukkatest --tags=Part=Box --tags=shukka:revision=${head}`,
+    `deploy --app ${assembly} --require-approval never --no-color --parameters BootstrapVersion=/cdk-bootstrap/shukkatest/version --exclusively Shukkatest-Box --tags=Project=shukkatest --tags=Part=Box --tags=shukka:revision=${head}`,
   ], 'dependencies first; never the CI stack');
 
   const failed = await runStep(ws, infra, 'deploy', 'Deploy', {}, { FAKE_DEPLOY_STATUS: '1' });
@@ -707,7 +707,7 @@ test('shu-9zr: the pull-request diff uses --method=template, never fails for a d
   const ws = workspace();
   const r = await runStep(ws, infra, 'diff', 'Diff and guard', {}, { FAKE_DIFF: diffFixture('removed.txt') });
   assert.equal(r.code, 0, r.out);
-  assert.deepEqual(r.cdk, [`diff --app ${ws.temp}/cdk.out --no-color --method=template`]);
+  assert.deepEqual(r.cdk, [`diff --app ${ws.temp}/cdk.out --no-color --method=template --parameters BootstrapVersion=/cdk-bootstrap/shukkatest/version`]);
   const out = join(ws.temp, 'shukka-pr-diff');
   assert.equal(readFileSync(join(out, 'guard-status'), 'utf8').trim(), '1');
   assert.match(readFileSync(join(out, 'diff.txt'), 'utf8'), /GoneRetain/);
@@ -1043,7 +1043,7 @@ test('shu-9bj.12: infra deploy never deploys <Project>-Ci, checks every other st
   }));
   const r = await runStep(ws, infra, 'deploy', 'Deploy', {});
   assert.equal(r.code, 0, r.out);
-  assert.deepEqual(r.cdk, [`deploy --app ${assembly} --require-approval never --no-color --exclusively Shukkatest-Box --tags=Project=shukkatest --tags=shukka:revision=${head}`]);
+  assert.deepEqual(r.cdk, [`deploy --app ${assembly} --require-approval never --no-color --parameters BootstrapVersion=/cdk-bootstrap/shukkatest/version --exclusively Shukkatest-Box --tags=Project=shukkatest --tags=shukka:revision=${head}`]);
   assert.match(r.out, /::notice::shukka: not deploying Shukkatest-Ci: an admin deploys the CI stack with shukka deploy-ci shukkatest/);
   writeFileSync(join(assembly, 'manifest.json'), JSON.stringify({ artifacts: { 'Shukkatest-Ci': { type: 'aws:cloudformation:stack', properties: { tags } } } }));
   const only = await runStep(ws, infra, 'deploy', 'Deploy', {});
@@ -1074,4 +1074,57 @@ test('shu-9bj.12: infra deploy never deploys <Project>-Ci, checks every other st
   const pr = await runStep(ws, infra, 'diff', 'Diff and guard', {}, { FAKE_DIFF: diffFile });
   assert.equal(pr.code, 0, pr.out);
   assert.match(readFileSync(join(ws.temp, 'shukka-pr-diff', 'guard.txt'), 'utf8'), /^guard: Shukkatest-Ci changes, and the pipeline never deploys it/m, 'the pull-request comment carries it');
+});
+
+// shu-r5f: cdk deploy keeps a stack's previous parameter values, so a stack first deployed through CDK's default
+// bootstrap keeps reading /cdk-bootstrap/hnb659fds/version; every diff and deploy names the project's own.
+const R5F_PARAM = '--parameters BootstrapVersion=/cdk-bootstrap/shukq/version';
+
+test('shu-r5f: infra deploy passes --parameters BootstrapVersion=/cdk-bootstrap/<qualifier>/version to every cdk deploy', async () => {
+  const ws = workspace();
+  const assembly = join(ws.temp, 'cdk.out');
+  mkdirSync(assembly);
+  const head = sh(ws.project, 'rev-parse', 'HEAD');
+  writeFileSync(join(assembly, 'manifest.json'), JSON.stringify({
+    artifacts: {
+      'Shukkatest-Box': { type: 'aws:cloudformation:stack', displayName: 'Shukkatest-Box', properties: { tags: { Project: 'shukkatest', Part: 'Box' } } },
+      'Shukkatest-Web': { type: 'aws:cloudformation:stack', displayName: 'Shukkatest-Web', properties: { tags: { Project: 'shukkatest', Part: 'Web' } }, dependencies: ['Shukkatest-Box'] },
+    },
+  }));
+  const r = await runStep(ws, infra, 'deploy', 'Deploy', { 'steps.config.outputs.qualifier': 'shukq' });
+  assert.equal(r.code, 0, r.out);
+  assert.deepEqual(r.cdk, [
+    `deploy --app ${assembly} --require-approval never --no-color ${R5F_PARAM} --exclusively Shukkatest-Box --tags=Project=shukkatest --tags=Part=Box --tags=shukka:revision=${head}`,
+    `deploy --app ${assembly} --require-approval never --no-color ${R5F_PARAM} --exclusively Shukkatest-Web --tags=Project=shukkatest --tags=Part=Web --tags=shukka:revision=${head}`,
+  ]);
+});
+
+test('shu-r5f: the deploy diff and the pull-request diff pass the same BootstrapVersion parameter as the deploy', async () => {
+  const ws = workspace();
+  const deploy = await runStep(ws, infra, 'deploy', 'Diff and guard', { ...deployExprs('false', 'push'), 'steps.config.outputs.qualifier': 'shukq' }, { FAKE_DIFF: diffFixture('same.txt') });
+  assert.equal(deploy.code, 0, deploy.out);
+  assert.deepEqual(deploy.cdk, [`diff --app ${ws.temp}/cdk.out --no-color ${R5F_PARAM}`]);
+  const pr = await runStep(ws, infra, 'diff', 'Diff and guard', { 'steps.config.outputs.qualifier': 'shukq' }, { FAKE_DIFF: diffFixture('same.txt') });
+  assert.equal(pr.code, 0, pr.out);
+  assert.deepEqual(pr.cdk, [`diff --app ${ws.temp}/cdk.out --no-color --method=template ${R5F_PARAM}`]);
+});
+
+test('shu-r5f: an invalid qualifier stops the diffs and the deploy before cdk runs', async () => {
+  const ws = workspace();
+  const assembly = join(ws.temp, 'cdk.out');
+  mkdirSync(assembly);
+  writeFileSync(join(assembly, 'manifest.json'), JSON.stringify({ artifacts: { 'Shukkatest-Box': { type: 'aws:cloudformation:stack', displayName: 'Shukkatest-Box', properties: { tags: { Project: 'shukkatest' } } } } }));
+  for (const bad of ['', 'Shukq', 'a b', 'x --plugin=/tmp/evil.cjs', 'q/../../x', 'abcdefghijk']) {
+    const q = { 'steps.config.outputs.qualifier': bad };
+    const runs = [
+      await runStep(ws, infra, 'deploy', 'Deploy', q),
+      await runStep(ws, infra, 'deploy', 'Diff and guard', { ...deployExprs('false', 'push'), ...q }, { FAKE_DIFF: diffFixture('same.txt') }),
+      await runStep(ws, infra, 'diff', 'Diff and guard', q, { FAKE_DIFF: diffFixture('same.txt') }),
+    ];
+    for (const r of runs) {
+      assert.notEqual(r.code, 0, `${JSON.stringify(bad)}: ${r.out}`);
+      assert.deepEqual(r.cdk, [], `${JSON.stringify(bad)}: cdk never ran`);
+      assert.match(r.out, /::error::shukka: .*qualifier/);
+    }
+  }
 });

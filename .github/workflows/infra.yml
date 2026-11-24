@@ -530,10 +530,16 @@ jobs:
           ALLOW_REPLACEMENT: ${{ inputs.allow_replacement }}
           EVENT_NAME: ${{ github.event_name }}
           PROJECT: ${{ steps.config.outputs.project }}
+          QUALIFIER: ${{ steps.config.outputs.qualifier }}
         run: |
           set +e -uo pipefail
+          # The deploy's BootstrapVersion parameter (scripts/assembly.mjs bootstrapVersionArgs), so the diff matches it.
+          if [[ ! "$QUALIFIER" =~ ^[a-z0-9]{1,10}$ ]]; then
+            echo "::error::shukka: the qualifier must match ^[a-z0-9]{1,10}\$"
+            exit 1
+          fi
           diff="$RUNNER_TEMP/shukka-diff.txt"
-          "$CDK" diff --app "$RUNNER_TEMP/cdk.out" --no-color 2>&1 | tee "$diff"
+          "$CDK" diff --app "$RUNNER_TEMP/cdk.out" --no-color --parameters "BootstrapVersion=/cdk-bootstrap/$QUALIFIER/version" 2>&1 | tee "$diff"
           diff_status=${PIPESTATUS[0]}
           node --input-type=module - "$diff" >>"$GITHUB_STEP_SUMMARY" <<'JS'
           import { readFileSync } from 'node:fs';
@@ -573,6 +579,7 @@ jobs:
         env:
           CDK: .shukka/node_modules/.bin/cdk
           PROJECT: ${{ steps.config.outputs.project }}
+          QUALIFIER: ${{ steps.config.outputs.qualifier }}
         run: |
           set -euo pipefail
           sha=$(git -C project rev-parse HEAD)
@@ -582,10 +589,12 @@ jobs:
           import { spawnSync } from 'node:child_process';
           import { pathToFileURL } from 'node:url';
           const [assembly, sha, script] = process.argv.slice(2);
-          const { deployCommands } = await import(pathToFileURL(script).href);
+          const { bootstrapVersionArgs, deployCommands } = await import(pathToFileURL(script).href);
           const { artifacts = {} } = JSON.parse(readFileSync(join(assembly, 'manifest.json'), 'utf8'));
           let plan;
+          let bootstrap;
           try {
+            bootstrap = bootstrapVersionArgs(process.env.QUALIFIER);
             plan = deployCommands(artifacts, process.env.PROJECT, sha);
           } catch (error) {
             console.log(`::error::shukka: ${error.message}`);
@@ -596,7 +605,7 @@ jobs:
           }
           if (plan.commands.length === 0) console.log(plan.skipped.length > 0 ? 'shukka: no stack to deploy but the CI stack' : 'shukka: the app has no stacks');
           for (const args of plan.commands) {
-            const r = spawnSync(process.env.CDK, ['deploy', '--app', assembly, '--require-approval', 'never', '--no-color', ...args], { stdio: 'inherit' });
+            const r = spawnSync(process.env.CDK, ['deploy', '--app', assembly, '--require-approval', 'never', '--no-color', ...bootstrap, ...args], { stdio: 'inherit' });
             if (r.status !== 0) {
               console.log(`::error::shukka: cdk deploy failed (exit ${r.status ?? r.signal})`);
               process.exit(1);
@@ -782,11 +791,17 @@ jobs:
         env:
           CDK: .shukka/node_modules/.bin/cdk
           PROJECT: ${{ steps.config.outputs.project }}
+          QUALIFIER: ${{ steps.config.outputs.qualifier }}
         run: |
           set +e -uo pipefail
+          # The deploy's BootstrapVersion parameter (scripts/assembly.mjs bootstrapVersionArgs), so the diff matches it.
+          if [[ ! "$QUALIFIER" =~ ^[a-z0-9]{1,10}$ ]]; then
+            echo "::error::shukka: the qualifier must match ^[a-z0-9]{1,10}\$"
+            exit 1
+          fi
           out="$RUNNER_TEMP/shukka-pr-diff"
           mkdir -p "$out"
-          "$CDK" diff --app "$RUNNER_TEMP/cdk.out" --no-color --method=template 2>&1 | tee "$out/diff.txt"
+          "$CDK" diff --app "$RUNNER_TEMP/cdk.out" --no-color --method=template --parameters "BootstrapVersion=/cdk-bootstrap/$QUALIFIER/version" 2>&1 | tee "$out/diff.txt"
           node --input-type=module - "$out/diff.txt" >>"$GITHUB_STEP_SUMMARY" <<'JS'
           import { readFileSync } from 'node:fs';
           const text = readFileSync(process.argv[2], 'utf8').slice(0, 900_000);
