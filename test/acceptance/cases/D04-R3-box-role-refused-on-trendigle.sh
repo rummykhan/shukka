@@ -10,10 +10,9 @@ verdict() {
 }
 
 case_run() {
-  local out t b
-  out=$(cat "$RUN_DIR/runs/box-trendigle-read.txt" 2>/dev/null)
-  t=$(sed -n 1p <<<"$out")
-  b=$(sed -n 2p <<<"$out")
+  local t b
+  t=$(state_get box_trendigle_table_read)
+  b=$(state_get box_trendigle_bucket_read)
   result R3-box-role-trendigle-table-read "$(verdict "$t")" "$t"
   result R3-box-role-trendigle-bucket-read "$(verdict "$b")" "$b"
   assert_eq "$(verdict "$t")" DENIED "DescribeTable on Trendigle's table from the box is refused"

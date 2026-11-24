@@ -10,5 +10,5 @@ case_run() {
   assert_eq "$(need_state cli_runs_for_sha)" 0 "no GitHub Actions run took part"
   assert_eq "$(need_state cli_deploy_rc)" 0 "shukka deploy exited 0"
   assert_eq "$(need_state after_cli_web_rev)" "$sha" "web current/REVISION is the merged commit"
-  assert_match "$(http_get "http://$(box_ip):8080/")" "revision: $sha" "the live address serves it"
+  assert_match "$(need_state after_cli_page)" "revision: $sha" "the live address served it right after the deploy"
 }

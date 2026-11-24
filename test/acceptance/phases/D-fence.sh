@@ -36,12 +36,18 @@ d_escape() {
   state_set standin_bucket_policy "$(aws s3api get-bucket-policy --bucket "$(state_get standin_bucket)" --query Policy --output text 2>&1 | one_line | head -c 200)"
   state_set standin_queue "$(aws sqs get-queue-url --queue-name "$(state_get standin_table)-queue" --query QueueUrl --output text 2>&1 | one_line | head -c 200)"
 
-  # The instance role (bounded) asked to read Trendigle from the box itself.
-  local tt tb
+  # The instance role (bounded) asked to read Trendigle from the box itself. Each read is its own
+  # command and its own one-line value: the CLI's error output starts with a blank line and may run
+  # to several, so the two answers cannot be told apart by line number.
+  # A box that cannot be asked fails the phase (the case then reads MISSING); the restore still runs.
+  local tt tb out rc=0
   tt=$(state_get trendigle_table)
   tb=$(state_get trendigle_bucket)
-  box_run "aws dynamodb describe-table --region $AWS_REGION --table-name $tt --query Table.TableStatus --output text 2>&1 | head -c 300; echo; aws s3api list-objects-v2 --region $AWS_REGION --bucket $tb --max-keys 1 --query KeyCount --output text 2>&1 | head -c 300" \
-    >"$RUN_DIR/runs/box-trendigle-read.txt" || true
+  out=$(box_run "aws dynamodb describe-table --region $AWS_REGION --table-name $tt --query Table.TableStatus --output text 2>&1 | head -c 300") || rc=1
+  state_set box_trendigle_table_read "$(one_line <<<"$out")"
+  out=$(box_run "aws s3api list-objects-v2 --region $AWS_REGION --bucket $tb --max-keys 1 --query KeyCount --output text 2>&1 | head -c 300") || rc=1
+  state_set box_trendigle_bucket_read "$(one_line <<<"$out")"
+  return $rc
 }
 
 # d_restore: takes the escape attempt out of the consumer's main (committing and pushing only what is
