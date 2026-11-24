@@ -153,6 +153,23 @@ function fenceName(r) {
 }
 
 /**
+ * The physical ids of every resource in a stack tagged Project=<project> or shukka:project=<project> in this region,
+ * each with the name of the stack that holds it: what bootstrap counts as the project's own.
+ * @param {Aws} aws
+ * @param {string} project
+ * @returns {Promise<Map<string, string>>}
+ */
+async function ownedPhysicalIds(aws, project) {
+  /** @type {Map<string, string>} */
+  const owned = new Map();
+  for (const stack of await aws.stacksWithTags()) {
+    if (stack.tags.Project !== project && stack.tags[PROJECT_TAG] !== project) continue;
+    for (const id of await aws.stackPhysicalIds(stack.name)) if (!owned.has(id)) owned.set(id, stack.name);
+  }
+  return owned;
+}
+
+/**
  * Resources the new fence (`<project>*`, `<Project>*`) would reach that are no part of this project: every DynamoDB
  * table, S3 bucket, SQS queue, SNS topic, Lambda function, log group, CloudWatch alarm, IAM role, IAM instance profile,
  * SES configuration set and SSM document (aws.mjs FENCED_KINDS) whose name is in the fence but which
@@ -167,12 +184,7 @@ export async function fenceClashes(aws, project) {
   const inFence = (/** @type {string} */ n) => n.startsWith(project) || n.startsWith(Project);
   const candidates = (await aws.accountResources()).filter((r) => inFence(fenceName(r)));
   if (candidates.length === 0) return [];
-  /** @type {Set<string>} */
-  const owned = new Set();
-  for (const stack of await aws.stacksWithTags()) {
-    if (stack.tags.Project !== project && stack.tags[PROJECT_TAG] !== project) continue;
-    for (const id of await aws.stackPhysicalIds(stack.name)) owned.add(id);
-  }
+  const owned = await ownedPhysicalIds(aws, project);
   return candidates.filter((r) => !owned.has(r.name)
     && !(r.kind === 'log-group' && r.name.startsWith(LAMBDA_LOGS) && owned.has(r.name.slice(LAMBDA_LOGS.length))));
 }
@@ -337,11 +349,46 @@ function originRepo(io, cwd) {
 }
 
 /**
+ * --bound-existing-roles: put the project's boundary (just deployed in step 1) on each of the project's own roles
+ * that lack it, print each, then read the roles again and refuse unless every role named like the project carries it.
+ * The project's next fenced deploy keeps it: applyBoundary writes the same boundary into each role's template.
+ * @param {Io} io
+ * @param {Aws} aws
+ * @param {{ project: string, toBound: { roleName: string, arn: string, stack: string }[], boundaryArn: string, target: Target }} inputs
+ */
+async function boundRoles(io, aws, { project, toBound, boundaryArn, target }) {
+  io.say(`1/4 putting boundary ${boundaryArn} on ${toBound.length} existing role(s) of ${project}`);
+  for (const r of toBound) {
+    io.say(`role ${r.arn || r.roleName} (stack ${r.stack}): boundary ${boundaryArn}`);
+    mustRun(io, `put-role-permissions-boundary on ${r.roleName}`, 'aws', [
+      'iam', 'put-role-permissions-boundary', '--role-name', r.roleName, '--permissions-boundary', boundaryArn, ...profileArgs(target),
+    ]);
+  }
+  if (io.dryRun) {
+    io.say(`dry run: the ${toBound.length} role(s) are not re-checked`);
+    return;
+  }
+  // IAM is eventually consistent: a role read straight after the change may not show it yet.
+  let left = await aws.unboundedRoles(project);
+  for (let attempt = 1; left.length > 0 && attempt < RECHECKS; attempt += 1) {
+    await new Promise((done) => { setTimeout(done, RECHECK_MS); });
+    left = await aws.unboundedRoles(project);
+  }
+  if (left.length > 0) {
+    for (const r of left) io.err(`shukka: role ${r.arn || r.roleName} still lacks boundary ${boundaryArn}\n`);
+    throw new CliError(`${left.length} role(s) named like the project still lack its boundary after --bound-existing-roles; the boundary stack is deployed, the project bootstrap is not`);
+  }
+  io.say(`every role named like ${project} carries ${boundaryArn}`);
+}
+const RECHECKS = 4;
+const RECHECK_MS = 2000;
+
+/**
  * `shukka bootstrap <project>`.
  * @param {{
  *   io: Io, aws: Aws, target: Target, project: string, configPath: string, cwd: string,
  *   hostedZoneIds?: string[], mailDomains?: string[], repo?: string, emergencyPrincipals?: string[],
- *   allowPrivateTypes?: boolean,
+ *   allowPrivateTypes?: boolean, boundExistingRoles?: boolean,
  * }} options
  */
 export async function bootstrapProject(options) {
@@ -439,13 +486,31 @@ export async function bootstrapProject(options) {
   }
 
   // Roles inside the fence's name prefix without its boundary could be given any permission by the pipeline.
+  // A project moving onto shukka has such roles in its own stacks; --bound-existing-roles puts the boundary on those
+  // (and only those, and only where they carry no other boundary) once step 1 has created it.
   const unbounded = await aws.unboundedRoles(project);
+  /** @type {{ roleName: string, arn: string, stack: string }[]} */
+  const toBound = [];
   if (unbounded.length > 0) {
-    for (const r of unbounded) {
-      io.err(`shukka: role ${r.arn || r.roleName} matches the ${project} prefix but ${r.boundaryArn ? `carries boundary ${r.boundaryArn}` : 'has no permissions boundary'}\n`);
+    const owned = await ownedPhysicalIds(aws, project);
+    const ownedOf = (/** @type {import('./aws.mjs').UnboundedRole} */ r) => (r.boundaryArn ? undefined : owned.get(r.roleName));
+    const foreign = unbounded.filter((r) => !ownedOf(r));
+    if (foreign.length === 0 && options.boundExistingRoles) {
+      for (const r of unbounded) toBound.push({ roleName: r.roleName, arn: r.arn, stack: /** @type {string} */ (ownedOf(r)) });
+    } else {
+      for (const r of unbounded) {
+        const stack = ownedOf(r);
+        io.err(`shukka: role ${r.arn || r.roleName} matches the ${project} prefix but ${r.boundaryArn ? `carries boundary ${r.boundaryArn}` : 'has no permissions boundary'}`
+          + `${stack ? ` (in stack ${stack} of ${project})` : ''}\n`);
+      }
+      if (foreign.length === 0) {
+        throw new CliError(`${unbounded.length} role(s) named like the project lack its boundary (${lib.boundaryPolicyName(project)}), all in stacks tagged `
+          + `Project=${project} or ${PROJECT_TAG}=${project}; pass --bound-existing-roles to put the boundary on them once it exists, or add applyBoundary and deploy`);
+      }
+      throw new CliError(`${unbounded.length} role(s) named like the project lack its boundary (${lib.boundaryPolicyName(project)}); `
+        + `${foreign.length} of them ${foreign.length === 1 ? 'is' : 'are'} in no stack tagged Project=${project} or ${PROJECT_TAG}=${project}, or carr${foreign.length === 1 ? 'ies' : 'y'} another boundary. `
+        + 'Rename them, delete them, or put the boundary on them, then run this again');
     }
-    throw new CliError(`${unbounded.length} role(s) named like the project lack its boundary (${lib.boundaryPolicyName(project)}); `
-      + 'rename them, delete them, or put the boundary on them, then run this again');
   }
 
   // Anything else in the fence's name prefix (another product's resources, not a shukka project) would be handed to
@@ -484,6 +549,7 @@ export async function bootstrapProject(options) {
   io.say(`1/4 ${boundaryStack}: boundary ${lib.boundaryPolicyName(project)} and execution policies ${lib.executionPolicyNames(project).join(', ')}; ${fenceLine}`);
   const assembly = await synthBoundary(io, { project, qualifier, account: caller.account, region, hostedZoneId, mailDomains });
   cdkDeploy(io, assembly, boundaryStack, target);
+  if (toBound.length > 0) await boundRoles(io, aws, { project, toBound, boundaryArn: `arn:${caller.arn.split(':')[1]}:iam::${caller.account}:policy/${lib.boundaryPolicyName(project)}`, target });
 
   // 2. The project's bootstrap.
   io.say(`2/4 ${toolkitName}: qualifier ${qualifier}, execution role with ${lib.executionPolicyNames(project).join(', ')}; emergency principals ${emergency.join(', ')}`);

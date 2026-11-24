@@ -1993,3 +1993,102 @@ test('shu-ecn: the admin\'s cdk gets a minimal environment, never NODE_OPTIONS o
   assert.equal(env.AWS_REGION, 'us-east-1');
   for (const k of ['NODE_OPTIONS', 'CDK_HOME', 'npm_config_userconfig']) assert.equal(env[k], undefined, k);
 });
+
+// ---------- shu-ik0: a project moving onto shukka, whose own stacks hold roles without the boundary ----------
+
+const OWN_ROLE = { roleName: 'Shukkatest-prod-Instance-Role1ABCC5F0', arn: `arn:aws:iam::${ACCOUNT}:role/Shukkatest-prod-Instance-Role1ABCC5F0` };
+const STRAY_ROLE = { roleName: 'shukkatest-handmade', arn: `arn:aws:iam::${ACCOUNT}:role/shukkatest-handmade` };
+const BOUNDARY_ARN = `arn:aws:iam::${ACCOUNT}:policy/shukkatest-shukka-boundary`;
+
+/** An account whose stack Shukkatest-prod-Instance (tag Project=shukkatest) holds OWN_ROLE; `unbounded` answers each read of the roles in turn. */
+function migratingAccount(unbounded: { roleName: string; arn: string; boundaryArn?: string }[][]) {
+  let reads = 0;
+  return fakeAws({
+    unboundedRoles: async () => unbounded[Math.min(reads++, unbounded.length - 1)],
+    accountResources: async () => [{ kind: 'iam-role', name: OWN_ROLE.roleName }],
+    stacksWithTags: async () => [{ name: 'Shukkatest-prod-Instance', tags: { Project: 'shukkatest' } }, { name: 'Other', tags: {} }],
+    stackPhysicalIds: async (name: string) => (name === 'Shukkatest-prod-Instance' ? [OWN_ROLE.roleName, 'i-0abc'] : ['shukkatest-handmade-not-a-role']),
+  });
+}
+
+test('shu-ik0: --bound-existing-roles deploys the boundary stack, bounds the role of an owned stack, re-checks and goes on', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  const { calls, spawn } = recordingSpawn();
+  const { aws, reads } = migratingAccount([[OWN_ROLE], []]);
+  const r = await cli(projectArgs(['--bound-existing-roles']).filter((a) => a !== '--dry-run'), { cwd: dir, spawn, aws });
+  assert.equal(r.code, 0, r.out + r.err);
+  const lines = printed(r.out);
+  const boundary = lines.findIndex((l) => l.includes('deploy Shukka-Boundary-shukkatest'));
+  const put = lines.findIndex((l) => l.startsWith('+ aws iam put-role-permissions-boundary'));
+  const toolkit = lines.findIndex((l) => l.startsWith('+ aws cloudformation deploy'));
+  assert.ok(boundary !== -1 && put > boundary && toolkit > put, r.out);
+  assert.equal(lines[put], `+ aws iam put-role-permissions-boundary --role-name ${OWN_ROLE.roleName} --permissions-boundary ${BOUNDARY_ARN} --profile stelking`);
+  assert.equal(lines.filter((l) => l.includes('put-role-permissions-boundary')).length, 1, 'one role, one change');
+  assert.ok(r.out.includes(`role ${OWN_ROLE.arn} (stack Shukkatest-prod-Instance): boundary ${BOUNDARY_ARN}`), r.out);
+  assert.equal(reads.filter((x) => x.startsWith('unboundedRoles')).length, 2, 'the roles are read again after the change');
+  assert.match(r.out, /every role named like shukkatest carries/);
+  const run = calls.find((c) => c.cmd === 'aws' && c.args[1] === 'put-role-permissions-boundary');
+  assert.ok(run, 'the change was run (real run)');
+}));
+
+test('shu-ik0: a role the re-check still finds unbounded stops the bootstrap before the project bootstrap', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  const { calls, spawn } = recordingSpawn();
+  // Every read, the retries included, still finds the role: the change did not take.
+  const { aws } = migratingAccount([[OWN_ROLE]]);
+  const r = await cli(projectArgs(['--bound-existing-roles']).filter((a) => a !== '--dry-run'), { cwd: dir, spawn, aws });
+  assert.equal(r.code, 1, r.out + r.err);
+  assert.match(r.err, /still lack its boundary after --bound-existing-roles/);
+  assert.ok(!calls.some((c) => c.cmd === 'aws' && c.args[0] === 'cloudformation' && c.args[1] === 'deploy'), 'no project bootstrap');
+}));
+
+test('shu-ik0: a role in no stack of the project still refuses with --bound-existing-roles, and nothing changes', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  const { calls, spawn } = recordingSpawn();
+  const { aws } = migratingAccount([[OWN_ROLE, STRAY_ROLE]]);
+  const r = await cli(projectArgs(['--bound-existing-roles']).filter((a) => a !== '--dry-run'), { cwd: dir, spawn, aws });
+  assert.equal(r.code, 1, r.out + r.err);
+  assert.match(r.err, /role arn:aws:iam::123456789012:role\/shukkatest-handmade matches the shukkatest prefix but has no permissions boundary\n/);
+  assert.match(r.err, /1 of them is in no stack tagged Project=shukkatest or shukka:project=shukkatest/);
+  assert.deepEqual(MUTATING(calls), [], 'nothing ran');
+
+  // A role of an owned stack that carries another boundary is not replaced either.
+  const other = migratingAccount([[{ ...OWN_ROLE, boundaryArn: `arn:aws:iam::${ACCOUNT}:policy/someone-else` }]]);
+  const r2 = await cli(projectArgs(['--bound-existing-roles']).filter((a) => a !== '--dry-run'), { cwd: dir, spawn, aws: other.aws });
+  assert.equal(r2.code, 1, r2.out + r2.err);
+  assert.match(r2.err, /carries boundary arn:aws:iam::123456789012:policy\/someone-else/);
+  assert.deepEqual(MUTATING(calls), [], 'nothing ran');
+}));
+
+test('shu-ik0: without the flag, roles all in owned stacks refuse and the message names --bound-existing-roles', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  const { calls, spawn } = recordingSpawn();
+  const r = await cli(projectArgs().filter((a) => a !== '--dry-run'), { cwd: dir, spawn, aws: migratingAccount([[OWN_ROLE]]).aws });
+  assert.equal(r.code, 1, r.out + r.err);
+  assert.ok(r.err.includes(`role ${OWN_ROLE.arn} matches the shukkatest prefix but has no permissions boundary (in stack Shukkatest-prod-Instance of shukkatest)`), r.err);
+  assert.match(r.err, /pass --bound-existing-roles/);
+  assert.deepEqual(MUTATING(calls), [], 'nothing ran');
+
+  // With a role outside the project's stacks, the flag would not help, so it is not offered.
+  const stray = await cli(projectArgs().filter((a) => a !== '--dry-run'), { cwd: dir, spawn, aws: migratingAccount([[OWN_ROLE, STRAY_ROLE]]).aws });
+  assert.equal(stray.code, 1);
+  assert.doesNotMatch(stray.err, /--bound-existing-roles/);
+}));
+
+test('shu-ik0: --bound-existing-roles --dry-run prints the put-role-permissions-boundary commands and changes nothing', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  const { calls, spawn } = recordingSpawn();
+  const { aws, reads } = migratingAccount([[OWN_ROLE]]);
+  const r = await cli(projectArgs(['--bound-existing-roles']), { cwd: dir, spawn, aws });
+  assert.equal(r.code, 0, r.out + r.err);
+  assert.ok(printed(r.out).includes(`+ aws iam put-role-permissions-boundary --role-name ${OWN_ROLE.roleName} --permissions-boundary ${BOUNDARY_ARN} --profile stelking   [dry run: not run]`), r.out);
+  assert.deepEqual(MUTATING(calls), [], 'a dry run changes nothing');
+  assert.equal(reads.filter((x) => x.startsWith('unboundedRoles')).length, 1, 'no re-check in a dry run');
+}));
+
+test('shu-ik0: bootstrap --account refuses --bound-existing-roles, and --help documents it', async () => {
+  const r = await cli(['bootstrap', '--account', '--region', 'us-east-1', '--bound-existing-roles', '--dry-run']);
+  assert.equal(r.code, 2);
+  assert.match(r.err, /--bound-existing-roles is for a project bootstrap/);
+  assert.match(helpText(), /--bound-existing-roles/);
+});
