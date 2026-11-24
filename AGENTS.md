@@ -140,32 +140,42 @@ This project is delivered through the software factory. The project profile is [
 
 ## System design
 
-_As built at `e21bf3a` · updated 2026-11-22_
+_As built at v1.0.0 · updated 2026-11-24_
 
 ### What it is
-A reusable deployment pipeline for AWS CDK projects on GitHub Actions. Nothing is built yet; the approved design is `docs/factory/v1/design.md`.
+A reusable, cheap and fenced deployment pipeline for AWS CDK projects on GitHub Actions: a consumer adds `shukka.json`, a short caller workflow and shukka's constructs; merges to `main` deploy infrastructure and apps, pull requests get a CDK diff, and an emergency CLI deploys from a laptop.
 
 ### Components
-Nothing built yet.
+- `lib/` (npm package entry `shukka`): `ShukkaAccess` (infra, app and diff roles trusted by GitHub OIDC through `job_workflow_ref`), `applyBoundary`/boundary stack (the project fence: execution policies + permissions boundary), `shukkaSynthesizer` / `shukkaCiSynthesizer`, per-project bootstrap template, account stack (shared OIDC provider), `tagProject` (Project tag on every create, project-prefixed launch template names).
+- `.github/workflows/`: `pipeline.yml` (plan, checks, build; calls the two below), `infra.yml` (credential-free synth, changes, guard + policy guard, diff/deploy with the deploy role), `ec2.yml` (upload bundles, release over SSM, smoke).
+- `scripts/`: config loader and schema check, change detection, assembly check, policy guard, diff guard, bundle/upload/release; `scripts/cli/` (`shukka bootstrap`, `diff`, `deploy`, `deploy-ci`) with project steps in Docker.
+- `box/shukka-release.sh`: server release script (release dirs, current/previous, digest-checked hooks, health check, rollback).
+- `test/`: unit and integration tests (the gate); `test/acceptance/` live suite against `rummykhan/shukka-consumer-test` and throwaway `shukkatest*` resources.
 
 ### Data model
-Nothing built yet.
+No database. State lives in: the project's CDK bootstrap (`CDKToolkit-<project>`, bucket `cdk-<project>-assets-*`), the boundary stack (`Shukka-Boundary-<project>`), the project's deploy bucket (`<project>/` bundles and hooks, 30-day expiry), the server's `/opt/<project>/<app>/{releases,current,previous}`, and stack tags `shukka:revision`.
 
 ### Key flows
-Nothing built yet.
+- Merge to main: plan → checks/build → synth (no credentials) → changes → guard/policy guard → deploy (deploy role, execution role fenced) → upload + release per changed app → smoke. Destructive changes stop until a hand run with `allow_replacement`.
+- Pull request: same up to the diff, posted as a comment; no deploy credentials.
+- CI stack: never deployed by the pipeline; `shukka deploy-ci <project>` synthesizes in Docker, checks, and deploys only that checked assembly with admin credentials.
+- Emergency: `shukka deploy` from a fresh origin/main worktree, project steps in Docker, cdk with only a deploy-role session.
 
 ### Interfaces
-Nothing built yet.
+`shukka.json` (schema `schema/shukka.schema.json`); the caller workflow `uses: rummykhan/shukka/.github/workflows/pipeline.yml@v1` (release tags are lightweight); configure hooks `<hook> <release-dir>` run as root; the CLI above.
 
 ### External dependencies
 | Service | Purpose | Config | Local stand-in |
 |---|---|---|---|
 | GitHub Actions + OIDC | Runs the pipeline; issues tokens AWS trusts | none (OIDC) | `rummykhan/shukka-consumer-test` |
-| AWS (CloudFormation, IAM, S3, SSM, EC2) | What consumers deploy to | consumer's account | throwaway `shukkatest*` resources |
+| AWS (CloudFormation, IAM, S3, SSM, EC2, Route 53, DynamoDB, SQS, SNS, Lambda, SES, CloudWatch) | What consumers deploy to | consumer's account | throwaway `shukkatest*` resources |
+| Docker | Emergency CLI runs project code in containers | local | none |
 
 ### Decisions
-- See the Decisions table in `docs/factory/v1/design.md` (D1–D11).
+- `docs/factory/v1/design.md` D1–D12 (D12: the CI stack is admin-deployed only).
+- Release tags are lightweight (GitHub will not start a caller pinned to an annotated tag).
+- Security review is on demand, not part of the factory loop.
 
 ### In progress
-- shukka v1 — builds everything above; Trendigle switches to it.
+- Trendigle switch-over (epic shu-li0).
 <!-- END SOFTWARE FACTORY -->
