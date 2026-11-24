@@ -1,0 +1,1 @@
+{"Resources": {"Q": {"Type": "AWS::SQS::Queue"}}, "Outputs": {"O": {"Value": "999999999999", "Export": {"Name": "trendigle-trusted"}}}}

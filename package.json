@@ -1,0 +1,59 @@
+{
+  "name": "shukka",
+  "version": "0.0.0",
+  "description": "Reusable deployment pipeline for AWS CDK projects on GitHub Actions",
+  "license": "MIT",
+  "type": "module",
+  "main": "./lib/index.ts",
+  "types": "./lib/index.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.ts",
+      "default": "./lib/index.ts"
+    },
+    "./package.json": "./package.json",
+    "./lib/*": "./lib/*"
+  },
+  "bin": {
+    "shukka": "bin/shukka"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rummykhan/shukka.git"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test --test-reporter=spec \"test/**/*.test.ts\"",
+    "actionlint": "actionlint",
+    "shellcheck": "find box scripts -name '*.sh' -type f -exec shellcheck {} +",
+    "gate": "npm run lint && npm run typecheck && npm test && npm run actionlint && npm run shellcheck"
+  },
+  "peerDependencies": {
+    "aws-cdk-lib": "^2.170.0",
+    "constructs": "^10.0.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^22.20.5",
+    "aws-cdk-lib": "2.278.0",
+    "constructs": "^10.8.1",
+    "eslint": "^10.15.0",
+    "globals": "^17.14.0",
+    "typescript": "~6.0.3",
+    "typescript-eslint": "^8.73.0",
+    "yaml": "2.9.1"
+  },
+  "dependencies": {
+    "@aws-sdk/client-cloudformation": "3.1162.0",
+    "@aws-sdk/client-ec2": "3.1162.0",
+    "@aws-sdk/client-iam": "3.1162.0",
+    "@aws-sdk/client-s3": "3.1162.0",
+    "@aws-sdk/client-ssm": "3.1162.0",
+    "aws-cdk": "2.1148.0",
+    "tsx": "^4.23.15"
+  }
+}

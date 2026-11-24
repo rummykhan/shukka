@@ -1,0 +1,13 @@
+AI agent detected
+
+Stack Trendigle-prod-Data
+Resources
+[~] AWS::DynamoDB::Table Table-users Tableusers60537A7D replace
+ └─ [~] TableName (requires replacement)
+     ├─ [-] other_name
+     └─ [+] trendigle_prod_users
+
+
+
+✨  Number of stacks with differences: 1
+

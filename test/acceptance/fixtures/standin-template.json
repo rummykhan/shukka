@@ -1,0 +1,32 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "shukka acceptance: a stand-in for another project (in place of Orbitary). Its names do not start with shukkatest, so shukkatest's fence must refuse to change it. Deleted at the end of every run.",
+  "Parameters": {
+    "TableName": { "Type": "String" },
+    "BucketName": { "Type": "String" }
+  },
+  "Resources": {
+    "Table": {
+      "Type": "AWS::DynamoDB::Table",
+      "DeletionPolicy": "Delete",
+      "UpdateReplacePolicy": "Delete",
+      "Properties": {
+        "TableName": { "Ref": "TableName" },
+        "BillingMode": "PAY_PER_REQUEST",
+        "AttributeDefinitions": [{ "AttributeName": "pk", "AttributeType": "S" }],
+        "KeySchema": [{ "AttributeName": "pk", "KeyType": "HASH" }]
+      }
+    },
+    "Bucket": {
+      "Type": "AWS::S3::Bucket",
+      "DeletionPolicy": "Delete",
+      "UpdateReplacePolicy": "Delete",
+      "Properties": {
+        "BucketName": { "Ref": "BucketName" },
+        "PublicAccessBlockConfiguration": {
+          "BlockPublicAcls": true, "BlockPublicPolicy": true, "IgnorePublicAcls": true, "RestrictPublicBuckets": true
+        }
+      }
+    }
+  }
+}

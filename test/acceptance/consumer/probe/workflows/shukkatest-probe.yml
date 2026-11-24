@@ -1,0 +1,24 @@
+# Copied into .github/workflows/ by the acceptance suite only for the trust cases, then removed.
+# The consumer's own workflow (not shukka's infra.yml or ec2.yml) asks for each deploy role. On a
+# branch, a tag or a pull request, both the subject and the workflow are wrong; on main only the
+# workflow is (job_workflow_ref names this file), so a refusal there proves the workflow condition.
+name: shukkatest-probe
+on:
+  push:
+    branches: [main, 'shukkatest-probe-**']
+    tags: ['shukkatest-probe-**']
+    paths: ['.github/workflows/shukkatest-probe.yml', 'probe/**']
+  pull_request:
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Ask for each deploy role
+        run: bash probe/assume.sh auto

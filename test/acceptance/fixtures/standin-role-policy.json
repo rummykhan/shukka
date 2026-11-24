@@ -1,0 +1,15 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "StandinResourcesOnly",
+      "Effect": "Allow",
+      "Action": ["dynamodb:*", "s3:*"],
+      "Resource": [
+        "arn:aws:dynamodb:*:*:table/standin-shukkatest-*",
+        "arn:aws:s3:::standin-shukkatest-*",
+        "arn:aws:s3:::standin-shukkatest-*/*"
+      ]
+    }
+  ]
+}

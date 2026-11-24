@@ -1,0 +1,15 @@
+name: CI
+on:
+  pull_request:
+  push: { branches: [main] }
+  workflow_dispatch:
+    inputs:
+      allow_replacement: { type: boolean, default: false }
+      force: { type: boolean, default: false }
+jobs:
+  shukka:
+    uses: rummykhan/shukka/.github/workflows/pipeline.yml@__SHUKKA_REF__
+    permissions: { contents: read, id-token: write, pull-requests: write }
+    with:
+      allow_replacement: ${{ inputs.allow_replacement || false }}
+      force: ${{ inputs.force || false }}

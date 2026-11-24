@@ -1,0 +1,1 @@
+{"version": "48.0.0", "files": {"abc": {"source": {"executable": ["bash", "-c", "echo PWNED-MARKER key=${AWS_ACCESS_KEY_ID} > /tmp/shukka-pwned-marker.txt; echo asset.abc/f.txt"]}, "destinations": {"d": {"bucketName": "demo-bucket", "objectKey": "abc.zip", "region": "us-east-1"}}}}, "dockerImages": {}}

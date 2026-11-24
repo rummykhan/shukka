@@ -29,7 +29,7 @@ Credentials exist only inside `infra.yml` and `ec2.yml`. Each AWS role trusts on
 
 **C1. `pipeline.yml`** (reusable workflow, entry point). Inputs: `config` (path, default `shukka.json`), `allow_replacement` (bool), `force` (bool: deploy everything regardless of changed paths). Jobs: `plan` → `checks` and `build` in parallel → `infra` (calls `infra.yml`) → `app` (calls `ec2.yml`, one matrix entry per app) → `smoke`. On `pull_request`: `plan`, `checks`, and `diff` (calls `infra.yml` in diff mode with the read-only role). Every job sets its own `permissions`; only the two nested workflows get `id-token: write`.
 
-**C2. `infra.yml`** (nested reusable workflow). Modes `diff` and `deploy`. Steps: checkout, `npm ci` in the infra directory, assume role, `cdk diff --no-color` to a file and the step summary, guard, then (deploy mode) `cdk deploy --all --require-approval never`. In diff mode it posts the diff and the guard verdict as a pull-request comment (updated in place) and never fails the check for a destructive diff; it says the merge will stop.
+**C2. `infra.yml`** (nested reusable workflow). Modes `diff` and `deploy`. Steps: checkout, `npm ci` in the infra directory, assume role, `cdk diff --no-color` to a file and the step summary, guard, then (deploy mode) `cdk deploy --require-approval never` of every stack but `<Project>-Ci` (D12). In diff mode it posts the diff and the guard verdict as a pull-request comment (updated in place) and never fails the check for a destructive diff; it says the merge will stop.
 
 **C3. `ec2.yml`** (nested reusable workflow). Downloads the build artifact for one app, checks out the repository (no install, no build) to take the configure hook from git rather than from the artifact, assumes the app role, uploads the bundle to `s3://<bucket>/<project>/<app>/<sha>.tgz`, sends `box/shukka-release.sh` with arguments through SSM Run Command to instances tagged `Project=<project>`, waits, prints output, fails if the script failed. Concurrency group `shukka-<project>-<app>`, `cancel-in-progress: false`.
 
@@ -39,6 +39,7 @@ Credentials exist only inside `infra.yml` and `ec2.yml`. Each AWS role trusts on
 - `ShukkaAccess`: GitHub OIDC provider (create or import), the `infra`, `app` and `diff` roles, the deploy bucket's permissions.
 - `ShukkaBoundary`: the project's permissions boundary policy and execution policy (also used by `shukka bootstrap`).
 - `shukkaSynthesizer(project)`: a `DefaultStackSynthesizer` with the project's qualifier, so stacks deploy through the project's bootstrap.
+- `shukkaCiSynthesizer(qualifier)`: for the CI stack `<Project>-Ci` only (D12). A `CliCredentialsStackSynthesizer` on the project's bootstrap bucket with the deploy role as lookup role: no deploy or execution role, so its admin deploy (`shukka deploy-ci`) runs CloudFormation with the admin's credentials.
 
 **C6. `scripts/`** (Node 22, no runtime dependencies beyond the AWS SDK v3 clients they need): `config.mjs` (load and validate `shukka.json`), `changed.mjs` (what changed since the last deployed commit), `guard.mjs` (port of today's `diff-guard.sh`), `upload.mjs`, `release.mjs` (SSM send and wait). Workflows call `node <shukka>/scripts/x.mjs`; the CLI calls the same modules.
 
@@ -46,7 +47,7 @@ Credentials exist only inside `infra.yml` and `ec2.yml`. Each AWS role trusts on
 
 **C8. Tests** (`test/`, run in shukka's own CI): guard against recorded `cdk diff` outputs (today's twelve cases plus the security reviewer's real samples), construct snapshot and assertion tests on the synthesized trust and boundary policies, `shukka-release.sh` in a Docker container with two fake apps, `actionlint` on the workflows, config validation.
 
-**Trendigle changes** (consumer, separate branch in its repo): `shukka.json`; `ci.yml` replaced by the caller; Ci stack uses `ShukkaAccess` (old roles removed after the switch); every stack uses `shukkaSynthesizer('trendigle')`; `box/install.sh` becomes two configure hooks (`box/configure-app.sh`, `box/configure-admin.sh`) and its systemd units point at `.../current`; `deploy.sh` reduced to a pointer at `shukka deploy`; `diff-guard.sh` and its test removed.
+**Trendigle changes** (consumer, separate branch in its repo): `shukka.json`; `ci.yml` replaced by the caller; Ci stack uses `ShukkaAccess` and `shukkaCiSynthesizer('trendigle')` (old roles removed after the switch); every other stack uses `shukkaSynthesizer('trendigle')`; `box/install.sh` becomes two configure hooks (`box/configure-app.sh`, `box/configure-admin.sh`) and its systemd units point at `.../current`; `deploy.sh` reduced to a pointer at `shukka deploy`; `diff-guard.sh` and its test removed.
 
 ## Data model
 
@@ -66,7 +67,7 @@ No database. State that exists:
   "$schema": "https://raw.githubusercontent.com/rummykhan/shukka/v1/schema/shukka.schema.json",
   "project": "trendigle",
   "qualifier": "trendigle",
-  "aws": { "account": "818221194501", "region": "us-east-1" },
+  "aws": { "account": "123456789012", "region": "us-east-1" },
   "node": "22",
   "checks": [
     { "name": "app",   "dir": "implementation/app",   "run": ["npm ci", "npm run lint", "npm run typecheck", "npm test", "npm run build"], "services": ["dynamodb-local"] },
@@ -120,11 +121,13 @@ jobs:
 export interface ShukkaAccessProps {
   project: string;                 // matches shukka.json
   githubRepo: string;              // subject repo segment, e.g. 'trendigle@220634492/trendigle@1462395046' or 'org/repo'
-  shukkaVersions?: string;         // default 'v1*' → job_workflow_ref must match rummykhan/shukka/.github/workflows/<file>@refs/tags/v1*
+  shukkaVersions?: string;         // release line, default 'v1' → job_workflow_ref must match .../<file>@refs/tags/v1 or .../<file>@refs/tags/v1.*
+  qualifier?: string;              // bootstrap qualifier, default project when valid
+  allowBranch?: string;            // rc testing only: also trust .../<file>@refs/heads/<branch> (literal)
+  allowPrerelease?: boolean;       // rc testing only: also trust pre-release tags (v1.0.0-rc.1); default refused
   oidcProviderArn?: string;        // import instead of create when the account already has one
   deployBucket: s3.IBucket;
   instanceTag?: { key: string; value: string }; // default { Project: project }
-  ssmPath?: string;                // default `/${project}/prod`; app role may read it
 }
 export class ShukkaAccess extends Construct {
   readonly infraRole: iam.Role; readonly appRole: iam.Role; readonly diffRole: iam.Role;
@@ -134,12 +137,14 @@ export class ShukkaAccess extends Construct {
 Trust, for each role, all conditions together:
 - `aud = sts.amazonaws.com`;
 - `sub` StringEquals `repo:<githubRepo>:ref:refs/heads/main` (infra, app) or `repo:<githubRepo>:pull_request` (diff); the default subject is used, no customisation (spike S1);
-- `job_workflow_ref` StringLike `rummykhan/shukka/.github/workflows/infra.yml@refs/tags/<shukkaVersions>` (infra, diff) or `.../ec2.yml@...` (app).
+- `job_workflow_ref` StringLike either of `rummykhan/shukka/.github/workflows/infra.yml@refs/tags/<line>` and `...@refs/tags/<line>.*` (infra, diff), or the same for `ec2.yml` (app). shukka must never be renamed or moved: this claim carries names, not ids.
+- `job_workflow_ref` StringNotLike `rummykhan/shukka/.github/workflows/<file>@refs/tags/*-*` unless `allowPrerelease` is set, so a production project never runs a pre-release tag such as `v1.0.0-rc.1` (security review of the epic, access-4; shu-9bj.9).
+- Diff role stack resources: `stack/<project>-*/*` and `stack/<Project>-*/*` (a hyphen after the name, so a project named with this one as a prefix is not reachable).
 
 Permissions:
-- **infra**: `sts:AssumeRole` on the project-qualifier bootstrap roles `cdk-<qualifier>-{deploy,file-publishing,lookup}-role-*`.
-- **app**: `s3:PutObject` on `<bucket>/<project>/*`; `ssm:SendCommand` on `AWS-RunShellScript` and on instances with the tag; `ssm:GetCommandInvocation`, `ec2:DescribeInstances`; `ssm:GetParameter` on `<ssmPath>/*`.
-- **diff**: `cloudformation:GetTemplate`, `DescribeStacks` on `arn:aws:cloudformation:<region>:<account>:stack/<StackPrefix>*/*`; `ssm:GetParameter` on `/cdk-bootstrap/<qualifier>/version`. Nothing else (no lookup role: `cdk.context.json` is committed).
+- **infra**: `sts:AssumeRole` on the project-qualifier bootstrap roles `cdk-<qualifier>-{deploy,file-publishing}-role-*` only. Not the lookup role: the stock one has account-wide ReadOnlyAccess, and `cdk.context.json` is committed so deploys need no live lookup (security review of shu-7nw, 2026-11-22). The bootstrap itself is shukka's own template, whose deploy role can change only the project's stacks with the project's own execution role (shu-9bj.2).
+- **app**: `s3:PutObject` on `<bucket>/<project>/*`; `ssm:SendCommand` on `AWS-RunShellScript` and on instances with the tag; `ssm:DescribeInstanceInformation`, `ssm:GetCommandInvocation`, `ec2:DescribeInstances` (no resource type; the boundary gives these three to the app role only, by `aws:PrincipalArn`). No `ssm:GetParameter`: nothing the app role runs reads the project's parameters (shu-9bj.9). The deploy bucket must be named `<project>*`, since the boundary's S3 statement covers only those (shukka.json refuses another `aws.deployBucket`).
+- **diff**: `cloudformation:GetTemplate`, `DescribeStacks` on `arn:aws:cloudformation:<region>:<account>:stack/<StackPrefix>*/*`; `ssm:GetParameter` on `/cdk-bootstrap/<qualifier>/version`. Nothing else (no lookup role: `cdk.context.json` is committed). The boundary allows exactly these to the diff role only, by `aws:PrincipalArn` (shu-9bj.9): every role, the pipeline's own included, carries the boundary.
 
 ### `ShukkaBoundary` / execution policy
 
@@ -157,17 +162,24 @@ Deployed with admin credentials by `shukka bootstrap --account`. Owns the GitHub
 
 ```
 shukka-release.sh --project P --app A --sha SHA --bucket B --region R
-                  --configure /path/in/bundle/to/hook.sh   (relative to the release dir)
+                  --configure-key <s3 key of the hook>     (uploaded by ec2.yml from the git checkout, never from the bundle)
+                  --configure-sha256 <hex>                 (sha256 of the hook release.mjs uploaded)
+                  --bundle-sha256 <hex>                    (sha256 of the tarball upload.mjs uploaded)
                   --units "u1 u2" --health URL [--keep 5] [--health-timeout 60]
 exit 0  = new release live and healthy
-exit 10 = download or unpack failed      (nothing changed)
+exit 10 = download or unpack failed, a digest differs, or the layout cannot be made root's (nothing changed)
 exit 11 = configure hook failed          (nothing switched)
 exit 12 = unhealthy, rolled back, previous healthy
 exit 13 = unhealthy, rollback also unhealthy (manual attention)
+exit 2  = invalid arguments (nothing touched)
 stdout last line: "shukka: <project>/<app> <old-sha> -> <new-sha> <result>"
 ```
 
-Configure hook contract: called as `hook.sh <release-dir>` with `PROJECT`, `APP`, `SHA`, `REGION` in the environment, as root. It writes settings files, users and systemd units (pointing at `/opt/<project>/<app>/current`), and must be idempotent. It must not start or restart the app's units; the release script does that after the switch. A release whose hook fails is deleted.
+Where the hook comes from (decided 2026-11-22 after the security review of shu-9bj.1 found the two readings of this contract): `ec2.yml` (through `scripts/release.mjs`) reads the hook from the **git checkout** at the config's `server.configure` path and uploads it to `s3://<bucket>/<project>/<app>/<sha>.configure.sh`; `shukka-release.sh` downloads that object to `/opt/<project>/<app>/hooks/<sha>.sh` (outside every release directory, root-owned, mode 0700) and runs only that file. A file at the same path inside the bundle is never executed.
+
+Digests and planted entries (decided 2026-11-22, shu-9bj.7): the hook and the bundle are checked against `--configure-sha256` and `--bundle-sha256` (computed by `release.mjs` from the hook it uploads and by `upload.mjs` from the tarball it uploads) before either is run or unpacked; a mismatch exits 10 and leaves nothing behind. Before anything else, entries in `releases/` that are not root-owned directories and entries in `hooks/` that are not regular root:root 0700 files are removed, with `current`/`previous` links that do not point at a kept `releases/<hex sha>`. On rollback, the kept hook runs only when the target is exactly `releases/<hex sha>`, a real root:root directory not writable by group or others, and `hooks/<sha>.sh` is a regular root:root 0700 file; otherwise the release is restarted as it is.
+
+Configure hook contract: called as `hook.sh <release-dir>` with `PROJECT`, `APP`, `SHA`, `REGION` in the environment, as root. It writes settings files, users and systemd units (pointing at `/opt/<project>/<app>/current`), and must be idempotent. It must not start or restart the app's units; the release script does that after the switch. It must enable its units (`systemctl enable`); the release script only restarts them. `/opt/<project>` and `/opt/<project>/<app>` are root-owned and not writable by group or others (the release script enforces it); the app user's home and writable data live elsewhere. A release whose hook fails is deleted.
 
 Health: HTTP GET every 2 s until 2xx/3xx or the timeout; units must be `active`.
 
@@ -206,6 +218,7 @@ Input: full `cdk diff --no-color` output. Exit 0 = safe. Exit 1 = destructive or
 | D9 | Build-time values (`buildEnv`) come from GitHub repository variables, copied from Parameter Store by `shukka bootstrap`; secrets are never build-time | Fetch from Parameter Store in a credentialed step before the build; build inside the credentialed job | Keeps the build job credential-free (D4). Trendigle's two build-time values are public text on its legal pages |
 | D10 | Pull-request diff through a template-only read role | No PR diff; reuse lookup role | The lookup role has account-wide ReadOnlyAccess (includes reading S3 objects); templates are already in the repo |
 | D11 | `shukka.json` is the single config, read by workflows and CLI | Workflow inputs only | The emergency CLI must deploy exactly like CI; workflow inputs cannot be read from a laptop |
+| D12 | The CI stack `<Project>-Ci` is deployed only by an admin, with `shukkaCiSynthesizer` and `shukka deploy-ci <project>` (shu-ecn: fresh worktree of origin/main, synth in Docker with no credentials, `assembly.mjs check --project`, policy guard, the stack must depend on nothing but its own assets, its stored CloudFormation `RoleARN` printed and the project's execution role refused, diff and guard, confirmation, then shukka's cdk with the admin's credentials from an empty directory: `cdk deploy --app <checked cdk.out> <Project>-Ci --exclusively`): CloudFormation acts with the admin's credentials and the project's code never runs next to them. The pipeline and `shukka deploy` leave it out (`assembly.mjs deployCommands`, never `--all` while it is in the app, so cdk does not pull it in as a dependency); `changed.mjs` ignores its revision; `guard.mjs --project` says when a diff changes it; `assembly.mjs check --project` refuses a stack without a deploy and execution role under any other name (shu-9bj.12) | Deploy it through the project's bootstrap (the first design: CloudFormation as the fenced execution role creates the roles, then `NoChangeToCiRoles` refuses their inline policies and the stack rolls back); exempt the CI roles' creation from `NoChangeToCiRoles`; a `--ci` flag on `shukka deploy` | The execution role must never change the roles the pipeline runs as, or a merge could re-trust them; so the stack that creates them cannot go through that role. An admin already has to deploy it first; every later change is the same hand deploy, from a checked-out `main`, after reading its diff. `NoChangeToCiRoles` stays unchanged. The CI stack carries no assets but its template; any it had would be published with the admin's credentials |
 
 ## Risks
 
@@ -218,7 +231,8 @@ Input: full `cdk diff --no-color` output. Exit 0 = safe. Exit 1 = destructive or
 | Moving stacks to the new qualifier triggers resource replacement | `cdk diff` must show only metadata/asset changes; the guard stops anything else |
 | First release migration on the box takes the site down | Done in a quiet moment; configure hooks tested in the container first; rollback leaves `/opt/trendigle/app` intact until the second successful release |
 | A tag push to rummykhan/shukka changes what deploys every project | Projects pin `@v1` (moving major tag) by choice; shukka CI must pass before a tag; projects that want stability pin `@v1.x.y` |
-| Public repo leaks something | No secrets by design; account IDs and role names only appear in consumer repos; a secret scan in shukka CI |
+| Public repo leaks something | No secrets by design; a secret scan in shukka CI. Tests, fixtures and examples use the placeholder account `123456789012` and dummy instance, security-group, zone and role ids, except `test/fence.test.ts`, which keeps Trendigle's real hosted zone id because it compares the fence with the spike's recorded output (`docs/factory/v1/spikes/s2/trendigle.json`); the shared account's real id appears only in `FACTORY.md` and the spikes' records (`docs/factory/v1/spikes/`), and in consumer repos. Account ids are not secret, but naming the account and its resources helps an attacker aim. Association parameters are readable by every bounded role in the account (`ssm:DescribeAssociation` has no project scope): never put a secret in them |
+| A merge changes the CI roles (who they trust, what they may do), or the CI stack is never deployed after a change | The fence refuses the execution role any change to `<P>-shukka-*` roles (`NoChangeToCiRoles`), and the pipeline never deploys `<Project>-Ci` (D12); the policy guard reads the CI stack and stops a trust outside the project; the diff on the pull request and on the merge says `guard: <Project>-Ci changes, and the pipeline never deploys it` until an admin deploys it with `shukka deploy-ci`, which runs the project's code only in a credential-less container and hands the admin's credentials only to shukka's cdk on the checked assembly, after the diff and a confirmation (README step 5; shu-ecn) |
 | GitHub's free minutes change | Measured per run in the summary; budget alert note in README |
 
 ## Test strategy

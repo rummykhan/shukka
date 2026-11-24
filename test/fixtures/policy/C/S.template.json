@@ -1,0 +1,1 @@
+{"Resources": {"T": {"Type": "AWS::DynamoDB::Table", "Properties": {"TableName": "trendigle-data", "ResourcePolicy": {"PolicyDocument": {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::999999999999:root"}, "Action": "dynamodb:*", "Resource": "*"}]}}}}}}

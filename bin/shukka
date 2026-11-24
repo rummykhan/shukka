@@ -1,0 +1,12 @@
+#!/usr/bin/env node
+// shukka CLI entry (design C7): `npx github:rummykhan/shukka#v1 <command>`. The CLI uses shukka's TypeScript
+// constructs (lib/), so tsx is registered before anything else is loaded, with shukka's own tsconfig: a tsconfig
+// in the directory the CLI is run from (a project's) must not decide how shukka's code is compiled.
+import { fileURLToPath } from 'node:url';
+import { register } from 'tsx/esm/api';
+
+const tsconfig = fileURLToPath(new URL('../tsconfig.json', import.meta.url));
+process.env.TSX_TSCONFIG_PATH = tsconfig;
+register({ tsconfig });
+const { main } = await import('../scripts/cli/main.mjs');
+process.exitCode = await main(process.argv.slice(2));

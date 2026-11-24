@@ -1,0 +1,29 @@
+{
+  "account": "__ACCOUNT__",
+  "region": "__REGION__",
+  "qualifier": "shukkatest",
+  "roles": {
+    "infra": "arn:aws:iam::__ACCOUNT__:role/shukkatest-shukka-infra",
+    "app": "arn:aws:iam::__ACCOUNT__:role/shukkatest-shukka-app",
+    "diff": "arn:aws:iam::__ACCOUNT__:role/shukkatest-shukka-diff",
+    "cdk-deploy": "arn:aws:iam::__ACCOUNT__:role/cdk-shukkatest-deploy-role-__ACCOUNT__-__REGION__",
+    "cdk-lookup": "arn:aws:iam::__ACCOUNT__:role/cdk-shukkatest-lookup-role-__ACCOUNT__-__REGION__",
+    "default-deploy": "arn:aws:iam::__ACCOUNT__:role/cdk-hnb659fds-deploy-role-__ACCOUNT__-__REGION__",
+    "default-lookup": "arn:aws:iam::__ACCOUNT__:role/cdk-hnb659fds-lookup-role-__ACCOUNT__-__REGION__"
+  },
+  "own": {
+    "stack": "Shukkatest-Box",
+    "bucket": "shukkatest-deploy-__ACCOUNT__",
+    "table": "shukkatest-items"
+  },
+  "standin": {
+    "stack": "__STANDIN_STACK__",
+    "table": "__STANDIN_TABLE__",
+    "bucket": "__STANDIN_BUCKET__",
+    "queue": "__STANDIN_TABLE__-queue"
+  },
+  "readOnly": {
+    "trendigleTable": "__TRENDIGLE_TABLE__",
+    "trendigleBucket": "__TRENDIGLE_BUCKET__"
+  }
+}
