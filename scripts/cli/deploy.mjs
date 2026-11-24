@@ -16,19 +16,23 @@
 // Upload and release are shukka's own code and use the caller's credentials in this process.
 // Every part deploys, whatever changed: an emergency deploy makes AWS match origin/main. The release script
 // redeploys a commit that is already live without harm, and an unchanged stack is a no-op for cdk.
+//
+// `deploy-ci` deploys the one stack neither the pipeline nor `deploy` deploys, the CI stack <Project>-Ci, with the
+// admin's own credentials: the same fresh tree and container synth, the same checks, then shukka's cdk with the
+// admin's profile on the checked cdk.out only (deployCiCommand).
 
 import { randomBytes } from 'node:crypto';
 import { copyFileSync, cpSync, existsSync, lstatSync, mkdtempSync, readFileSync, realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { deployCommands } from '../assembly.mjs';
+import { ciStackName, ciStackPlan, deployCommands } from '../assembly.mjs';
 import { loadConfig } from '../config.mjs';
 import { adminNotice, guard, report } from '../guard.mjs';
 import { githubRepoFromUrl, policyGuard, report as policyReport } from '../policy-guard.mjs';
 import { release } from '../release.mjs';
 import { checkBundle, upload } from '../upload.mjs';
 import {
-  CliError, HOST_CODE_WARNING, NPM_SAFE, cdkBin, cdkPlace, containerArgs, dockerAvailable, ensureProjectImage, mustRun, projectEnv, refuseSymlink,
+  CliError, HOST_CODE_WARNING, NPM_SAFE, awsFiles, cdkBin, cdkPlace, containerArgs, dockerAvailable, ensureProjectImage, mustRun, projectEnv, refuseSymlink,
   startServices, tempDir,
 } from './exec.mjs';
 
@@ -365,7 +369,7 @@ function diffAndGuard(io, config, session, assembly, allow) {
 /**
  * Stack deploys with the shukka:revision tag, as infra.yml does (scripts/assembly.mjs deployCommands): one `--all`
  * when every stack has the same tags, otherwise each stack alone after its dependencies, so each keeps its own tags.
- * The CI stack (<Project>-Ci) is never deployed here: an admin deploys it by hand (README step 5).
+ * The CI stack (<Project>-Ci) is never deployed here: an admin deploys it with deployCiCommand (README step 5).
  * @param {Io} io
  * @param {Config} config
  * @param {Session | null} session
@@ -395,7 +399,7 @@ function deployStacks(io, config, session, assembly, sha) {
     deploy(['--all', `--tags=${REVISION_TAG}=${sha}`]);
     return;
   }
-  for (const skipped of plan.skipped) io.say(`not deploying ${skipped}: the CI stack is deployed by hand with admin credentials (npx cdk deploy ${skipped}, README step 5)`);
+  for (const skipped of plan.skipped) io.say(`not deploying ${skipped}: an admin deploys the CI stack with shukka deploy-ci ${config.project} (README step 5)`);
   if (plan.commands.length === 0) io.say(hasStacks ? 'no stack to deploy but the CI stack' : 'the app has no stacks');
   for (const args of plan.commands) deploy(args);
 }
@@ -659,6 +663,158 @@ export async function deployCommand(options) {
       io.say(io.dryRun ? 'dry run: smoke test not run' : 'smoke test passed');
     }
     io.say(io.dryRun ? 'dry run: nothing was deployed' : `${config.project} deployed at ${sha}`);
+    return 0;
+  } finally {
+    removeTree(io, root, tree);
+  }
+}
+
+/** Variables of this process the admin's cdk keeps: how to find node and temp files, the AWS credentials and proxies. */
+const ADMIN_ENV_KEEP = [
+  'PATH', 'TMPDIR', 'LANG', 'AWS_PROFILE', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN', 'AWS_CA_BUNDLE',
+  'HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'NO_PROXY', 'no_proxy',
+];
+
+/**
+ * The whole environment of the admin's cdk: only the variables in ADMIN_ENV_KEEP from this process (nothing like
+ * NODE_OPTIONS or CDK_* that could change what cdk loads or does), the admin's AWS files by real path, the config's
+ * region, npm made safe, and an empty HOME.
+ * @param {string} region
+ * @param {string} home
+ * @param {Record<string, string | undefined>} [from]
+ * @returns {Record<string, string>}
+ */
+export function adminEnv(region, home, from = process.env) {
+  /** @type {Record<string, string>} */
+  const env = {};
+  for (const k of ADMIN_ENV_KEEP) {
+    const v = from[k];
+    if (v !== undefined) env[k] = v;
+  }
+  return { ...env, ...awsFiles(from), ...NPM_SAFE, HOME: home, AWS_REGION: region, AWS_DEFAULT_REGION: region };
+}
+
+/**
+ * shukka's pinned cdk with the caller's own (admin) credentials: their AWS files and --profile, from an empty temp
+ * directory with an empty HOME and a minimal environment (adminEnv), on an assembly passed with --app. No project
+ * code runs here: no cdk.json (so no `app` command and no plugins), no .npmrc, no npm; only the synthesized and
+ * checked cdk.out.
+ * @param {Io} io
+ * @param {Config} config
+ * @param {Target} target
+ * @param {string[]} args
+ * @param {import('./exec.mjs').RunOptions} [options]
+ */
+function adminCdk(io, config, target, args, options = {}) {
+  const place = cdkPlace();
+  return io.run(process.execPath, [cdkBin(), ...args, ...(target.profile ? ['--profile', target.profile] : [])], {
+    cwd: place.cwd,
+    fullEnv: adminEnv(config.aws.region, place.home),
+    ...options,
+  });
+}
+
+/**
+ * CloudFormation keeps the service role a stack was created or last updated with (describe-stacks RoleARN) and
+ * reuses it on every update that names none; it can be replaced, never removed. A CI stack once deployed through
+ * the project's execution role (or any role) is therefore still updated as that role, not with the admin's
+ * credentials. Print which role it is; refuse the project's own execution role, which NoChangeToCiRoles stops from
+ * changing the CI roles, so that deploy would fail half-way.
+ * @param {Io} io
+ * @param {Aws} aws
+ * @param {Config} config
+ */
+export async function checkCiServiceRole(io, aws, config) {
+  const ci = ciStackName(config.project);
+  const existing = await aws.describeStack(ci);
+  if (!existing) {
+    io.say(`${ci} does not exist yet: CloudFormation creates it with your credentials`);
+    return;
+  }
+  if (existing.roleArn === undefined) {
+    io.say(`${ci} has no stored service role: CloudFormation acts with your credentials`);
+    return;
+  }
+  const { account, region } = config.aws;
+  const exec = `arn:aws:iam::${account}:role/cdk-${config.qualifier}-cfn-exec-role-${account}-${region}`;
+  if (existing.roleArn === exec) {
+    throw new CliError(`refusing: ${ci} keeps the project's execution role ${exec} as its CloudFormation service role, and CloudFormation `
+      + 'uses it for every update that names none; that role may not change the CI roles (NoChangeToCiRoles), so the deploy would fail. '
+      + 'A stack\'s service role can be replaced but never removed. To go on, either delete ' + ci + ' (aws cloudformation delete-stack '
+      + `--stack-name ${ci} with admin credentials; the pipeline cannot assume its roles until it is back) and run deploy-ci again, or `
+      + 'update it once with a CloudFormation service role of your own that may change the CI roles (cdk deploy --role-arn), knowing '
+      + 'every later update keeps that role');
+  }
+  io.warn(`${ci} keeps ${existing.roleArn} as its CloudFormation service role: CloudFormation updates it as that role, not with your credentials (a stack's service role can be replaced, never removed)`);
+}
+
+/** Why deploy-ci stops when there is no Docker: it never runs project code outside a container. */
+export const NO_DOCKER_CI = 'refusing: Docker is not available. deploy-ci runs the project\'s code (npm ci, cdk synth) only in a container, '
+  + 'never on this machine next to admin credentials, and has no --trust-project-code. Start Docker';
+
+/**
+ * `shukka deploy-ci <project>`: the CI stack (<Project>-Ci), which the pipeline and `shukka deploy` never deploy,
+ * deployed with the caller's own admin credentials (shukkaCiSynthesizer), without ever giving the project's code
+ * those credentials.
+ *
+ * Like deploy: refuses unless the tree is clean and HEAD is origin/main, builds from a fresh worktree of that commit,
+ * and the project named must be shukka.json's there. The CI stack's stored service role is read first
+ * (checkCiServiceRole). npm ci and cdk synth run only in a throwaway Docker container (no home directory, no
+ * credentials; no host fallback). The assembly then goes through the workflows' checks (assembly.mjs check
+ * --project, policy-guard.mjs), and the CI stack must be synthesized by shukkaCiSynthesizer and depend on nothing
+ * but its own assets (assembly.mjs ciStackPlan). shukka's own cdk, with the admin's credentials, diffs exactly that
+ * stack (`--exclusively`) and the guard reads the diff. After a confirmation (or --yes) it runs `cdk deploy --app
+ * <cdk.out> <Project>-Ci --exclusively` on the same assembly.
+ * @param {{
+ *   io: Io, makeAws: (region: string) => Aws, target: Target, configPath: string, cwd: string, project: string,
+ *   yes?: boolean, confirm: (question: string) => Promise<boolean>,
+ *   allowReplacement?: boolean, checkAssembly?: (dir: string, options?: { project?: string }) => string[],
+ * }} options
+ * @returns {Promise<number>}
+ */
+export async function deployCiCommand(options) {
+  const { io, target } = options;
+  const allow = options.allowReplacement ?? false;
+  const { root, sha, tree, config, aws } = await prepare(options);
+  try {
+    if (options.project !== config.project) {
+      throw new CliError(`refusing: shukka.json on origin/main is for project ${config.project}, not ${options.project}`);
+    }
+    await checkCiServiceRole(io, aws, config);
+    if (!dockerAvailable(io)) throw new CliError(NO_DOCKER_CI);
+    const steps = projectSteps(io, tree, config, false);
+    const assembly = synth(steps, tree, config);
+    await checkAssemblySafe(io, assembly, config.project, options.checkAssembly);
+    checkPoliciesSafe(io, root, assembly, config, allow);
+    const manifestFile = join(assembly, 'manifest.json');
+    /** @type {Record<string, any>} */
+    const artifacts = io.dryRun || !existsSync(manifestFile) ? {} : (JSON.parse(readFileSync(manifestFile, 'utf8')).artifacts ?? {});
+    const plan = io.dryRun
+      ? { selector: ciStackName(config.project), problems: [] }
+      : ciStackPlan(artifacts, config.project, { dir: assembly, account: config.aws.account, region: config.aws.region, qualifier: config.qualifier });
+    if (plan.selector === null) throw new CliError(`refusing to deploy the CI stack:\n${plan.problems.join('\n')}`);
+    const ci = plan.selector;
+    const as = target.profile ? ` (profile ${target.profile})` : '';
+    io.say(`cdk runs with your own credentials${as}, from an empty directory, on the checked assembly only, for ${ci} alone`);
+    // In a dry run nothing was synthesized, so the diff is printed, not run (as in diffAndGuard).
+    const d = adminCdk(io, config, target, ['diff', '--app', assembly, '--exclusively', ci, '--no-color'], { capture: 'merged' });
+    if (!io.dryRun) {
+      io.out(d.stdout.endsWith('\n') || d.stdout === '' ? d.stdout : `${d.stdout}\n`);
+      const result = guard(d.stdout, { allow });
+      io.out(report(result));
+      if (result.code !== 0) {
+        throw new CliError(result.verdict === 'incomplete'
+          ? 'the guard stopped the CI stack deploy: the diff is incomplete'
+          : 'the guard stopped the CI stack deploy: resources would be deleted or replaced; run again with --allow-replacement if that is intended');
+      }
+      if (d.status !== 0) throw new CliError(`cdk diff failed (exit ${d.status})`);
+      if (!options.yes && !(await options.confirm(`Deploy ${ci} at ${sha.slice(0, 12)} with your credentials${as}, as diffed above? Type yes: `))) {
+        throw new CliError(`${ci} not deployed`);
+      }
+    }
+    const r = adminCdk(io, config, target, ['deploy', '--app', assembly, ci, '--exclusively', '--require-approval', 'never', '--no-color']);
+    if (r.status !== 0) throw new CliError(`cdk deploy ${ci} failed (exit ${r.status})`);
+    io.say(io.dryRun ? 'dry run: nothing was deployed' : `${ci} deployed at ${sha}`);
     return 0;
   } finally {
     removeTree(io, root, tree);

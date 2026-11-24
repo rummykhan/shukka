@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { checkAssembly, ciStackName, deployCommands, main, stackNames } from '../scripts/assembly.mjs';
+import { checkAssembly, ciStackName, ciPublishProblems, ciStackPlan, deployCommands, main, stackNames } from '../scripts/assembly.mjs';
 
 const scratch = mkdtempSync(join(tmpdir(), 'shu-9zr-assembly-'));
 after(() => rmSync(scratch, { recursive: true, force: true }));
@@ -289,4 +289,51 @@ test('shu-9bj.12: deployCommands leaves the CI stack out and never lets cdk pull
   // The CI stack is matched by CloudFormation name, not by artifact id.
   assert.deepEqual(deployCommands({ X: { type: 'aws:cloudformation:stack', properties: { stackName: 'Shukkatest-Ci' } } }, 'shukkatest', 'abc').skipped, ['X']);
   assert.throws(() => deployCommands({ '--plugin=x': { type: 'aws:cloudformation:stack' } }, 'shukkatest', 'abc'), /could be read as a cdk option/);
+});
+
+test('shu-ecn: ciStackPlan deploys exactly <Project>-Ci, synthesized for the caller\'s credentials and depending on nothing but its own assets', () => {
+  const stack = (extra: Loose = {}) => ({ type: 'aws:cloudformation:stack', displayName: 'Shukkatest-Ci', properties: {}, dependencies: ['Shukkatest-Ci.assets'], ...extra });
+  const base = { 'Shukkatest-Ci.assets': { type: 'cdk:asset-manifest' }, 'Shukkatest-Box.assets': { type: 'cdk:asset-manifest' }, 'Shukkatest-Box': { type: 'aws:cloudformation:stack', properties: ROLES } };
+  assert.deepEqual(ciStackPlan({ ...base, 'Shukkatest-Ci': stack() }, 'shukkatest'), { selector: 'Shukkatest-Ci', problems: [] });
+  assert.deepEqual(ciStackPlan({ ...base, 'Shukkatest-Ci': stack({ dependencies: [] }) }, 'shukkatest').problems, []);
+  const refused = (artifacts: Loose, re: RegExp) => {
+    const plan = ciStackPlan(artifacts, 'shukkatest');
+    assert.equal(plan.selector, null);
+    assert.match(plan.problems.join('\n'), re);
+  };
+  refused({ ...base, 'Shukkatest-Ci': stack({ dependencies: ['Shukkatest-Ci.assets', 'Shukkatest-Box'] }) }, /depends on "Shukkatest-Box": the CI stack must depend on nothing but its own assets/);
+  refused({ ...base, 'Shukkatest-Ci': stack({ dependencies: ['Shukkatest-Box.assets'] }) }, /depends on "Shukkatest-Box.assets"/);
+  refused({ ...base, 'Shukkatest-Ci': stack({ properties: ROLES }) }, /names a deploy or execution role: synthesize it with shukkaCiSynthesizer/);
+  refused(base, /the app has no stack named Shukkatest-Ci/);
+  refused({ ...base, 'Shukkatest-Ci': stack({ displayName: '--plugin=x' }) }, /could be read as a cdk option/);
+});
+
+test('shu-ecn: ciPublishProblems accepts what shukkaCiSynthesizer writes and refuses a foreign bucket, an extra asset, an assumeRoleArn and a foreign lookup role', () => {
+  const dir = mkdtempSync(join(scratch, 'ci-publish-'));
+  const env = { dir, account: '123456789012', region: 'us-east-1', qualifier: 'shukkatest' };
+  const bucket = 'cdk-shukkatest-assets-123456789012-us-east-1';
+  const dest = { bucketName: bucket, objectKey: 'h.json', region: 'us-east-1' };
+  const lookupRole = { arn: 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/cdk-shukkatest-deploy-role-${AWS::AccountId}-${AWS::Region}', bootstrapStackVersionSsmParameter: '/cdk-bootstrap/shukkatest/version' };
+  const check = (props: Loose = {}, files: Loose = {}, d: Loose = dest) => {
+    writeFileSync(join(dir, 'Shukkatest-Ci.assets.json'), JSON.stringify({ files: { h: { source: { path: 'Shukkatest-Ci.template.json', packaging: 'file' }, destinations: { a: d } }, ...files } }));
+    const artifacts = {
+      'Shukkatest-Ci.assets': { type: 'cdk:asset-manifest', properties: { file: 'Shukkatest-Ci.assets.json' } },
+      'Shukkatest-Ci': { type: 'aws:cloudformation:stack', environment: 'aws://123456789012/us-east-1', dependencies: ['Shukkatest-Ci.assets'], properties: { templateFile: 'Shukkatest-Ci.template.json', stackTemplateAssetObjectUrl: `s3://${bucket}/h.json`, lookupRole, ...props } },
+    };
+    return ciPublishProblems(artifacts, 'Shukkatest-Ci', 'Shukkatest-Ci', env).join('\n');
+  };
+  assert.equal(check(), '');
+  assert.equal(check({ lookupRole: { arn: 'arn:aws:iam::123456789012:role/cdk-shukkatest-deploy-role-123456789012-us-east-1' } }), '', 'the resolved ARN too');
+  assert.match(check({ stackTemplateAssetObjectUrl: 's3://otherproject-deploy-123456789012/releases/app.tar.gz' }, {}, { bucketName: 'otherproject-deploy-123456789012', objectKey: 'releases/app.tar.gz', region: 'us-east-1' }), /not the project's bootstrap bucket/);
+  assert.match(check({}, { x: { source: { path: 'app.tar.gz' }, destinations: { a: dest } } }), /2 file assets/);
+  assert.match(check({}, {}, { ...dest, assumeRoleArn: 'arn:aws:iam::999999999999:role/x' }), /published as the role/);
+  assert.match(check({ lookupRole: { arn: 'arn:aws:iam::999999999999:role/x' } }), /lookup role is "arn:aws:iam::999999999999:role\/x"/);
+  assert.match(check({ lookupRole: undefined }), /lookup role is null/);
+  assert.match(check({}, {}, { ...dest, region: 'eu-west-1' }), /region "eu-west-1"/);
+  assert.match(check({ templateFile: 'Other.template.json' }), /is not its template file/);
+  // ciStackPlan applies it when given the environment.
+  assert.equal(ciStackPlan({
+    'Shukkatest-Ci.assets': { type: 'cdk:asset-manifest', properties: { file: 'Shukkatest-Ci.assets.json' } },
+    'Shukkatest-Ci': { type: 'aws:cloudformation:stack', dependencies: ['Shukkatest-Ci.assets'], properties: { lookupRole: { arn: 'arn:aws:iam::999999999999:role/x' } } },
+  }, 'shukkatest', env).selector, null);
 });

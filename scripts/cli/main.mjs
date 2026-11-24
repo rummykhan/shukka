@@ -1,4 +1,4 @@
-// The shukka CLI (design C7): `bootstrap --account`, `bootstrap <project>`, `diff`, `deploy`.
+// The shukka CLI (design C7): `bootstrap --account`, `bootstrap <project>`, `diff`, `deploy`, `deploy-ci <project>`.
 // Run with `npx github:rummykhan/shukka#v1 <command>`; bin/shukka loads this file.
 //
 // Exit codes: 0 done; 1 refused or failed (one `shukka: ...` line says why); 2 usage error;
@@ -104,7 +104,7 @@ export const COMMANDS = [
       '(scripts/upload.mjs) and release it on the servers (scripts/release.mjs), and the smoke test. Every part',
       'deploys, whatever changed. It builds from a fresh worktree of origin/main and reads shukka.json from there.',
       'It never deploys the CI stack <Project>-Ci (there is no flag for it): the diff says when that stack changed,',
-      'and an admin deploys it by hand (npx cdk deploy <Project>-Ci with admin credentials; README step 5).',
+      'and an admin deploys it with shukka deploy-ci <project> (below; README step 5).',
       '',
       ...PROJECT_CODE_HELP,
       '',
@@ -126,7 +126,50 @@ export const COMMANDS = [
       DRY_RUN,
     ],
   },
+  {
+    name: 'deploy-ci',
+    usage: 'shukka deploy-ci <project> [--config <path>] [--yes] [--allow-replacement] [--profile <name>] [--region <region>] [--dry-run]',
+    summary: [
+      'Deploys the CI stack <Project>-Ci (ShukkaAccess, synthesized with shukkaCiSynthesizer) with your own admin',
+      'credentials, the first time and after every change to it. The pipeline and shukka deploy never deploy it: the',
+      'fence refuses the execution role any change to the CI roles. Your credentials never reach the project\'s code:',
+      'like deploy it refuses unless the working tree is clean and HEAD equals origin/main, builds from a fresh worktree',
+      'of that commit (whose shukka.json must name <project>), and runs npm ci and cdk synth only in a throwaway Docker',
+      'container with no credentials (Docker is required; there is no --trust-project-code). The assembly goes through',
+      'the workflows\' checks (scripts/assembly.mjs check --project, scripts/policy-guard.mjs), and the CI stack must',
+      'depend on nothing but its own assets. It reads the stack\'s stored CloudFormation service role (describe-stacks',
+      'RoleARN), prints it, and refuses when it is the project\'s execution role. Then shukka\'s pinned cdk, with your',
+      'credentials, from an empty directory and on that checked cdk.out only, diffs <Project>-Ci alone and the guard',
+      'reads the diff; after you confirm (or with --yes) it runs cdk deploy --app <cdk.out> <Project>-Ci --exclusively.',
+      'Never npm ci or npx cdk in the checkout with admin credentials: that runs the merge\'s code as you.',
+    ].join('\n'),
+    flags: [
+      CONFIG,
+      { name: 'yes', help: 'deploy after the diff and the guard without asking (needed when stdin is not a terminal)' },
+      { name: 'allow-replacement', help: 'go ahead when the guard or the policy guard would stop it' },
+      PROFILE,
+      REGION,
+      DRY_RUN,
+    ],
+  },
 ];
+
+/**
+ * Ask on the terminal; true only when the answer is `yes`. Refuses when stdin is not a terminal (use --yes).
+ * @param {string} question
+ * @param {{ isTTY?: boolean }} [stdin]
+ * @returns {Promise<boolean>}
+ */
+export async function confirmOnTerminal(question, stdin = process.stdin) {
+  if (!stdin.isTTY) throw new CliError('no terminal to confirm on; read the diff and run again with --yes');
+  const { createInterface } = await import('node:readline/promises');
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    return (await rl.question(question)).trim() === 'yes';
+  } finally {
+    rl.close();
+  }
+}
 
 /**
  * The --help text: every command, its usage and every flag.
@@ -143,6 +186,7 @@ export function helpText() {
     "  bootstrap <project>   deploy the project's fence and its own CDK bootstrap; copy buildEnv to GitHub",
     '  diff                  cdk diff of origin/main with the guard\'s verdict',
     '  deploy                emergency deploy of origin/main from this machine',
+    '  deploy-ci <project>   deploy the CI stack <Project>-Ci with your admin credentials, from a checked assembly',
     '  help                  this text (also --help, and <command> --help)',
     '',
   ];
@@ -230,6 +274,7 @@ function list(flags, name) {
  *   env?: Record<string, string | undefined>,
  *   checkAssembly?: (dir: string, options?: { project?: string }) => string[],
  *   keepTemp?: boolean,
+ *   confirm?: (question: string) => Promise<boolean>,
  * }} Deps
  */
 
@@ -305,11 +350,19 @@ export async function main(argv, deps = {}) {
       return 0;
     }
 
-    if (positional.length > 0) throw new CliError(`${spec.name}: unexpected argument ${JSON.stringify(positional[0])}`, 2);
     // shukka.json is read from the fresh worktree of origin/main, not from this working tree.
     const target = { ...(profile ? { profile } : {}), ...(region ? { region } : {}) };
-    const { deployCommand, diffCommand } = await import('./deploy.mjs');
+    const { deployCiCommand, deployCommand, diffCommand } = await import('./deploy.mjs');
     const checkAssembly = deps.checkAssembly ? { checkAssembly: deps.checkAssembly } : {};
+    if (spec.name === 'deploy-ci') {
+      if (positional.length !== 1) throw new CliError('deploy-ci: give the project name (shukka deploy-ci <project>)', 2);
+      return await deployCiCommand({
+        io, makeAws, target, configPath, cwd, ...checkAssembly, project: /** @type {string} */ (positional[0]),
+        yes: flags.yes === true, confirm: deps.confirm ?? ((q) => confirmOnTerminal(q)),
+        allowReplacement: flags['allow-replacement'] === true,
+      });
+    }
+    if (positional.length > 0) throw new CliError(`${spec.name}: unexpected argument ${JSON.stringify(positional[0])}`, 2);
     const trustProjectCode = flags['trust-project-code'] === true;
     if (spec.name === 'diff') return await diffCommand({ io, makeAws, target, configPath, cwd, trustProjectCode, ...checkAssembly });
     return await deployCommand({

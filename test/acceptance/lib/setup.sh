@@ -229,34 +229,43 @@ qualifier_stacks() {
   } | grep . | sort -u || true
 }
 
-# The Ci stack (ShukkaAccess) is deployed by hand with admin credentials, as a consumer does before its
-# first merge and after every change to it (README step 5). It uses shukkaCiSynthesizer: CloudFormation
-# acts with these admin credentials, not the fenced execution role, which may not change the CI roles
-# (NoChangeToCiRoles); the pipeline never deploys it.
+# The Ci stack (ShukkaAccess) is deployed with `shukka deploy-ci` and admin credentials, as a consumer does
+# before its first merge and after every change to it (README step 5). It uses shukkaCiSynthesizer:
+# CloudFormation acts with the admin's credentials, not the fenced execution role, which may not change
+# the CI roles (NoChangeToCiRoles); the pipeline never deploys it. deploy-ci builds only origin/main, so
+# the baseline is pushed first with the caller workflow disabled (nothing runs); the first merge is
+# pushed after (setup_push_baseline). No project code runs here next to the admin profile: the lockfile
+# is resolved without install scripts, and deploy-ci synthesizes in Docker with no credentials.
 setup_ci_stack() {
-  local infra="$RUN_DIR/consumer/infra"
-  (cd "$infra" && npm install --no-audit --no-fund --loglevel=error) || die "npm install in the consumer's infra failed"
+  local infra="$RUN_DIR/consumer/infra" r role
+  (cd "$infra" && npm install --package-lock-only --ignore-scripts --no-audit --no-fund --loglevel=error) ||
+    die "resolving the consumer's infra lockfile failed"
+  clean_consumer_github
+  commit_all "shukkatest $RUN_ID: consumer baseline" >/dev/null || die "cannot commit the consumer baseline"
+  require_consumer_remote
+  gh workflow disable "$CALLER_WORKFLOW" -R "$CONSUMER_REPO" >/dev/null 2>&1 || true
+  c_git push -q --force origin HEAD:main || die "cannot push the baseline to $CONSUMER_REPO"
   state_set ci_stack_started 1
-  (cd "$infra" && npx cdk deploy Shukkatest-Ci --require-approval never --progress events) ||
-    die "deploying Shukkatest-Ci by hand failed"
-  local r role
+  cli_deploy_ci "$RUN_DIR/consumer" --yes || die "shukka deploy-ci $PROJECT failed"
   for r in infra app diff; do
     aws iam get-role --role-name "$PROJECT-shukka-$r" >/dev/null 2>&1 || die "role $PROJECT-shukka-$r was not created"
   done
+  # As deploy-ci reads it: no stored CloudFormation service role, so every update acts with the admin's
+  # credentials (CloudFormation would reuse a stored role, the execution role included, on every update).
   role=$(aws cloudformation describe-stacks --stack-name Shukkatest-Ci --query 'Stacks[0].RoleARN' --output text 2>/dev/null)
-  [[ "$role" == None || -z "$role" ]] || die "Shukkatest-Ci was deployed through a CloudFormation role ($role), not the admin's own credentials"
+  [[ "$role" == None || -z "$role" ]] || die "Shukkatest-Ci keeps the CloudFormation service role $role, so its updates run as that role, not the admin's credentials"
 }
 
-# Clean the test repository of earlier probes, then push the baseline as the first merge to main.
+# Push the first merge to main: the baseline is already there (setup_ci_stack), so an empty commit on it,
+# with the caller enabled again (teardown of an earlier run, and setup_ci_stack, leave it disabled).
 setup_push_baseline() {
-  clean_consumer_github
   local sha id
-  sha=$(commit_all "shukkatest $RUN_ID: consumer baseline")
+  c_git commit -q --allow-empty -m "shukkatest $RUN_ID: first merge" || die "cannot commit the first merge"
+  sha=$(c_git rev-parse HEAD)
   require_consumer_remote
-  # Teardown of an earlier run leaves the caller disabled; enable it, and wait until it is active, so
-  # this merge runs.
+  # Enable the caller, and wait until it is active, so this merge runs.
   enable_workflow "$CALLER_WORKFLOW"
-  c_git push -q --force origin HEAD:main || die "cannot push the baseline to $CONSUMER_REPO"
+  c_git push -q origin HEAD:main || die "cannot push the first merge to $CONSUMER_REPO"
   state_set baseline_sha "$sha"
   id=$(wait_run_of "$sha") ||
     die "no CI run for the baseline merge $sha; caller '$CALLER_WORKFLOW' is $(workflow_state "$CALLER_WORKFLOW")"

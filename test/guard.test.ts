@@ -198,7 +198,7 @@ test('shu-bp6: --summary without a file is refused', () => {
 
 test('shu-9bj.12: with --project the guard says when the diff changes the CI stack, which only an admin deploys; the verdict is unchanged', () => {
   const changed = `${ESC}[1mStack ${ESC}[1mShukkatest-Ci${ESC}[22m\nIAM Statement Changes\nResources\n[~] AWS::IAM::Role InfraRole InfraRole1234\n\nStack Shukkatest-Box\nThere were no differences\n\n${closing}\n`;
-  const notice = /^guard: Shukkatest-Ci changes, and the pipeline never deploys it: an admin deploys it by hand \(npx cdk deploy Shukkatest-Ci with admin credentials, README step 5\)$/m;
+  const notice = /^guard: Shukkatest-Ci changes, and the pipeline never deploys it: an admin deploys it with shukka deploy-ci shukkatest \(README step 5\)$/m;
   const dir = mkdtempSync(join(tmpdir(), 'shu-9bj12-guard-'));
   try {
     const summary = join(dir, 'summary.md');

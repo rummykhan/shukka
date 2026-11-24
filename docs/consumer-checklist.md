@@ -139,10 +139,11 @@ Example values: project `acme`, repository `acme-org/acme`, account `12345678901
   gh variable list --repo acme-org/acme
   ```
 
-- [ ] Deploy the CI stack by hand with admin credentials, from a clean checkout of `main` you trust, after reading its diff. The pipeline and `shukka deploy` never deploy `<Project>-Ci`: repeat this whenever it changes (the pipeline's diff then says `guard: Acme-Ci changes, and the pipeline never deploys it`):
+- [ ] Deploy the CI stack with `shukka deploy-ci` (README, step 5), with admin credentials and Docker running, from a clean checkout at `origin/main` and a clone of shukka at your pinned tag. It synthesizes in a container with no credentials, checks the assembly, prints the stack's stored CloudFormation service role, shows the diff and asks before `cdk deploy --app <checked cdk.out> Acme-Ci --exclusively`. **Never** `npm ci` or `npx cdk` in the checkout with admin credentials. The pipeline and `shukka deploy` never deploy `<Project>-Ci`: repeat this whenever it changes (the pipeline's diff then says `guard: Acme-Ci changes, and the pipeline never deploys it: an admin deploys it with shukka deploy-ci acme`):
 
   ```bash
-  cd ~/src/acme/infra && npm ci && npx cdk diff Acme-Ci --profile admin && npx cdk deploy Acme-Ci --profile admin
+  cd ~/src/acme && git status   # clean, at origin/main
+  node ~/shukka/bin/shukka deploy-ci acme --profile admin
   for r in infra app diff; do aws iam get-role --role-name acme-shukka-$r --profile admin --query Role.Arn; done
   ```
 

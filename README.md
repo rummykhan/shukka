@@ -88,7 +88,7 @@ Read this part before you adopt shukka.
 - **You trust shukka's tags with your AWS account.** Whoever can push tags to `rummykhan/shukka` decides what the pipeline runs. Pinning `@v1` takes every new v1 release automatically; pin `@v1.x.y` to choose when (see [Versioning](#versioning-and-pins)).
 - **The fence is a name prefix.** A resource someone made by hand whose name starts with your project's name is inside your fence. Project names must not be prefixes of each other (`acme` and `acmepro`). `shukka bootstrap` refuses a name that prefixes, or is prefixed by, another shukka project, and refuses when tables, buckets, queues, topics, functions, log groups, alarms, roles, instance profiles, SES configuration sets or SSM documents already carry the name outside your project's stacks. A resource made by hand after bootstrap is not caught.
 - **The account is shared.** Read-only calls that AWS cannot scope to a resource (describing instances, reading SSM command results by id) work across projects.
-- **Bootstrap and every deploy of the CI stack run with admin credentials.** The pipeline never deploys `<Project>-Ci`: its roles are the ones the pipeline runs as, and the fence refuses the execution role any change to them, so CloudFormation must act as an admin for that one stack (step 5). That deploy runs your CDK app, and CloudFormation applies whatever the CI stack holds, with admin rights: run `shukka bootstrap` from outside your project directory (below), and deploy the CI stack only from a checkout you trust, after reading its diff.
+- **Bootstrap and every deploy of the CI stack run with admin credentials.** The pipeline never deploys `<Project>-Ci`: its roles are the ones the pipeline runs as, and the fence refuses the execution role any change to them, so CloudFormation must act as an admin for that one stack (step 5). CloudFormation applies whatever the CI stack holds with admin rights: run `shukka bootstrap` from outside your project directory (below), and deploy the CI stack only with `shukka deploy-ci`, after reading its diff. Never run `npm ci` or `npx cdk` in your checkout with admin credentials: that runs the merged code (npm scripts, the CDK app, cdk.json plugins) as the admin.
 - **The emergency deploy runs your build on your laptop.** In Docker it sees only a fresh checkout and none of your credentials, but it has the network. With `--trust-project-code` (no Docker) it runs as you and can read your home directory (`~/.aws`, the SSO cache, `gh`'s token). Run it as a non-admin emergency principal where you can.
 
 ## Adopting shukka
@@ -181,8 +181,8 @@ const app = new App();
 const env = { account: '123456789012', region: 'us-east-1' };
 const synthesizer = shukkaSynthesizer('acme');           // your qualifier
 
-// The CI stack: the three roles the pipeline assumes. Named <Project>-Ci, and deployed only by hand, by an
-// admin (step 5): its own synthesizer, so CloudFormation acts with the admin's credentials, not the fence's.
+// The CI stack: the three roles the pipeline assumes. Named <Project>-Ci, and deployed only by an admin with
+// shukka deploy-ci (step 5): its own synthesizer, so CloudFormation acts with the admin's credentials, not the fence's.
 const ci = new Stack(app, 'Acme-Ci', { env, synthesizer: shukkaCiSynthesizer('acme') });
 new ShukkaAccess(ci, 'Access', {
   project: 'acme',
@@ -243,18 +243,19 @@ Before changing anything, bootstrap refuses: a project name that prefixes anothe
 
 Useful flags: `--hosted-zone-id` and `--mail-domain` override `fence` in `shukka.json`; `--emergency-principal <role or user ARN>` (repeatable) names who may run `shukka deploy` from a laptop (default: whoever runs the bootstrap; the account root is refused, so run it as an IAM role or user); `--dry-run`. Running it again is safe and is how you change the fence or the emergency principals. **Re-running without `--emergency-principal` resets the emergency principals to whoever runs it**, so name every principal you want to keep each time.
 
-### 5. Deploy the CI stack by hand, as an admin
+### 5. Deploy the CI stack with `shukka deploy-ci`, as an admin
 
-A pipeline cannot create the role it runs as, and must never change it: the fence refuses the execution role any change to the three CI roles' trust or policies (`NoChangeToCiRoles`). So `Acme-Ci` is the one stack that does not go through your project's bootstrap. With `shukkaCiSynthesizer` (step 3), `cdk deploy` runs CloudFormation with your own admin credentials:
+A pipeline cannot create the role it runs as, and must never change it: the fence refuses the execution role any change to the three CI roles' trust or policies (`NoChangeToCiRoles`). So `Acme-Ci` is the one stack that does not go through your project's bootstrap. With `shukkaCiSynthesizer` (step 3), CloudFormation acts with your own admin credentials, and `shukka deploy-ci` makes sure your project's code never gets them. Use it for the first deploy and for every one after; push the commit with the CI stack to `main` first (with the caller workflow disabled if you do not want it to run yet). From a clean checkout of your project at `origin/main`, with Docker running and a clone of shukka at your pinned tag (as for the [emergency deploy](#emergency-deploy-github-is-down)):
 
 ```bash
-cd ~/src/acme/infra
-npm ci
-npx cdk diff Acme-Ci --profile admin       # read it first
-npx cdk deploy Acme-Ci --profile admin
+cd ~/src/acme
+git status            # must be clean, at origin/main
+node ~/shukka/bin/shukka deploy-ci acme --profile admin
 ```
 
-This runs your CDK app, and CloudFormation applies the CI stack, with admin credentials: do it from a clean checkout of `main` you trust. Do the same whenever the CI stack changes (a new shukka release line in `shukkaVersions`, another repository subject): **the pipeline never deploys `Acme-Ci`**, and neither does `shukka deploy`. The pipeline's diff, on pull requests and on merges, still shows the stack's changes and says when an admin deploy is needed (`guard: Acme-Ci changes, and the pipeline never deploys it`). Until you deploy it, the roles keep their old trust and policies. The policy guard reads the CI stack too and stops a merge whose CI roles would trust anything outside the project, but only your own review protects the hand deploy.
+It builds a fresh worktree of `origin/main` (whose `shukka.json` must name `acme`), runs `npm ci` and `cdk synth` only in a throwaway Docker container with no credentials, checks the assembly as the pipeline does (`scripts/assembly.mjs check --project`, the policy guard), and refuses when `Acme-Ci` depends on any other stack or another stack's assets, when its asset manifest holds anything but its own template published to your project's bootstrap bucket (`cdk-<qualifier>-assets-<account>-<region>`, in your region, with no role to assume, at the object its template URL names), or when its lookup role is not your project's deploy role: cdk publishes and reads those with your credentials. It reads the stack's stored CloudFormation service role (`describe-stacks` `RoleARN`) and prints it: CloudFormation reuses a stored role on every update, and if it is your project's execution role (the stack was once deployed through the bootstrap) deploy-ci refuses and says how to go on. Then shukka's own pinned `cdk`, with your profile, from an empty directory and on that checked `cdk.out` only, shows `cdk diff` of `Acme-Ci` alone and the guard's verdict, asks you to type `yes`, and runs `cdk deploy --app <cdk.out> Acme-Ci --exclusively`. Flags: `--yes` (no question; needed without a terminal), `--allow-replacement`, `--config`, `--region`, `--dry-run`.
+
+**Never run `npm ci` or `npx cdk diff/deploy Acme-Ci` in your checkout with admin credentials**: that runs the merged code (npm install scripts, your CDK app, `cdk.json` plugins) as the admin. Do this whenever the CI stack changes (a new shukka release line in `shukkaVersions`, another repository subject): **the pipeline never deploys `Acme-Ci`**, and neither does `shukka deploy`. The pipeline's diff, on pull requests and on merges, still shows the stack's changes and says when an admin deploy is needed (`guard: Acme-Ci changes, and the pipeline never deploys it: an admin deploys it with shukka deploy-ci acme`). Until you deploy it, the roles keep their old trust and policies. The policy guard reads the CI stack too and stops a merge whose CI roles would trust anything outside the project; the diff deploy-ci shows is still yours to read.
 
 ### 6. Repository variables
 
@@ -426,7 +427,7 @@ Limits:
 - It deploys **only what is on `origin/main`**: it refuses a dirty tree or a `HEAD` that differs from `origin/main`. It fetches first; if GitHub is unreachable it compares with the last `origin/main` you fetched. You cannot push a fix while GitHub is down, so you can only redeploy what was already merged.
 - Your principal must be an emergency principal named at bootstrap (default: whoever ran it).
 - `origin` must be your GitHub repository: the policy guard checks GitHub trusts (your CI stack has them) against it, and stops the deploy otherwise.
-- It never deploys the CI stack `<Project>-Ci`, and has no flag to: an admin deploys it by hand (step 5). The diff says when it changed.
+- It never deploys the CI stack `<Project>-Ci`, and has no flag to: an admin deploys it with `shukka deploy-ci` (step 5). The diff says when it changed.
 - Prefer a non-admin emergency principal, above all with `--trust-project-code`.
 - It does not coordinate with a pipeline run. Do not run both at once.
 
@@ -435,14 +436,14 @@ Limits:
 - **One hosted zone per project**, by id. Mail domains: any number.
 - **No Docker image assets.** shukka's bootstrap has no image repository or image-publishing role, and an assembly with Docker image assets is refused.
 - **The cloud assembly must be readable by shukka's pinned `cdk` CLI** (`aws-cdk` 2.1148.0 in this release). If your `aws-cdk-lib` is newer than that CLI understands, the deploy fails with a schema version error until a shukka release bumps the pin.
-- **No AWS SSO profiles for bootstrap yet.** shukka runs `cdk` with an empty home directory, where SSO's token cache is not found. Use a profile with long-lived or assumed-role credentials. Exporting short-lived credentials into the environment first (`eval "$(aws configure export-credentials --profile <sso-profile> --format env)"`, then no `--profile`) should work but has not been tested.
+- **No AWS SSO profiles for bootstrap or deploy-ci yet.** shukka runs `cdk` with an empty home directory, where SSO's token cache is not found. Use a profile with long-lived or assumed-role credentials. Exporting short-lived credentials into the environment first (`eval "$(aws configure export-credentials --profile <sso-profile> --format env)"`, then no `--profile`) should work but has not been tested.
 - **At most 20 apps** per project.
 - One environment (`prod`) per project; EC2 servers only (no ECS or Lambda app deploys).
 - The services listed under [What the fence stops](#what-the-fence-stops). Anything else is refused.
 - Instances launch only from Amazon-owned AMIs (the fence's default; `shukka bootstrap` has no flag to change it yet).
 - **Top-level stacks only**: stacks inside a CDK `Stage` are not deployed.
 - **Deliberately public resources** need a run by hand with `allow_replacement` on every merge that deploys the infrastructure (step 3).
-- **The CI stack is deployed only by hand, by an admin** (step 5): the fence refuses the execution role any change to the `<project>-shukka-*` roles' trust and policies, so neither the pipeline nor `shukka deploy` deploys `<Project>-Ci`.
+- **The CI stack is deployed only by an admin, with `shukka deploy-ci`** (step 5): the fence refuses the execution role any change to the `<project>-shukka-*` roles' trust and policies, so neither the pipeline nor `shukka deploy` deploys `<Project>-Ci`.
 
 ## Versioning and pins
 

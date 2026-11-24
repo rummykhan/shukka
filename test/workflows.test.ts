@@ -1044,7 +1044,7 @@ test('shu-9bj.12: infra deploy never deploys <Project>-Ci, checks every other st
   const r = await runStep(ws, infra, 'deploy', 'Deploy', {});
   assert.equal(r.code, 0, r.out);
   assert.deepEqual(r.cdk, [`deploy --app ${assembly} --require-approval never --no-color --exclusively Shukkatest-Box --tags=Project=shukkatest --tags=shukka:revision=${head}`]);
-  assert.match(r.out, /::notice::shukka: not deploying Shukkatest-Ci: the CI stack is deployed by hand with admin credentials/);
+  assert.match(r.out, /::notice::shukka: not deploying Shukkatest-Ci: an admin deploys the CI stack with shukka deploy-ci shukkatest/);
   writeFileSync(join(assembly, 'manifest.json'), JSON.stringify({ artifacts: { 'Shukkatest-Ci': { type: 'aws:cloudformation:stack', properties: { tags } } } }));
   const only = await runStep(ws, infra, 'deploy', 'Deploy', {});
   assert.equal(only.code, 0, only.out);
@@ -1069,7 +1069,7 @@ test('shu-9bj.12: infra deploy never deploys <Project>-Ci, checks every other st
   const merge = await runStep(ws, infra, 'deploy', 'Diff and guard', deployExprs('false', 'push'), { FAKE_DIFF: diffFile });
   assert.equal(merge.code, 0, merge.out);
   assert.match(merge.out, /\[~\] AWS::IAM::Role InfraRole/);
-  assert.match(merge.out, /^guard: Shukkatest-Ci changes, and the pipeline never deploys it: an admin deploys it by hand/m);
+  assert.match(merge.out, /^guard: Shukkatest-Ci changes, and the pipeline never deploys it: an admin deploys it with shukka deploy-ci shukkatest/m);
   assert.match(merge.summary, /\*\*Admin deploy needed:\*\* Shukkatest-Ci changes/);
   const pr = await runStep(ws, infra, 'diff', 'Diff and guard', {}, { FAKE_DIFF: diffFile });
   assert.equal(pr.code, 0, pr.out);

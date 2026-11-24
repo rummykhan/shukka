@@ -23,7 +23,7 @@
 #            any role is assumed; allow_replacement on a run by hand goes ahead); skip when the
 #            stacks are already at a later commit; cdk diff, ### Infrastructure changes and ### Guard
 #            in the step summary, guard.mjs, cdk deploy tagged shukka:revision=<sha> of every stack but
-#            the CI stack <Project>-Ci (deployed by hand by an admin; the guard says when it changed)
+#            the CI stack <Project>-Ci (an admin deploys it with shukka deploy-ci; the guard says when it changed)
 #   diff     diff mode (pull requests): the same diff under the read-only diff role with
 #            --method=template; the diff, the guard's and policy-guard.mjs's verdicts go to the
 #            artifact shukka-diff; a destructive diff or policy never fails it. Skipped with a notice when GitHub gives the job no
@@ -421,7 +421,7 @@ jobs:
 
       # cdk-assets runs on this runner with the deploy role: no asset may run a command, build a
       # Docker image or read outside the assembly. Every stack deploys through the project's bootstrap;
-      # only <Project>-Ci may name no deploy role (an admin deploys it by hand; Deploy leaves it out).
+      # only <Project>-Ci may name no deploy role (an admin deploys it with shukka deploy-ci; Deploy leaves it out).
       - name: Check the assembly
         id: assembly
         env:
@@ -564,7 +564,7 @@ jobs:
       # shukka:revision. Stacks with the same tags deploy together; otherwise one by one in
       # dependency order (assembly.mjs deployCommands, which shukka deploy uses too). The CI stack
       # <Project>-Ci is never deployed here: the execution role may not change the CI roles, so an
-      # admin deploys it by hand (README step 5); the diff above says when it changed. Nothing from
+      # admin deploys it with shukka deploy-ci (README step 5); the diff above says when it changed. Nothing from
       # the assembly may become a cdk option: each tag is one --tags=k=v token, and every stack
       # selector is checked again (assembly.mjs SELECTOR) before cdk starts.
       - name: Deploy
@@ -592,7 +592,7 @@ jobs:
             process.exit(1);
           }
           for (const s of plan.skipped) {
-            console.log(`::notice::shukka: not deploying ${s}: the CI stack is deployed by hand with admin credentials (cdk deploy ${s}, README step 5)`);
+            console.log(`::notice::shukka: not deploying ${s}: an admin deploys the CI stack with shukka deploy-ci ${process.env.PROJECT} (README step 5)`);
           }
           if (plan.commands.length === 0) console.log(plan.skipped.length > 0 ? 'shukka: no stack to deploy but the CI stack' : 'shukka: the app has no stacks');
           for (const args of plan.commands) {
