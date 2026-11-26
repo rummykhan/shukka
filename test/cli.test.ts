@@ -2176,7 +2176,7 @@ test('shu-dnd: --tag-existing-ec2 --dry-run prints create-tags for the EC2 resou
   assert.equal(lookup.length, 1);
   assert.deepEqual(lookup[0]!.args.slice(0, 4), ['ec2', 'describe-addresses', '--public-ips', '203.0.113.7']);
   assert.ok(r.out.includes('stack Shukkatest-prod-Instance: i-0abc12345678def01, lt-0c441db83956d6c6b'), r.out);
-  assert.deepEqual(MUTATING(calls).filter((c) => !(c.cmd === 'aws' && c.args[1] === 'describe-addresses')), [], 'a dry run changes nothing');
+  assert.deepEqual(MUTATING(calls).filter((c) => !(c.cmd === 'aws' && (c.args[1] === 'describe-addresses' || c.args[1] === 'describe-instances'))), [], 'a dry run changes nothing');
 }));
 
 test('shu-dnd: --tag-existing-ec2 tags after the boundary stack and before the project bootstrap', withTmp(async (tmp) => {
@@ -2206,6 +2206,77 @@ test('shu-dnd: a failed Elastic IP lookup stops the bootstrap before anything ch
   const r2 = await cli(projectArgs(), { cwd: dir, spawn: plain.spawn, aws: ec2Account().aws });
   assert.equal(r2.code, 0, r2.out + r2.err);
   assert.ok(!r2.out.includes('create-tags') && !plain.calls.some((c) => c.args[1] === 'describe-addresses'), r2.out);
+}));
+
+// ---------- shu-bca: the network interfaces and volumes RunInstances attached to an owned instance carry no tag ----------
+
+const OWN_ENI = 'eni-0aaaaaaaaaaaaaaa1';
+const OWN_ROOT = 'vol-0bbbbbbbbbbbbbbb2';
+
+/** ec2Spawn, and describe-instances answers with the owned instance's interface and volumes (one also a stack resource) and a foreign instance's, which must be dropped. */
+function bcaSpawn(describe: (c: Call) => { status: number; stdout: string } = () => ({
+  status: 0,
+  stdout: JSON.stringify([
+    ['i-0abc12345678def01', [OWN_ENI], [OWN_ROOT, 'vol-0fedcba9876543210']],
+    ['i-0999999999999999a', ['eni-0999999999999999e'], ['vol-0999999999999999f']],
+  ]),
+})) {
+  return recordingSpawn((c) => {
+    if (c.cmd === 'aws' && c.args[1] === 'describe-instances') return describe(c);
+    if (c.cmd === 'aws' && c.args[1] === 'describe-addresses') return { status: 0, stdout: '203.0.113.7\teipalloc-0a1b2c3d4e5f60718\n' };
+    return answerExport(c);
+  });
+}
+const READS = (c: Call) => c.cmd === 'aws' && (c.args[1] === 'describe-addresses' || c.args[1] === 'describe-instances');
+
+test('shu-bca: --tag-existing-ec2 --dry-run also prints create-tags for the interfaces and volumes attached to owned instances only, looked up read only', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  const { calls, spawn } = bcaSpawn();
+  const r = await cli(projectArgs(['--tag-existing-ec2']), { cwd: dir, spawn, aws: ec2Account().aws });
+  assert.equal(r.code, 0, r.out + r.err);
+  const lookup = calls.filter((c) => c.cmd === 'aws' && c.args[1] === 'describe-instances');
+  assert.equal(lookup.length, 1, 'one read-only lookup, run in a dry run');
+  assert.deepEqual(lookup[0]!.args.slice(0, 4), ['ec2', 'describe-instances', '--instance-ids', 'i-0abc12345678def01'], 'only owned instances are asked about');
+  assert.ok(lookup[0]!.args.includes('--query'));
+  assert.match(lookup[0]!.args.join(' '), /NetworkInterfaces\[\]\.NetworkInterfaceId/);
+  assert.match(lookup[0]!.args.join(' '), /BlockDeviceMappings\[\]\.Ebs\.VolumeId/);
+  const tags = printed(r.out).filter((l) => l.includes('ec2 create-tags'));
+  assert.deepEqual(tags, [
+    `+ aws ec2 create-tags --resources i-0abc12345678def01 lt-0c441db83956d6c6b sg-0123456789abcdef0 vol-0fedcba9876543210 ${OWN_ENI} ${OWN_ROOT} --tags Key=Project,Value=shukkatest --region us-east-1 --profile stelking   [dry run: not run]`,
+    '+ aws ec2 create-tags --resources eipalloc-0a1b2c3d4e5f60718 --tags Key=Project,Value=shukkatest --region us-east-1 --profile stelking   [dry run: not run]',
+  ], 'the attached ids are tagged with the instance\'s stack, a volume that is also a stack resource only once');
+  for (const id of ['eni-0999999999999999e', 'vol-0999999999999999f', ...FOREIGN]) assert.ok(!r.out.includes(id), `${id} is attached to no owned instance and is never named`);
+  assert.deepEqual(MUTATING(calls).filter((c) => !READS(c)), [], 'a dry run changes nothing');
+}));
+
+test('shu-bca: the attached interfaces and volumes are tagged for real after the boundary stack and before the project bootstrap', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  const { calls, spawn } = bcaSpawn();
+  const r = await cli(projectArgs(['--tag-existing-ec2']).filter((a) => a !== '--dry-run'), { cwd: dir, spawn, aws: ec2Account().aws });
+  assert.equal(r.code, 0, r.out + r.err);
+  const lines = printed(r.out);
+  const boundary = lines.findIndex((l) => l.includes('deploy Shukka-Boundary-shukkatest'));
+  const tag = lines.findIndex((l) => l.includes(`create-tags --resources i-0abc12345678def01`) && l.includes(OWN_ENI));
+  const toolkit = lines.findIndex((l) => l.startsWith('+ aws cloudformation deploy'));
+  assert.ok(boundary !== -1 && tag > boundary && toolkit > tag, r.out);
+  const describe = calls.findIndex((c) => c.cmd === 'aws' && c.args[1] === 'describe-instances');
+  const firstChange = calls.findIndex((c) => MUTATING([c]).length > 0 && !READS(c));
+  assert.ok(describe !== -1 && describe < firstChange, 'the lookup comes before anything changes');
+  const runs = calls.filter((c) => c.cmd === 'aws' && c.args[1] === 'create-tags');
+  assert.ok(runs.some((c) => c.args.includes(OWN_ENI) && c.args.includes(OWN_ROOT)), 'run for real');
+  for (const c of runs) for (const id of ['eni-0999999999999999e', 'vol-0999999999999999f']) assert.ok(!c.args.includes(id), `${id} not tagged`);
+}));
+
+test('shu-bca: a failed or unreadable describe-instances stops the bootstrap before anything changes', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  for (const answer of [{ status: 255, stdout: '' }, { status: 0, stdout: 'not json' }]) {
+    const { calls, spawn } = bcaSpawn(() => answer);
+    const r = await cli(projectArgs(['--tag-existing-ec2']).filter((a) => a !== '--dry-run'), { cwd: dir, spawn, aws: ec2Account().aws });
+    assert.equal(r.code, 1, r.out + r.err);
+    assert.match(r.err, /describe-instances/);
+    assert.match(r.err, /i-0abc12345678def01/);
+    assert.deepEqual(MUTATING(calls).filter((c) => !READS(c)), [], 'nothing ran');
+  }
 }));
 
 test('shu-dnd: bootstrap --account refuses --tag-existing-ec2, and --help documents it', async () => {

@@ -75,6 +75,8 @@ export const COMMANDS = [
       'and Elastic IPs of stacks tagged Project=<project> or shukka:project=<project> are tagged Project=<project> (aws ec2',
       'create-tags, printed per stack) right after Shukka-Boundary-<project> is deployed: the fence changes and deletes only',
       'Project-tagged EC2 resources, so one made before the tag would be left behind when a fenced deploy replaces it.',
+      'The network interfaces and EBS volumes attached to each such instance are tagged too (looked up read only with aws',
+      'ec2 describe-instances): RunInstances made them, so they carry no tag, and the fence would refuse a replacement on them.',
     ].join('\n'),
     flags: [
       { name: 'account', help: 'bootstrap the account (Shukka-Account) instead of a project' },
@@ -87,7 +89,7 @@ export const COMMANDS = [
       { name: 'emergency-principal', value: '<arn>', repeat: true, help: 'role or user ARN (pattern) that may deploy from a laptop (default: whoever runs this)' },
       { name: 'allow-private-types', help: 'go ahead although the account has private CloudFormation extensions (each is listed with its execution role)' },
       { name: 'bound-existing-roles', help: 'for a project moving onto shukka: after deploying Shukka-Boundary-<project>, put its boundary on the roles named like the project that have none and are in a stack tagged Project=<project> or shukka:project=<project> (aws iam put-role-permissions-boundary, each printed), re-check, then go on; any other such role still refuses' },
-      { name: 'tag-existing-ec2', help: 'for a project moving onto shukka: tag the EC2 instances, launch templates, security groups, volumes and Elastic IPs of stacks tagged Project=<project> or shukka:project=<project> Project=<project> (aws ec2 create-tags, each printed), so a fenced deploy can replace or delete them; nothing outside those stacks is tagged' },
+      { name: 'tag-existing-ec2', help: 'for a project moving onto shukka: tag the EC2 instances, launch templates, security groups, volumes and Elastic IPs of stacks tagged Project=<project> or shukka:project=<project>, and the network interfaces and volumes attached to those instances, Project=<project> (aws ec2 create-tags, each printed), so a fenced deploy can replace or delete them; nothing outside those stacks is tagged' },
       PROFILE,
       REGION,
       DRY_RUN,

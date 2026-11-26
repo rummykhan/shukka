@@ -31,7 +31,8 @@ export const STUCK = {
   ROLLBACK_FAILED: 'its creation failed and the rollback failed too. Delete it by hand with admin credentials '
     + '(aws cloudformation delete-stack --stack-name <stack>, with --retain-resources for any resource that will not delete), then deploy again',
   UPDATE_ROLLBACK_FAILED: 'an update failed and rolling it back failed too. Continue the rollback with admin credentials '
-    + '(aws cloudformation continue-update-rollback --stack-name <stack>, with --resources-to-skip for any resource that cannot roll back), then deploy again',
+    + '(aws cloudformation continue-update-rollback --stack-name <stack> --resources-to-skip <logical id>, naming each resource that failed '
+    + 'to roll back, for example a role the fence will not let the rollback change; only resources that failed during the rollback can be skipped), then deploy again',
   DELETE_FAILED: 'a delete of it failed. Delete it by hand with admin credentials '
     + '(aws cloudformation delete-stack --stack-name <stack>, with --retain-resources for any resource that will not delete), then deploy again',
   REVIEW_IN_PROGRESS: 'a change set created it and was never executed, so it holds nothing. Delete it by hand with admin credentials '
@@ -85,7 +86,7 @@ export async function readStackStates(names, cfn, warn = () => {}) {
  */
 export function summary(stuck) {
   if (stuck.length === 0) return '';
-  const rows = stuck.map((s) => `| \`${s.name}\` | \`${s.status}\` | ${s.advice.replaceAll('|', '\\|')} |`);
+  const rows = stuck.map((s) => `| \`${s.name}\` | \`${s.status}\` | ${s.advice.replaceAll('|', '\\|').replaceAll('<', '&lt;').replaceAll('>', '&gt;')} |`);
   return ['### Infrastructure not deployed: a stack is stuck', '',
     'The deploy role may not delete stacks, so cdk cannot deploy over these. An admin has to act first:', '',
     '| Stack | State | What to do |', '|---|---|---|', ...rows, '', ''].join('\n');
