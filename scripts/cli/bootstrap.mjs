@@ -394,7 +394,8 @@ const IPV4_RE = /^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/;
  * shukka:project=<project>, in this region) that the fence changes only when they carry Project=<project>. Resources
  * created before the project tagged its stacks lack the tag, so a fenced deploy could not replace or delete them and
  * CloudFormation's cleanup would leave them behind. An Elastic IP's public address is looked up (read only) to its
- * allocation id. Nothing outside those stacks is ever named.
+ * allocation id, and the network interfaces and EBS volumes attached to each owned instance are looked up (read only)
+ * too. Nothing outside those stacks, or attached to an instance outside them, is ever named.
  * @param {Io} io
  * @param {Aws} aws
  * @param {string} project
@@ -428,8 +429,40 @@ async function ownedEc2Resources(io, aws, project, target) {
       else io.warn(`Elastic IP ${ip} (stack ${stack}) has no allocation id in this region; not tagged`);
     }
   }
+  // The network interfaces and EBS volumes attached to each owned instance: RunInstances made them, not the stack, so
+  // they carry no Project tag, and the fence then refuses a replacement's DisassociateAddress or DetachVolume on them
+  // (shu-bca, Orbitary's switch-over). Looked up read only; only what is attached to an owned instance is named.
+  const instances = found.filter((r) => r.id.startsWith('i-'));
+  if (instances.length > 0) {
+    const stackOf = new Map(instances.map((r) => [r.id, r.stack]));
+    const r = io.run('aws', [
+      'ec2', 'describe-instances', '--instance-ids', ...stackOf.keys(),
+      '--query', 'Reservations[].Instances[].[InstanceId,NetworkInterfaces[].NetworkInterfaceId,BlockDeviceMappings[].Ebs.VolumeId]', '--output', 'json',
+      '--region', target.region, ...profileArgs(target),
+    ], { mutates: false, capture: 'stdout' });
+    if (r.status !== 0) throw new CliError(`cannot look up the network interfaces and volumes of the instance(s) ${[...stackOf.keys()].join(', ')} of ${project}'s stacks (aws ec2 describe-instances failed)`);
+    /** @type {unknown} */
+    let rows;
+    try { rows = JSON.parse(r.stdout || '[]'); } catch { rows = null; }
+    if (!Array.isArray(rows)) throw new CliError(`cannot read the answer of aws ec2 describe-instances for ${[...stackOf.keys()].join(', ')}`);
+    const seen = new Set(found.map((x) => x.id));
+    for (const row of rows) {
+      if (!Array.isArray(row)) continue;
+      const [instance, enis, volumes] = row;
+      const stack = typeof instance === 'string' ? stackOf.get(instance) : undefined;
+      if (!stack) continue;
+      for (const id of [...(Array.isArray(enis) ? enis : []), ...(Array.isArray(volumes) ? volumes : [])]) {
+        if (typeof id === 'string' && ATTACHED_ID_RE.test(id) && !seen.has(id)) {
+          seen.add(id);
+          found.push({ id, stack });
+        }
+      }
+    }
+  }
   return found;
 }
+/** An interface or EBS volume attached to an instance. */
+const ATTACHED_ID_RE = /^(?:eni|vol)-[0-9a-f]{8,17}$/;
 
 /**
  * Tag each of the project's own EC2 resources Project=<project> (one `aws ec2 create-tags` per stack, printed).

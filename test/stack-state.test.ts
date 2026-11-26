@@ -30,6 +30,17 @@ function fakeCfn(stacks: Record<string, string>, asked: string[] = []) {
   };
 }
 
+test('shu-bca: UPDATE_ROLLBACK_FAILED names continue-update-rollback with --resources-to-skip <logical id>, and the summary shows the placeholder', () => {
+  const [s] = stuckStacks([{ name: 'Acme-Web', status: 'UPDATE_ROLLBACK_FAILED' }]);
+  assert.ok(s);
+  assert.match(s.advice, /aws cloudformation continue-update-rollback --stack-name Acme-Web --resources-to-skip <logical id>/);
+  assert.match(s.advice, /only resources that failed during the rollback can be skipped/);
+  assert.match(s.advice, /admin credentials/);
+  const md = summary([s]);
+  assert.match(md, /--resources-to-skip &lt;logical id&gt;/, 'the placeholder is not swallowed as an HTML tag');
+  assert.doesNotMatch(md, /<logical id>/);
+});
+
 test('shu-wud: each stuck state names the stack, the state and what an admin does; other states pass', () => {
   assert.deepEqual(Object.keys(STUCK).sort(), [...STATES].sort());
   for (const status of STATES) {
