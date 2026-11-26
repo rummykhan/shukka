@@ -1160,3 +1160,36 @@ test('shu-r5f: an invalid qualifier stops the diffs and the deploy before cdk ru
     }
   }
 });
+
+test('shu-njm: build refuses a bundle whose native modules are for another architecture than the app\'s servers', async () => {
+  const ws = workspace();
+  // A build that leaves an ELF .node for machine $M (62 x64, 183 arm64) in the bundle, as npm leaves sharp's.
+  const writeNode = 'node -e \'const b=Buffer.alloc(64);b.write("\\x7fELF",0,"latin1");b[4]=2;b[5]=1;b[6]=1;b.writeUInt16LE(3,16);'
+    + 'b.writeUInt16LE(Number(process.env.M),18);const d="dist/node_modules/@img/sharp/lib";require("fs").mkdirSync(d,{recursive:true});'
+    + 'require("fs").writeFileSync(d+"/sharp.node",b)\'';
+  const app = (arch: string, machine: number) => JSON.stringify({
+    ...fixtureConfig.apps[0],
+    build: { ...fixtureConfig.apps[0]!.build, run: ['bash build.sh', writeNode], env: { GREETING_STYLE: 'plain', M: String(machine) } },
+    server: { ...fixtureConfig.apps[0]!.server, arch },
+  });
+  const given = (json: string) => ({ 'toJSON(matrix.app)': json, 'matrix.app.name': 'web', 'strategy.job-index': '0', 'toJSON(vars)': JSON.stringify({ SHUKKATEST_GREETING: 'hi' }) });
+
+  const wrong = await runStep(ws, pipeline, 'build', 'Build and bundle', given(app('arm64', 62)));
+  assert.equal(wrong.code, 1, wrong.out);
+  assert.match(wrong.out, /native-arch: "node_modules\/@img\/sharp\/lib\/sharp\.node": built for x64, the servers are arm64/);
+  assert.match(wrong.out, /::error::shukka: build web: the bundle holds native modules for another architecture than the servers' \(arm64\)/);
+  assert.equal(wrong.outputs.digest_0, undefined, 'no digest for a refused bundle');
+
+  const right = await runStep(ws, pipeline, 'build', 'Build and bundle', given(app('arm64', 183)));
+  assert.equal(right.code, 0, right.out);
+  assert.match(right.out, /native-arch: 1 native module\(s\), all linux arm64/);
+  const listing = execFileSync('tar', ['-tzf', join(ws.temp, 'shukka-bundle', 'bundle.tgz')], { encoding: 'utf8' });
+  assert.match(listing, /node_modules\/@img\/sharp\/lib\/sharp\.node/);
+
+  // No arch (a config normalised before it existed): x64.
+  const legacy = JSON.parse(app('x64', 62));
+  delete legacy.server.arch;
+  const x64 = await runStep(ws, pipeline, 'build', 'Build and bundle', given(JSON.stringify(legacy)));
+  assert.equal(x64.code, 0, x64.out);
+  assert.match(x64.out, /all linux x64/);
+});

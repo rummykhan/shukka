@@ -153,6 +153,7 @@ In your project root. The schema (`schema/shukka.schema.json`) documents every f
 - `apps[].build.bundle`: a script in the build dir that prints the path of the directory to ship. `scripts/bundle.sh` is provided by shukka for Next.js `output: 'standalone'` (it adds `.next/static` and `public` and deletes every `.env*`).
 - `apps[].build.env`: non-secret values written in the file. `buildEnv`: names of non-secret values read from GitHub repository variables (step 6 copies them there).
 - `apps[].server.health`: a URL on the server itself (`127.0.0.1` or `localhost`).
+- `apps[].server.arch`: `x64` (default) or `arm64`, the CPU of the app's servers (`arm64` for Graviton, such as t4g). For `arm64` the build runs on GitHub's `ubuntu-24.04-arm` runner (and in a `linux/arm64` container for `shukka deploy`), so native modules such as sharp match the server; every build fails if the bundle holds a `.node` file for another architecture.
 - `aws.deployBucket`: optional; the bucket for app bundles. Default `<project>-deploy-<account>`. If you set it, it must start with the project name, or your stacks cannot create it through the fence.
 - `alwaysDeploy`: deploy everything on every merge. Default `false`.
 - `fence`: the hosted zone (exactly one, by id) and the SES domains your stacks may change. Read by `shukka bootstrap`.

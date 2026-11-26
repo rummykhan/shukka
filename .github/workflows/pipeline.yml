@@ -18,7 +18,8 @@
 # nested workflow's jobs show as "<caller> / <job>", and its skipped jobs are listed too):
 #   plan     plan                      reads and validates shukka.json; no AWS access, does not decide what changed
 #   checks   check <name>              one per shukka.json check (pull requests and merges); no AWS access
-#   build    build <app>               one per app (deploying runs only): build, bundle, upload bundle-<app>; no AWS access
+#   build    build <app>               one per app (deploying runs only): build, bundle, upload bundle-<app>; no AWS access;
+#                                      on an arm64 runner when the app's servers are arm64 (apps[].server.arch)
 #   diff     pull request / synth      pull requests: the project's cdk synth, without credentials
 #            pull request / diff       the read-only diff role diffs the synthesized assembly
 #            pull request / comment    one PR comment marked <!-- shukka:diff --> updated in place
@@ -266,7 +267,10 @@ jobs:
     name: build ${{ matrix.app.name }}
     needs: plan
     if: needs.plan.outputs.deploy == 'true' && needs.plan.outputs.has_apps == 'true'
-    runs-on: ubuntu-24.04
+    # The bundle carries the app's native modules (sharp's @img/sharp-linux-<arch>, ...), which npm installs for the
+    # machine it runs on, so an app whose servers are arm64 (apps[].server.arch) builds on an arm64 runner.
+    # ubuntu-24.04-arm is a standard GitHub-hosted runner, free-plan minutes included, in private repositories too.
+    runs-on: ${{ matrix.app.server.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     timeout-minutes: 60
     permissions:
       contents: read
@@ -376,6 +380,12 @@ jobs:
           process.stdout.write(`${dir}\n`);
           JS
           dir=$(SHUKKA_DIR="$GITHUB_WORKSPACE/.shukka" node "$RUNNER_TEMP/shukka-build.mjs" | tail -n 1)
+          # Refuse native modules the servers cannot load (a .node file built for another architecture).
+          arch=$(node -e 'process.stdout.write(JSON.parse(process.env.APP).server.arch ?? "x64")')
+          node "$GITHUB_WORKSPACE/.shukka/scripts/native-arch.mjs" "$dir" "$arch" || {
+            echo "::error::shukka: build $APP_NAME: the bundle holds native modules for another architecture than the servers' ($arch)"
+            exit 1
+          }
           mkdir -p "$RUNNER_TEMP/shukka-bundle"
           # A tarball keeps symbolic links as links; upload.mjs checks them on the deploy side.
           tar -C "$dir" -czf "$RUNNER_TEMP/shukka-bundle/bundle.tgz" .
