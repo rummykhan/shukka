@@ -91,6 +91,17 @@ Read this part before you adopt shukka.
 - **Bootstrap and every deploy of the CI stack run with admin credentials.** The pipeline never deploys `<Project>-Ci`: its roles are the ones the pipeline runs as, and the fence refuses the execution role any change to them, so CloudFormation must act as an admin for that one stack (step 5). CloudFormation applies whatever the CI stack holds with admin rights: run `shukka bootstrap` from outside your project directory (below), and deploy the CI stack only with `shukka deploy-ci`, after reading its diff. Never run `npm ci` or `npx cdk` in your checkout with admin credentials: that runs the merged code (npm scripts, the CDK app, cdk.json plugins) as the admin.
 - **The emergency deploy runs your build on your laptop.** In Docker it sees only a fresh checkout and none of your credentials, but it has the network. With `--trust-project-code` (no Docker) it runs as you and can read your home directory (`~/.aws`, the SSO cache, `gh`'s token). Run it as a non-admin emergency principal where you can.
 
+## Quick start
+
+In your repository root, `shukka init` writes `shukka.json` and the caller workflow `.github/workflows/ci.yml`, pinned to a release tag, and prints the CDK wiring for your app:
+
+```bash
+cd ~/src/acme
+npx github:rummykhan/shukka#v1.2.3 init acme --account 123456789012 --region us-east-1    # --apps web,api when they are not package.json workspaces
+```
+
+It reads your apps from `package.json` workspaces, their checks and build from each app's `package.json` scripts, and `infra.dir` from your `cdk.json`. Every value it could not read holds `TODO` (a `TODO` command fails until you replace it) and it lists them all; fill them in using steps 2 and 3 below. It never overwrites a file without `--force`, and calls neither AWS nor GitHub. `--ref vX.Y.Z` pins another release. Then follow the steps below from step 1: bootstrap the account and the project, deploy the CI stack, push.
+
 ## Adopting shukka
 
 You need: an AWS account with admin credentials for the one-time setup; a GitHub repository; Node 22, `git`, the AWS CLI v2 (2.9 or later) and `gh` (signed in, with admin on the repository) on the machine you set up from; a CDK app in TypeScript or JavaScript; and one Route 53 hosted zone the project may change.
