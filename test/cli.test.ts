@@ -2387,6 +2387,7 @@ test('shu-2mg: an SSO profile that is not signed in stops before cdk, says to ru
   assert.equal(g.code, 1);
   assert.match(g.err, /gave no keys for profile sso-admin/);
   assert.ok(!g.err.includes('leaked-secret') && !g.out.includes('leaked-secret'));
+}));
 
 test('shu-njm: deploy builds and bundles an arm64 app in a linux/arm64 container, keeps the other project steps on linux/amd64, and refuses an x64 native module', withTmp(async (tmp) => {
   const { dir } = consumer(tmp, (c) => { c.apps[0].server.arch = 'arm64'; });
