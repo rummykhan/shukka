@@ -45,7 +45,8 @@ export const COMMANDS = [
     name: 'bootstrap',
     usage: 'shukka bootstrap --account [--oidc-provider-arn <arn>] [--projects <a,b>] [--profile <name>] --region <region> [--dry-run]\n'
       + 'shukka bootstrap <project> [--config <path>] [--hosted-zone-id <id>] [--mail-domain <domain>]... [--repo <owner/name>]\n'
-      + '    [--emergency-principal <arn>]... [--allow-private-types] [--bound-existing-roles] [--profile <name>] [--region <region>] [--dry-run]',
+      + '    [--emergency-principal <arn>]... [--allow-private-types] [--bound-existing-roles] [--tag-existing-ec2]\n'
+      + '    [--profile <name>] [--region <region>] [--dry-run]',
     summary: [
       'Once per AWS account, with admin credentials: --account deploys the Shukka-Account stack (cdk deploy), which owns',
       "the account's GitHub OIDC provider, or imports an existing one with --oidc-provider-arn, and lists the account's",
@@ -68,6 +69,11 @@ export const COMMANDS = [
       'are in a stack tagged Project=<project> or shukka:project=<project> do not refuse: right after Shukka-Boundary-<project>',
       'is deployed, each gets the boundary (aws iam put-role-permissions-boundary, printed), the roles are checked again, and',
       'the bootstrap goes on. Without the flag, the refusal names it when every such role is in the project\'s own stacks.',
+      '',
+      'With --tag-existing-ec2 (a project moving onto shukka), the EC2 instances, launch templates, security groups, volumes',
+      'and Elastic IPs of stacks tagged Project=<project> or shukka:project=<project> are tagged Project=<project> (aws ec2',
+      'create-tags, printed per stack) right after Shukka-Boundary-<project> is deployed: the fence changes and deletes only',
+      'Project-tagged EC2 resources, so one made before the tag would be left behind when a fenced deploy replaces it.',
     ].join('\n'),
     flags: [
       { name: 'account', help: 'bootstrap the account (Shukka-Account) instead of a project' },
@@ -80,6 +86,7 @@ export const COMMANDS = [
       { name: 'emergency-principal', value: '<arn>', repeat: true, help: 'role or user ARN (pattern) that may deploy from a laptop (default: whoever runs this)' },
       { name: 'allow-private-types', help: 'go ahead although the account has private CloudFormation extensions (each is listed with its execution role)' },
       { name: 'bound-existing-roles', help: 'for a project moving onto shukka: after deploying Shukka-Boundary-<project>, put its boundary on the roles named like the project that have none and are in a stack tagged Project=<project> or shukka:project=<project> (aws iam put-role-permissions-boundary, each printed), re-check, then go on; any other such role still refuses' },
+      { name: 'tag-existing-ec2', help: 'for a project moving onto shukka: tag the EC2 instances, launch templates, security groups, volumes and Elastic IPs of stacks tagged Project=<project> or shukka:project=<project> Project=<project> (aws ec2 create-tags, each printed), so a fenced deploy can replace or delete them; nothing outside those stacks is tagged' },
       PROFILE,
       REGION,
       DRY_RUN,
@@ -321,7 +328,7 @@ export async function main(argv, deps = {}) {
       const { bootstrapAccount, bootstrapProject } = await import('./bootstrap.mjs');
       if (flags.account === true) {
         if (positional.length > 0) throw new CliError('bootstrap: give --account or a project name, not both', 2);
-        const projectOnly = ['config', 'hosted-zone-id', 'mail-domain', 'repo', 'emergency-principal', 'allow-private-types', 'bound-existing-roles'].filter((f) => f in flags);
+        const projectOnly = ['config', 'hosted-zone-id', 'mail-domain', 'repo', 'emergency-principal', 'allow-private-types', 'bound-existing-roles', 'tag-existing-ec2'].filter((f) => f in flags);
         if (projectOnly.length > 0) throw new CliError(`bootstrap --account: --${projectOnly[0]} is for a project bootstrap`, 2);
         const r = region ?? env.AWS_REGION ?? env.AWS_DEFAULT_REGION;
         if (!r) throw new CliError('bootstrap --account: give --region', 2);
@@ -353,6 +360,7 @@ export async function main(argv, deps = {}) {
         ...(list(flags, 'emergency-principal') ? { emergencyPrincipals: list(flags, 'emergency-principal') } : {}),
         allowPrivateTypes: flags['allow-private-types'] === true,
         boundExistingRoles: flags['bound-existing-roles'] === true,
+        tagExistingEc2: flags['tag-existing-ec2'] === true,
       });
       return 0;
     }
