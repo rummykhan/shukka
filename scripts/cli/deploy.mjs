@@ -6,7 +6,7 @@
 //
 // `deploy` takes the steps the workflows take, in the same order:
 //   checks (pipeline.yml "check", skippable with --skip-checks) -> build and bundle (pipeline.yml "build") ->
-//   synth, assembly and policy checks, cdk diff, guard, cdk deploy with the shukka:revision tag (infra.yml "deploy") ->
+//   synth, assembly and policy checks, stuck-stack check, cdk diff, guard, cdk deploy with the shukka:revision tag (infra.yml "deploy") ->
 //   upload and release each app (ec2.yml "release": scripts/upload.mjs, scripts/release.mjs) -> smoke.
 // Credentials, as in CI: the project's own code (checks, build, bundle, npm ci, synth, smoke) runs in a throwaway
 // Docker container with only the fresh worktree mounted and nothing of the caller's environment or home
@@ -25,11 +25,12 @@ import { randomBytes } from 'node:crypto';
 import { copyFileSync, cpSync, existsSync, lstatSync, mkdtempSync, readFileSync, realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { bootstrapVersionArgs, ciStackName, ciStackPlan, deployCommands } from '../assembly.mjs';
+import { bootstrapVersionArgs, ciStackName, ciStackPlan, deployCommands, stackNames } from '../assembly.mjs';
 import { loadConfig } from '../config.mjs';
 import { adminNotice, guard, report } from '../guard.mjs';
 import { githubRepoFromUrl, policyGuard, report as policyReport } from '../policy-guard.mjs';
 import { release } from '../release.mjs';
+import { stuckStacks } from '../stack-state.mjs';
 import { checkBundle, upload } from '../upload.mjs';
 import {
   CliError, HOST_CODE_WARNING, NPM_SAFE, awsFiles, cdkBin, cdkPlace, containerArgs, dockerAvailable, ensureProjectImage, mustRun, projectEnv, refuseSymlink,
@@ -419,6 +420,46 @@ function deployStacks(io, config, session, assembly, sha) {
 }
 
 /**
+ * Stop before cdk when a stack the deploy would touch (every stack in the assembly but the CI stack) is in a state no
+ * update can leave (scripts/stack-state.mjs: ROLLBACK_COMPLETE, ROLLBACK_FAILED, UPDATE_ROLLBACK_FAILED,
+ * DELETE_FAILED, REVIEW_IN_PROGRESS), naming the stack, its state and what an admin does, as infra.yml does. cdk would
+ * otherwise try to delete it and fail on the deploy role's DeleteStack deny. A stack that cannot be read is a warning.
+ * @param {Io} io
+ * @param {Aws} aws
+ * @param {Config} config
+ * @param {string} assembly
+ */
+export async function checkStacksDeployable(io, aws, config, assembly) {
+  if (io.dryRun) {
+    io.out('+ read the state of each stack to deploy; stop if one is ROLLBACK_COMPLETE, ROLLBACK_FAILED, UPDATE_ROLLBACK_FAILED, DELETE_FAILED or REVIEW_IN_PROGRESS   [dry run: not run]\n');
+    return;
+  }
+  const ci = ciStackName(config.project);
+  /** @type {string[]} */
+  let names = [];
+  if (existsSync(join(assembly, 'manifest.json'))) {
+    try {
+      names = stackNames(assembly).filter((n) => n !== ci);
+    } catch (error) {
+      throw new CliError(/** @type {Error} */ (error).message);
+    }
+  }
+  /** @type {import('../stack-state.mjs').StackState[]} */
+  const states = [];
+  for (const name of names) {
+    try {
+      const s = await aws.describeStack(name);
+      states.push({ name, status: s?.status ?? null });
+    } catch (error) {
+      io.warn(`could not read the state of stack ${name}: ${String(/** @type {Error} */ (error).message ?? error).split('\n')[0]}`);
+    }
+  }
+  const stuck = stuckStacks(states);
+  if (stuck.length > 0) throw new CliError(`refusing to deploy:\n${stuck.map((s) => s.message).join('\n')}`);
+  io.say(`stacks checked: none is stuck (${names.length})`);
+}
+
+/**
  * Run each check's commands in its directory, as pipeline.yml's check job does, as project code.
  * @param {Io} io
  * @param {ProjectSteps} steps
@@ -640,6 +681,7 @@ export async function deployCommand(options) {
     await checkAssemblySafe(io, assembly, config.project, options.checkAssembly);
     checkPoliciesSafe(io, root, assembly, config, options.allowReplacement ?? false);
     const session = await fencedSession(io, aws, config);
+    await checkStacksDeployable(io, aws, config, assembly);
     const { result, diffStatus } = diffAndGuard(io, config, session, assembly, options.allowReplacement ?? false);
     if (result.code !== 0) {
       throw new CliError(result.verdict === 'incomplete'

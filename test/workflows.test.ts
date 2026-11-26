@@ -340,7 +340,7 @@ printf 'aws %s\\n' "$*" >>"$FAKE_CDK_LOG"
 echo '{"AccessKeyId":"AKIAORDERCHECK","SecretAccessKey":"order-secret","SessionToken":"order-token"}'
 `);
 
-// node: real node, except that changed.mjs, upload.mjs and release.mjs run their own main() with
+// node: real node, except that changed.mjs, upload.mjs, release.mjs and stack-state.mjs run their own main() with
 // stubbed AWS clients (from $FAKE_WORLD); each call's arguments are logged to $FAKE_LOG.
 const fakeNodeModule = join(scratch, 'fake-node.mjs');
 writeFileSync(fakeNodeModule, `
@@ -369,10 +369,11 @@ const stubs = {
     return { Status: 'Success', ResponseCode: 0, StandardOutputContent: 'shukka: p/a old -> new live\\n' };
   } },
 };
-if (['changed.mjs', 'upload.mjs', 'release.mjs'].includes(name)) {
+if (['changed.mjs', 'upload.mjs', 'release.mjs', 'stack-state.mjs'].includes(name)) {
   const mod = await import(pathToFileURL(resolve(args[0])).href);
   const deps = name === 'changed.mjs'
     ? { clients: { cfn: stubs.cfn, ec2: stubs.ec2, ssm: stubs.ssm }, wait: { sleep: async () => {}, timeoutMs: 10, intervalMs: 1 } }
+    : name === 'stack-state.mjs' ? { cfn: stubs.cfn }
     : { s3: stubs.s3, ssm: stubs.ssm, ec2: stubs.ec2, pollMs: 1 };
   const code = await mod.main(args.slice(1), deps);
   appendFileSync(process.env.FAKE_LOG, JSON.stringify({ script: name, args: args.slice(1), code, sent, key: process.env.AWS_ACCESS_KEY_ID ?? null }) + '\\n');
@@ -886,6 +887,37 @@ test('shu-9zr: a deploy of an older commit than the stacks carry is skipped, rea
   const denied = await runStep(ws, infra, 'deploy', 'Check the stacks are not ahead of this commit', exprs, { FAKE_AWS_FAIL: '1' });
   assert.deepEqual(denied.outputs, { skip: 'false' });
   assert.match(denied.out, /could not read the stacks' revisions; deploying/);
+});
+
+test('shu-wud: the deploy job stops before cdk on a stuck stack, naming it, its state and what to do, in the log and the summary', async () => {
+  const ws = workspace();
+  const name = 'Check no stack is stuck';
+  const names = steps(infra.jobs.deploy).map((s) => s.name as string);
+  assert.ok(names.indexOf(name) > names.indexOf('Check the stacks are not ahead of this commit'), names.join(', '));
+  assert.ok(names.indexOf(name) < names.indexOf('Diff and guard'), names.join(', '));
+  assert.equal(step(infra, 'deploy', name).if, "steps.order.outputs.skip != 'true'");
+  const exprs = { 'steps.assembly.outputs.stacks': 'Shukkatest-Box,Shukkatest-Ci', 'steps.config.outputs.account': '123456789012', 'steps.config.outputs.region': 'us-east-1' };
+  const world = (status: string, ci = 'CREATE_COMPLETE') => JSON.stringify({ stacks: [{ StackName: 'Shukkatest-Box', StackStatus: status }, { StackName: 'Shukkatest-Ci', StackStatus: ci }] });
+  for (const status of ['ROLLBACK_FAILED', 'ROLLBACK_COMPLETE', 'UPDATE_ROLLBACK_FAILED', 'DELETE_FAILED', 'REVIEW_IN_PROGRESS']) {
+    const r = await runStep(ws, infra, 'deploy', name, exprs, { FAKE_WORLD: world(status) });
+    assert.notEqual(r.code, 0, `${status}: ${r.out}`);
+    assert.match(r.out, new RegExp(`^::error::shukka: stack Shukkatest-Box is in ${status}: .*(delete-stack|continue-update-rollback) --stack-name Shukkatest-Box`, 'm'), status);
+    assert.match(r.summary, new RegExp(`\\| \`Shukkatest-Box\` \\| \`${status}\` \\|.*admin credentials`), status);
+    assert.ok(r.cdk.includes('aws sts assume-role --role-arn arn:aws:iam::123456789012:role/cdk-shukkatest-deploy-role-123456789012-us-east-1 --role-session-name shukka-infra-state --query Credentials --output json'));
+    const call = r.calls[0] as Loose;
+    assert.equal(call.key, 'AKIAORDERCHECK');
+    assert.match(r.out, /^::add-mask::order-secret$/m);
+  }
+  // The CI stack is never deployed by the pipeline, so its state does not stop it; a healthy stack goes on.
+  const ok = await runStep(ws, infra, 'deploy', name, exprs, { FAKE_WORLD: world('UPDATE_COMPLETE', 'ROLLBACK_FAILED') });
+  assert.equal(ok.code, 0, ok.out);
+  assert.equal(ok.summary, '');
+  assert.deepEqual((ok.calls[0] as Loose).sent.map((c: Loose) => c.input.StackName), ['Shukkatest-Box']);
+  // A stack that does not exist yet is fine; credentials that cannot be had warn and go on (cdk reports the rest).
+  assert.equal((await runStep(ws, infra, 'deploy', name, exprs, { FAKE_WORLD: JSON.stringify({ stacks: [] }) })).code, 0);
+  const denied = await runStep(ws, infra, 'deploy', name, exprs, { FAKE_AWS_FAIL: '1' });
+  assert.equal(denied.code, 0, denied.out);
+  assert.match(denied.out, /could not read the stacks' states; deploying/);
 });
 
 test('shu-9zr: synth runs the project\'s npm ci and cdk synth with no credentials and tars the assembly; its settings are checked', async () => {
