@@ -68,7 +68,10 @@ const neutral = synthFence(NEUTRAL);
 // own test below and a case in test/simulate/run.mjs. Every other statement must equal the spike's.
 const SPIKE_EXCEPTIONS: Record<'executionA' | 'executionB' | 'boundary', { changed: string[]; added: string[]; removed?: string[] }> = {
   executionA: {
-    changed: ['LambdaEventSources'], // Create/Update/Delete fenced by lambda:FunctionArn
+    changed: [
+      'LambdaEventSources', // Create/Update/Delete fenced by lambda:FunctionArn
+      'DNS', // shu-jhi: ListQueryLoggingConfigs and UpdateHostedZoneComment on the zone (CloudFormation's hosted-zone handler)
+    ],
     added: [
       'LambdaEventSourcesRead', 'LambdaEventSourcesList', // Get by mapping ARN, List on * (no resource type)
       'AssetBucketRead', // shu-9bj.2: Lambda code from the project's own bootstrap asset bucket
@@ -626,6 +629,30 @@ test('shu-9bj.9: every action ShukkaAccess grants its roles is also allowed for 
           assert.ok(allowed && !denied, `${props.RoleName}: ${action} on ${sample} is refused by the boundary`);
         }
       }
+    }
+  }
+});
+
+test('shu-jhi: the DNS statement grants what CloudFormation\'s hosted-zone read and update handlers call, on the project\'s zone only', () => {
+  const zone = 'arn:aws:route53:::hostedzone/ZEXAMPLEZONE';
+  const added = ['route53:ListQueryLoggingConfigs', 'route53:UpdateHostedZoneComment'];
+  const forbidden = [
+    'route53:CreateHostedZone', 'route53:DeleteHostedZone', 'route53:AssociateVPCWithHostedZone',
+    'route53:DisassociateVPCFromHostedZone', 'route53:CreateQueryLoggingConfig', 'route53:DeleteQueryLoggingConfig',
+  ];
+  const docsOf = fenceDocuments({ ...NEUTRAL, qualifier: 'shukkatest' });
+  const dns = stmt(docsOf.executionA, 'DNS');
+  assert.equal(dns.Effect, 'Allow');
+  assert.deepEqual(list(dns.Resource), [zone], 'only the project\'s zone');
+  for (const a of ['route53:GetHostedZone', 'route53:ListTagsForResource', ...added]) assert.ok(list(dns.Action).includes(a), `DNS grants ${a}`);
+  for (const doc of [docsOf.executionA, docsOf.executionB, docsOf.executionC, docsOf.boundary]) {
+    for (const st of doc.Statement) {
+      if (st.Effect !== 'Allow') continue;
+      for (const a of added) {
+        if (list(st.Action).includes(a)) assert.deepEqual(list(st.Resource), [zone], `${st.Sid}: ${a} only on the zone`);
+      }
+      for (const a of forbidden) assert.ok(!list(st.Action).includes(a), `${st.Sid} does not grant ${a}`);
+      assert.ok(!list(st.Action).some((a) => a.startsWith('route53:') && a.includes('*')), `${st.Sid}: no route53 wildcard`);
     }
   }
 });
