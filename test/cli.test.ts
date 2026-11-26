@@ -2131,3 +2131,44 @@ test('shu-r5f: a qualifier that is not ^[a-z0-9]{1,10}$ is refused before any cd
     assert.ok(!s.calls.some((y) => isCdk(y, 'diff') || isCdk(y, 'deploy')), `${bad}: cdk never ran`);
   }
 }));
+
+test('shu-njm: deploy builds and bundles an arm64 app in a linux/arm64 container, keeps the other project steps on linux/amd64, and refuses an x64 native module', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp, (c) => { c.apps[0].server.arch = 'arm64'; });
+  const elf = (machine: number) => {
+    const b = Buffer.alloc(64);
+    b.write('\x7fELF', 0, 'latin1');
+    b[4] = 2; b[5] = 1; b[6] = 1;
+    b.writeUInt16LE(3, 16);
+    b.writeUInt16LE(machine, 18);
+    return b;
+  };
+  const bundle = bundleDir(tmp);
+  mkdirSync(join(bundle, 'node_modules', '@img', 'sharp-linux-arm64', 'lib'), { recursive: true });
+  writeFileSync(join(bundle, 'node_modules', '@img', 'sharp-linux-arm64', 'lib', 'sharp-linux-arm64.node'), elf(183));
+  let s = deploySpawn(CLEAN_DIFF, bundle);
+  const r = await cli(['deploy', '--profile', 'stelking'], { cwd: dir, spawn: s.spawn, aws: awsWith(releaseClients()).aws, checkAssembly: NO_ASSETS });
+  assert.equal(r.code, 0, r.out + r.err);
+  const steps = s.calls.filter((x) => stepOf(x) !== undefined);
+  assert.deepEqual(steps.map(stepOf), PROJECT_STEPS);
+  const armSteps = new Set(['npm ci', 'npm run build', 'bundle.sh']);
+  for (const x of steps) {
+    const argv: string[] = x.options.docker;
+    const arm = armSteps.has(stepOf(x)!);
+    assert.equal(argv[argv.indexOf('--platform') + 1], arm ? 'linux/arm64' : 'linux/amd64', stepOf(x));
+    assert.equal(unwrapDocker(argv).image, arm ? projectImage('linux/arm64') : projectImage(), stepOf(x));
+  }
+  // Each platform's image is looked up (and built when missing) once.
+  assert.deepEqual(s.calls.filter((x) => x.cmd === 'docker' && x.args[0] === 'image').map((x) => x.args.at(-1)), [projectImage(), projectImage('linux/arm64')]);
+
+  // The same app whose bundle carries sharp for x64 is refused before anything is synthesized or deployed.
+  const wrong = join(tmp, 'wrong');
+  cpSync(bundleDir(join(tmp, 'w')), wrong, { recursive: true });
+  mkdirSync(join(wrong, 'node_modules', '@img', 'sharp-linux-x64', 'lib'), { recursive: true });
+  writeFileSync(join(wrong, 'node_modules', '@img', 'sharp-linux-x64', 'lib', 'sharp-linux-x64.node'), elf(62));
+  s = deploySpawn(CLEAN_DIFF, wrong);
+  const refused = await cli(['deploy', '--profile', 'stelking'], { cwd: dir, spawn: s.spawn, aws: awsWith(releaseClients()).aws, checkAssembly: NO_ASSETS });
+  assert.equal(refused.code, 1, refused.out + refused.err);
+  assert.match(refused.err, /build web: the bundle holds native modules for another architecture than the servers' \(arm64\)/);
+  assert.match(refused.err, /"node_modules\/@img\/sharp-linux-x64\/lib\/sharp-linux-x64\.node": built for x64, the servers are arm64/);
+  assert.ok(!s.calls.some((x) => stepOf(x) === 'cdk synth' || isCdk(x, 'deploy')), 'nothing synthesized or deployed');
+}));

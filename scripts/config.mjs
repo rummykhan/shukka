@@ -16,7 +16,8 @@ import { fileURLToPath } from 'node:url';
 /**
  * @typedef {{ name: string, dir: string, run: string[], services: string[] }} Check
  * @typedef {{ dir: string, run: string[], bundle: string, env: Record<string, string>, buildEnv: string[] }} Build
- * @typedef {{ configure: string, units: string[], health: string }} Server
+ * @typedef {'x64' | 'arm64'} Arch
+ * @typedef {{ arch: Arch, configure: string, units: string[], health: string }} Server
  * @typedef {{ name: string, paths: string[], build: Build, server: Server }} App
  * @typedef {{ infra: string, app: string, diff: string }} DerivedNames
  * @typedef {{ hostedZoneIds: string[], mailDomains: string[] }} Fence
@@ -39,6 +40,9 @@ import { fileURLToPath } from 'node:url';
  */
 
 const DEFAULT_NODE = '22';
+
+/** Servers are x64 unless an app says otherwise: shukka.json files written before apps[].server.arch existed. */
+export const DEFAULT_ARCH = 'x64';
 
 /** Every problem line starts with this, so none begins with text from the file. */
 export const PROBLEM_PREFIX = 'shukka.json: ';
@@ -153,6 +157,9 @@ function check(value, node, path, problems) {
   if (node.allOf) {
     for (const sub of node.allOf) check(value, sub, path, problems);
   }
+  if (node.enum && !node.enum.includes(value)) {
+    problems.push(`${at}: ${JSON.stringify(value)} is not one of ${node.enum.join(', ')}`);
+  }
   if (typeof value === 'string') {
     if (node.minLength !== undefined && value.length < node.minLength) {
       problems.push(`${at}: must not be empty`);
@@ -239,6 +246,7 @@ function normalise(raw) {
         buildEnv: [...(a.build.buildEnv ?? [])],
       },
       server: {
+        arch: a.server.arch ?? DEFAULT_ARCH,
         configure: a.server.configure,
         units: [...a.server.units],
         health: a.server.health,

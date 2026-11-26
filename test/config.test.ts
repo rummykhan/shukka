@@ -54,7 +54,7 @@ test('shu-9wa: the schema names exactly the contract keys', () => {
   const app = schema.definitions.app;
   assert.deepEqual(Object.keys(app.properties).sort(), ['build', 'name', 'paths', 'server']);
   assert.deepEqual(Object.keys(app.properties.build.properties).sort(), ['buildEnv', 'bundle', 'dir', 'env', 'run']);
-  assert.deepEqual(Object.keys(app.properties.server.properties).sort(), ['configure', 'health', 'units']);
+  assert.deepEqual(Object.keys(app.properties.server.properties).sort(), ['arch', 'configure', 'health', 'units']);
 });
 
 test('shu-9wa: project format is enforced', () => {

@@ -200,21 +200,38 @@ export const PROJECT_DOCKERFILE = fileURLToPath(new URL('./image/Dockerfile', im
  */
 export const PROJECT_PLATFORM = 'linux/amd64';
 
-/** The local tag of the project image: shukka-project:<first 16 hex of the Dockerfile's SHA-256>. */
-export function projectImage() {
-  return `shukka-project:${createHash('sha256').update(readFileSync(PROJECT_DOCKERFILE)).digest('hex').slice(0, 16)}`;
+/**
+ * The platform an app's build and bundle run for: its servers' architecture (shukka.json apps[].server.arch), so the
+ * native modules npm installs (sharp's @img/sharp-linux-<arch>, ...) load there. Everything else runs for
+ * PROJECT_PLATFORM.
+ * @param {'x64' | 'arm64'} arch
+ * @returns {string}
+ */
+export function platformFor(arch) {
+  return arch === 'arm64' ? 'linux/arm64' : PROJECT_PLATFORM;
+}
+
+/**
+ * The local tag of the project image: shukka-project:<first 16 hex of the Dockerfile's SHA-256>, with -arm64 after
+ * it for the linux/arm64 image (a local tag holds one platform's image).
+ * @param {string} [platform]
+ */
+export function projectImage(platform = PROJECT_PLATFORM) {
+  const hash = createHash('sha256').update(readFileSync(PROJECT_DOCKERFILE)).digest('hex').slice(0, 16);
+  return `shukka-project:${hash}${platform === PROJECT_PLATFORM ? '' : `-${platform.split('/').pop()}`}`;
 }
 
 /**
  * Build the project image unless this Docker already has it (`docker image inspect`, read-only); returns its tag.
  * The build context is an empty directory: the Dockerfile copies nothing in.
  * @param {Io} io
+ * @param {string} [platform] PROJECT_PLATFORM unless an app's build needs another (platformFor)
  * @returns {string}
  */
-export function ensureProjectImage(io) {
-  const tag = projectImage();
+export function ensureProjectImage(io, platform = PROJECT_PLATFORM) {
+  const tag = projectImage(platform);
   if (io.run('docker', ['image', 'inspect', '--format', '{{.Id}}', tag], { mutates: false, capture: 'merged' }).status === 0) return tag;
-  mustRun(io, `docker build of ${tag}`, 'docker', ['build', '--platform', PROJECT_PLATFORM, '--tag', tag, '--file', PROJECT_DOCKERFILE, tempDir('image')]);
+  mustRun(io, `docker build of ${tag}`, 'docker', ['build', '--platform', platform, '--tag', tag, '--file', PROJECT_DOCKERFILE, tempDir('image')]);
   return tag;
 }
 
@@ -259,7 +276,8 @@ let containers = 0;
  * or with `network` the network of that container (a check's services, reached on localhost). The container sees no
  * variable of this process: only HOME, CI=true and `env`, which is written to an --env-file in a shukka temp
  * directory (values stay off the command line).
- * @param {{ image: string, tree: string, cwd: string, env: Record<string, string>, cmd: string, args: string[], label?: string, network?: string }} spec
+ * `platform` (default PROJECT_PLATFORM) must be the one `image` was built for (ensureProjectImage).
+ * @param {{ image: string, tree: string, cwd: string, env: Record<string, string>, cmd: string, args: string[], label?: string, network?: string, platform?: string }} spec
  * @returns {string[]}
  */
 export function containerArgs(spec) {
@@ -279,7 +297,7 @@ export function containerArgs(spec) {
   const gid = process.getgid?.() ?? 1000;
   containers += 1;
   return [
-    'run', '--rm', '--platform', PROJECT_PLATFORM,
+    'run', '--rm', '--platform', spec.platform ?? PROJECT_PLATFORM,
     '--name', `shukka-${spec.label ?? 'step'}-${process.pid}-${containers}`,
     '--user', `${uid}:${gid}`,
     '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',

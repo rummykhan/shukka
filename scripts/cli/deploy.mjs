@@ -31,9 +31,10 @@ import { adminNotice, guard, report } from '../guard.mjs';
 import { githubRepoFromUrl, policyGuard, report as policyReport } from '../policy-guard.mjs';
 import { release } from '../release.mjs';
 import { checkBundle, upload } from '../upload.mjs';
+import { checkNativeArch } from '../native-arch.mjs';
 import {
-  CliError, HOST_CODE_WARNING, NPM_SAFE, awsFiles, cdkBin, cdkPlace, containerArgs, dockerAvailable, ensureProjectImage, mustRun, projectEnv, refuseSymlink,
-  startServices, tempDir,
+  CliError, HOST_CODE_WARNING, NPM_SAFE, PROJECT_PLATFORM, awsFiles, cdkBin, cdkPlace, containerArgs, dockerAvailable, ensureProjectImage, mustRun, platformFor, projectEnv,
+  refuseSymlink, startServices, tempDir,
 } from './exec.mjs';
 
 const SHUKKA_DIR = fileURLToPath(new URL('../../', import.meta.url));
@@ -47,7 +48,7 @@ export const SESSION_NAME = 'shukka-emergency';
  * @typedef {import('../config.mjs').Config} Config
  * @typedef {{ profile?: string, region?: string }} Target
  * @typedef {{ root: string, sha: string, tree: string, config: Config, aws: Aws }} Prepared
- * @typedef {{ cwd: string, env?: Record<string, string>, capture?: false | 'stdout', network?: string }} StepOptions network: a container whose network the step joins (container mode only)
+ * @typedef {{ cwd: string, env?: Record<string, string>, capture?: false | 'stdout', network?: string, platform?: string }} StepOptions network: a container whose network the step joins (container mode only); platform: the container's (exec.mjs platformFor), PROJECT_PLATFORM when absent
  * @typedef {import('./exec.mjs').RunResult} RunResult
  * @typedef {{
  *   inContainer: boolean,
@@ -175,9 +176,17 @@ export function projectSteps(io, tree, config, trust) {
     const image = ensureProjectImage(io);
     io.say(`the project's code (npm ci, cdk synth, checks, build, bundle, smoke) runs in throwaway containers of ${image}: `
       + `only ${tree} is mounted, no home directory, no AWS or GitHub credentials`);
+    /** @type {Map<string, string>} the project image for each other platform an app's build asks for, built on first use */
+    const images = new Map();
+    const imageFor = (/** @type {string | undefined} */ platform) => {
+      if (!platform || platform === PROJECT_PLATFORM) return image;
+      if (!images.has(platform)) images.set(platform, ensureProjectImage(io, platform));
+      return /** @type {string} */ (images.get(platform));
+    };
     exec = (cmd, args, options) => io.run('docker', containerArgs({
-      image, tree, cwd: options.cwd, env: { ...base, ...options.env }, cmd, args, label: config.project,
+      image: imageFor(options.platform), tree, cwd: options.cwd, env: { ...base, ...options.env }, cmd, args, label: config.project,
       ...(options.network ? { network: options.network } : {}),
+      ...(options.platform ? { platform: options.platform } : {}),
     }), options.capture ? { capture: options.capture } : {});
     services = (check, names) => startServices(io, check, names, `${config.project}-${randomBytes(4).toString('hex')}`);
   } else {
@@ -472,9 +481,11 @@ async function build(io, steps, aws, tree, config, app, env) {
     values[name] = p.value;
   }
   const cwd = join(tree, app.build.dir);
+  // The build and bundle run for the servers' architecture, as pipeline.yml's build job runs on an arm64 runner for them.
+  const platform = platformFor(app.server.arch);
   app.build.run.forEach((command, i) => {
     io.say(`build ${app.name}, command ${i + 1} of ${app.build.run.length}`);
-    steps.run(`build ${app.name} (command ${i + 1})`, 'bash', ['-eo', 'pipefail', '-c', command], { cwd, env: values });
+    steps.run(`build ${app.name} (command ${i + 1})`, 'bash', ['-eo', 'pipefail', '-c', command], { cwd, env: values, platform });
   });
   let script = resolve(cwd, app.build.bundle);
   if (!existsSync(script) && app.build.bundle === 'scripts/bundle.sh') script = join(SHUKKA_DIR, 'scripts', 'bundle.sh');
@@ -485,11 +496,17 @@ async function build(io, steps, aws, tree, config, app, env) {
     copyFileSync(script, copy);
     script = copy;
   }
-  const r = steps.run(`build ${app.name}: the bundle script`, 'bash', [script], { cwd, env: values, capture: 'stdout' });
+  const r = steps.run(`build ${app.name}: the bundle script`, 'bash', [script], { cwd, env: values, capture: 'stdout', platform });
   if (io.dryRun) return `<directory printed by ${app.build.bundle}>`;
   const dir = r.stdout.split('\n').map((l) => l.trim()).filter(Boolean).pop();
   if (!dir) throw new CliError(`build ${app.name}: the bundle script did not print a directory`);
-  return snapshotBundle(checkBundlePath(tree, resolve(cwd, dir), app.name), app.name);
+  const copy = snapshotBundle(checkBundlePath(tree, resolve(cwd, dir), app.name), app.name);
+  // As pipeline.yml does: refuse native modules the servers cannot load (scripts/native-arch.mjs).
+  const native = checkNativeArch(copy, app.server.arch);
+  if (native.problems.length > 0) {
+    throw new CliError(`build ${app.name}: the bundle holds native modules for another architecture than the servers' (${app.server.arch}):\n${native.problems.join('\n')}`);
+  }
+  return copy;
 }
 
 /**
