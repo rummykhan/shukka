@@ -21,7 +21,8 @@
 #            commands, build Docker images or reach outside it (assembly.mjs check); stop on a trust
 #            or resource policy that lets a principal outside the project in (policy-guard.mjs, before
 #            any role is assumed; allow_replacement on a run by hand goes ahead); skip when the
-#            stacks are already at a later commit; cdk diff, ### Infrastructure changes and ### Guard
+#            stacks are already at a later commit; stop on a stack CloudFormation cannot update
+#            (ROLLBACK_FAILED and the like: stack-state.mjs, also in the step summary); cdk diff, ### Infrastructure changes and ### Guard
 #            in the step summary, guard.mjs, cdk deploy tagged shukka:revision=<sha> of every stack but
 #            the CI stack <Project>-Ci (an admin deploys it with shukka deploy-ci; the guard says when it changed)
 #   diff     diff mode (pull requests): the same diff under the read-only diff role with
@@ -522,6 +523,34 @@ jobs:
             echo "::warning::shukka: could not read the stacks' revisions; deploying"
           fi
           echo "skip=$skip" >>"$GITHUB_OUTPUT"
+
+      # A stack left in ROLLBACK_COMPLETE, ROLLBACK_FAILED, UPDATE_ROLLBACK_FAILED, DELETE_FAILED or
+      # REVIEW_IN_PROGRESS cannot be updated: cdk would try to delete it and fail on the deploy role's
+      # DeleteStack deny, with no hint. Stop first, naming the stack, its state and what an admin does
+      # (scripts/stack-state.mjs, which shukka deploy uses too), in the log and the job summary. Read with
+      # the deploy role's credentials (DescribeStacks on <Project>-*), handed to the script alone.
+      - name: Check no stack is stuck
+        if: steps.order.outputs.skip != 'true'
+        env:
+          STACKS: ${{ steps.assembly.outputs.stacks }}
+          PROJECT: ${{ steps.config.outputs.project }}
+          ACCOUNT: ${{ steps.config.outputs.account }}
+          QUALIFIER: ${{ steps.config.outputs.qualifier }}
+          REGION: ${{ steps.config.outputs.region }}
+        run: |
+          set -euo pipefail
+          role="arn:aws:iam::$ACCOUNT:role/cdk-$QUALIFIER-deploy-role-$ACCOUNT-$REGION"
+          if ! creds=$(aws sts assume-role --role-arn "$role" --role-session-name shukka-infra-state --query Credentials --output json); then
+            echo "::warning::shukka: could not read the stacks' states; deploying"
+            exit 0
+          fi
+          key=$(jq -r .AccessKeyId <<<"$creds")
+          secret=$(jq -r .SecretAccessKey <<<"$creds")
+          token=$(jq -r .SessionToken <<<"$creds")
+          echo "::add-mask::$secret"
+          echo "::add-mask::$token"
+          AWS_ACCESS_KEY_ID=$key AWS_SECRET_ACCESS_KEY=$secret AWS_SESSION_TOKEN=$token \
+            node .shukka/scripts/stack-state.mjs --stacks "$STACKS" --project "$PROJECT" --region "$REGION" --summary "$GITHUB_STEP_SUMMARY"
 
       - name: Diff and guard
         if: steps.order.outputs.skip != 'true'

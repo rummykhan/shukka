@@ -542,6 +542,7 @@ test('shu-5ix: deploy dry run prints the workflow steps in order: checks, build,
     /^node scripts\/assembly\.mjs check \S+ --project shukkatest$/,
     new RegExp(`^node scripts/policy-guard\\.mjs \\S+ --account ${ACCOUNT} --mail-domain example\\.com$`),
     new RegExp(`^assume arn:aws:iam::${ACCOUNT}:role/cdk-shukkatest-deploy-role-${ACCOUNT}-us-east-1 as shukka-emergency; cdk gets only that session$`),
+    /^read the state of each stack to deploy; stop if one is ROLLBACK_COMPLETE, ROLLBACK_FAILED, UPDATE_ROLLBACK_FAILED, DELETE_FAILED or REVIEW_IN_PROGRESS$/, // shu-wud
     new RegExp(`^${reEscape(CDK)} diff --app \\S+ --no-color --parameters BootstrapVersion=/cdk-bootstrap/shukkatest/version$`),
     /^node scripts\/guard\.mjs < the diff$/,
     new RegExp(`^${reEscape(CDK)} deploy --app \\S+ --require-approval never --no-color --parameters BootstrapVersion=/cdk-bootstrap/shukkatest/version --all --tags=shukka:revision=${sha}$`),
@@ -678,6 +679,18 @@ test('shu-5ix: project code runs without AWS credentials; cdk gets only the depl
     assert.ok(env.HOME.includes('shukka-cdk-home-'), `cdk gets an empty HOME: ${env.HOME}`);
   }
   assert.equal(c.s3.calls.length, 2, 'upload and release used the caller clients');
+}));
+
+test('shu-wud: deploy stops before cdk when a stack it deploys is ROLLBACK_FAILED, naming the stack, the state and what to do', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  const s = deploySpawn(CLEAN_DIFF, bundleDir(tmp));
+  const c = releaseClients();
+  const { aws } = awsWith(c, { describeStack: async (name: string) => (name === 'shukkatest-App' ? { name, outputs: {}, tags: {}, status: 'ROLLBACK_FAILED' } : null) });
+  const r = await cli(['deploy', '--skip-checks'], { cwd: dir, spawn: s.spawn, aws, checkAssembly: NO_ASSETS });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.err, /refusing to deploy:\n(shukka: )?stack shukkatest-App is in ROLLBACK_FAILED: .*Delete it by hand with admin credentials \(aws cloudformation delete-stack --stack-name shukkatest-App/);
+  assert.ok(!s.calls.some((x) => isCdk(x, 'diff') || isCdk(x, 'deploy')), 'cdk never runs');
+  assert.equal(c.s3.calls.length, 0, 'nothing uploaded');
 }));
 
 test('shu-5ix: deploy stops at the guard on a destructive diff unless --allow-replacement, and takes buildEnv from the environment', withTmp(async (tmp) => {
