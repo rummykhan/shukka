@@ -2154,7 +2154,7 @@ function ec2Account() {
 function ec2Spawn() {
   return recordingSpawn((c) => (c.cmd === 'aws' && c.args[1] === 'describe-addresses'
     ? { status: 0, stdout: '203.0.113.7\teipalloc-0a1b2c3d4e5f60718\n' }
-    : { status: 0, stdout: '' }));
+    : answerExport(c)));
 }
 
 const FOREIGN = ['i-0999999999999999a', 'lt-0999999999999999b', '198.51.100.9', 'sg-0888888888888888c'];
@@ -2196,7 +2196,7 @@ test('shu-dnd: --tag-existing-ec2 tags after the boundary stack and before the p
 
 test('shu-dnd: a failed Elastic IP lookup stops the bootstrap before anything changes; without the flag nothing is looked up or tagged', withTmp(async (tmp) => {
   const { dir } = consumer(tmp);
-  const failing = recordingSpawn((c) => (c.cmd === 'aws' && c.args[1] === 'describe-addresses' ? { status: 255, stdout: '' } : { status: 0, stdout: '' }));
+  const failing = recordingSpawn((c) => (c.cmd === 'aws' && c.args[1] === 'describe-addresses' ? { status: 255, stdout: '' } : answerExport(c)));
   const r = await cli(projectArgs(['--tag-existing-ec2']).filter((a) => a !== '--dry-run'), { cwd: dir, spawn: failing.spawn, aws: ec2Account().aws });
   assert.equal(r.code, 1, r.out + r.err);
   assert.match(r.err, /cannot look up the Elastic IP\(s\) 203\.0\.113\.7/);
