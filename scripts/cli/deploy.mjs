@@ -32,7 +32,7 @@ import { githubRepoFromUrl, policyGuard, report as policyReport } from '../polic
 import { release } from '../release.mjs';
 import { checkBundle, upload } from '../upload.mjs';
 import {
-  CliError, HOST_CODE_WARNING, NPM_SAFE, awsFiles, cdkBin, cdkPlace, containerArgs, dockerAvailable, ensureProjectImage, mustRun, projectEnv, refuseSymlink,
+  CliError, HOST_CODE_WARNING, NPM_SAFE, adminCdkEnv, adminCredentials, cdkBin, cdkPlace, containerArgs, dockerAvailable, ensureProjectImage, mustRun, projectEnv, refuseSymlink,
   startServices, tempDir,
 } from './exec.mjs';
 
@@ -683,34 +683,9 @@ export async function deployCommand(options) {
   }
 }
 
-/** Variables of this process the admin's cdk keeps: how to find node and temp files, the AWS credentials and proxies. */
-const ADMIN_ENV_KEEP = [
-  'PATH', 'TMPDIR', 'LANG', 'AWS_PROFILE', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN', 'AWS_CA_BUNDLE',
-  'HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'NO_PROXY', 'no_proxy',
-];
-
 /**
- * The whole environment of the admin's cdk: only the variables in ADMIN_ENV_KEEP from this process (nothing like
- * NODE_OPTIONS or CDK_* that could change what cdk loads or does), the admin's AWS files by real path, the config's
- * region, npm made safe, and an empty HOME.
- * @param {string} region
- * @param {string} home
- * @param {Record<string, string | undefined>} [from]
- * @returns {Record<string, string>}
- */
-export function adminEnv(region, home, from = process.env) {
-  /** @type {Record<string, string>} */
-  const env = {};
-  for (const k of ADMIN_ENV_KEEP) {
-    const v = from[k];
-    if (v !== undefined) env[k] = v;
-  }
-  return { ...env, ...awsFiles(from), ...NPM_SAFE, HOME: home, AWS_REGION: region, AWS_DEFAULT_REGION: region };
-}
-
-/**
- * shukka's pinned cdk with the caller's own (admin) credentials: their AWS files and --profile, from an empty temp
- * directory with an empty HOME and a minimal environment (adminEnv), on an assembly passed with --app. No project
+ * shukka's pinned cdk with the caller's own (admin) credentials: their profile's keys, resolved first (adminCredentials:
+ * an SSO profile too), from an empty temp directory with an empty HOME and a minimal environment (adminCdkEnv), on an assembly passed with --app. No project
  * code runs here: no cdk.json (so no `app` command and no plugins), no .npmrc, no npm; only the synthesized and
  * checked cdk.out.
  * @param {Io} io
@@ -721,9 +696,9 @@ export function adminEnv(region, home, from = process.env) {
  */
 function adminCdk(io, config, target, args, options = {}) {
   const place = cdkPlace();
-  return io.run(process.execPath, [cdkBin(), ...args, ...(target.profile ? ['--profile', target.profile] : [])], {
+  return io.run(process.execPath, [cdkBin(), ...args], {
     cwd: place.cwd,
-    fullEnv: adminEnv(config.aws.region, place.home),
+    fullEnv: adminCdkEnv(adminCredentials(io, target.profile), config.aws.region, place.home),
     ...options,
   });
 }
