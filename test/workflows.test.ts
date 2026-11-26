@@ -340,7 +340,7 @@ printf 'aws %s\\n' "$*" >>"$FAKE_CDK_LOG"
 echo '{"AccessKeyId":"AKIAORDERCHECK","SecretAccessKey":"order-secret","SessionToken":"order-token"}'
 `);
 
-// node: real node, except that changed.mjs, upload.mjs and release.mjs run their own main() with
+// node: real node, except that changed.mjs, upload.mjs, release.mjs and stack-state.mjs run their own main() with
 // stubbed AWS clients (from $FAKE_WORLD); each call's arguments are logged to $FAKE_LOG.
 const fakeNodeModule = join(scratch, 'fake-node.mjs');
 writeFileSync(fakeNodeModule, `
@@ -369,10 +369,11 @@ const stubs = {
     return { Status: 'Success', ResponseCode: 0, StandardOutputContent: 'shukka: p/a old -> new live\\n' };
   } },
 };
-if (['changed.mjs', 'upload.mjs', 'release.mjs'].includes(name)) {
+if (['changed.mjs', 'upload.mjs', 'release.mjs', 'stack-state.mjs'].includes(name)) {
   const mod = await import(pathToFileURL(resolve(args[0])).href);
   const deps = name === 'changed.mjs'
     ? { clients: { cfn: stubs.cfn, ec2: stubs.ec2, ssm: stubs.ssm }, wait: { sleep: async () => {}, timeoutMs: 10, intervalMs: 1 } }
+    : name === 'stack-state.mjs' ? { cfn: stubs.cfn }
     : { s3: stubs.s3, ssm: stubs.ssm, ec2: stubs.ec2, pollMs: 1 };
   const code = await mod.main(args.slice(1), deps);
   appendFileSync(process.env.FAKE_LOG, JSON.stringify({ script: name, args: args.slice(1), code, sent, key: process.env.AWS_ACCESS_KEY_ID ?? null }) + '\\n');
@@ -888,6 +889,37 @@ test('shu-9zr: a deploy of an older commit than the stacks carry is skipped, rea
   assert.match(denied.out, /could not read the stacks' revisions; deploying/);
 });
 
+test('shu-wud: the deploy job stops before cdk on a stuck stack, naming it, its state and what to do, in the log and the summary', async () => {
+  const ws = workspace();
+  const name = 'Check no stack is stuck';
+  const names = steps(infra.jobs.deploy).map((s) => s.name as string);
+  assert.ok(names.indexOf(name) > names.indexOf('Check the stacks are not ahead of this commit'), names.join(', '));
+  assert.ok(names.indexOf(name) < names.indexOf('Diff and guard'), names.join(', '));
+  assert.equal(step(infra, 'deploy', name).if, "steps.order.outputs.skip != 'true'");
+  const exprs = { 'steps.assembly.outputs.stacks': 'Shukkatest-Box,Shukkatest-Ci', 'steps.config.outputs.account': '123456789012', 'steps.config.outputs.region': 'us-east-1' };
+  const world = (status: string, ci = 'CREATE_COMPLETE') => JSON.stringify({ stacks: [{ StackName: 'Shukkatest-Box', StackStatus: status }, { StackName: 'Shukkatest-Ci', StackStatus: ci }] });
+  for (const status of ['ROLLBACK_FAILED', 'ROLLBACK_COMPLETE', 'UPDATE_ROLLBACK_FAILED', 'DELETE_FAILED', 'REVIEW_IN_PROGRESS']) {
+    const r = await runStep(ws, infra, 'deploy', name, exprs, { FAKE_WORLD: world(status) });
+    assert.notEqual(r.code, 0, `${status}: ${r.out}`);
+    assert.match(r.out, new RegExp(`^::error::shukka: stack Shukkatest-Box is in ${status}: .*(delete-stack|continue-update-rollback) --stack-name Shukkatest-Box`, 'm'), status);
+    assert.match(r.summary, new RegExp(`\\| \`Shukkatest-Box\` \\| \`${status}\` \\|.*admin credentials`), status);
+    assert.ok(r.cdk.includes('aws sts assume-role --role-arn arn:aws:iam::123456789012:role/cdk-shukkatest-deploy-role-123456789012-us-east-1 --role-session-name shukka-infra-state --query Credentials --output json'));
+    const call = r.calls[0] as Loose;
+    assert.equal(call.key, 'AKIAORDERCHECK');
+    assert.match(r.out, /^::add-mask::order-secret$/m);
+  }
+  // The CI stack is never deployed by the pipeline, so its state does not stop it; a healthy stack goes on.
+  const ok = await runStep(ws, infra, 'deploy', name, exprs, { FAKE_WORLD: world('UPDATE_COMPLETE', 'ROLLBACK_FAILED') });
+  assert.equal(ok.code, 0, ok.out);
+  assert.equal(ok.summary, '');
+  assert.deepEqual((ok.calls[0] as Loose).sent.map((c: Loose) => c.input.StackName), ['Shukkatest-Box']);
+  // A stack that does not exist yet is fine; credentials that cannot be had warn and go on (cdk reports the rest).
+  assert.equal((await runStep(ws, infra, 'deploy', name, exprs, { FAKE_WORLD: JSON.stringify({ stacks: [] }) })).code, 0);
+  const denied = await runStep(ws, infra, 'deploy', name, exprs, { FAKE_AWS_FAIL: '1' });
+  assert.equal(denied.code, 0, denied.out);
+  assert.match(denied.out, /could not read the stacks' states; deploying/);
+});
+
 test('shu-9zr: synth runs the project\'s npm ci and cdk synth with no credentials and tars the assembly; its settings are checked', async () => {
   const ws = workspace();
   const read = await runStep(ws, infra, 'synth', 'Read the infra settings', { 'inputs.config': 'shukka.json' });
@@ -1127,4 +1159,37 @@ test('shu-r5f: an invalid qualifier stops the diffs and the deploy before cdk ru
       assert.match(r.out, /::error::shukka: .*qualifier/);
     }
   }
+});
+
+test('shu-njm: build refuses a bundle whose native modules are for another architecture than the app\'s servers', async () => {
+  const ws = workspace();
+  // A build that leaves an ELF .node for machine $M (62 x64, 183 arm64) in the bundle, as npm leaves sharp's.
+  const writeNode = 'node -e \'const b=Buffer.alloc(64);b.write("\\x7fELF",0,"latin1");b[4]=2;b[5]=1;b[6]=1;b.writeUInt16LE(3,16);'
+    + 'b.writeUInt16LE(Number(process.env.M),18);const d="dist/node_modules/@img/sharp/lib";require("fs").mkdirSync(d,{recursive:true});'
+    + 'require("fs").writeFileSync(d+"/sharp.node",b)\'';
+  const app = (arch: string, machine: number) => JSON.stringify({
+    ...fixtureConfig.apps[0],
+    build: { ...fixtureConfig.apps[0]!.build, run: ['bash build.sh', writeNode], env: { GREETING_STYLE: 'plain', M: String(machine) } },
+    server: { ...fixtureConfig.apps[0]!.server, arch },
+  });
+  const given = (json: string) => ({ 'toJSON(matrix.app)': json, 'matrix.app.name': 'web', 'strategy.job-index': '0', 'toJSON(vars)': JSON.stringify({ SHUKKATEST_GREETING: 'hi' }) });
+
+  const wrong = await runStep(ws, pipeline, 'build', 'Build and bundle', given(app('arm64', 62)));
+  assert.equal(wrong.code, 1, wrong.out);
+  assert.match(wrong.out, /native-arch: "node_modules\/@img\/sharp\/lib\/sharp\.node": built for x64, the servers are arm64/);
+  assert.match(wrong.out, /::error::shukka: build web: the bundle holds native modules for another architecture than the servers' \(arm64\)/);
+  assert.equal(wrong.outputs.digest_0, undefined, 'no digest for a refused bundle');
+
+  const right = await runStep(ws, pipeline, 'build', 'Build and bundle', given(app('arm64', 183)));
+  assert.equal(right.code, 0, right.out);
+  assert.match(right.out, /native-arch: 1 native module\(s\), all linux arm64/);
+  const listing = execFileSync('tar', ['-tzf', join(ws.temp, 'shukka-bundle', 'bundle.tgz')], { encoding: 'utf8' });
+  assert.match(listing, /node_modules\/@img\/sharp\/lib\/sharp\.node/);
+
+  // No arch (a config normalised before it existed): x64.
+  const legacy = JSON.parse(app('x64', 62));
+  delete legacy.server.arch;
+  const x64 = await runStep(ws, pipeline, 'build', 'Build and bundle', given(JSON.stringify(legacy)));
+  assert.equal(x64.code, 0, x64.out);
+  assert.match(x64.out, /all linux x64/);
 });

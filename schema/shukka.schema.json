@@ -156,6 +156,11 @@
           "additionalProperties": false,
           "required": ["configure", "units", "health"],
           "properties": {
+            "arch": {
+              "description": "CPU architecture of the app's servers (default x64). arm64 (Graviton, e.g. t4g) builds on arm64 runners and checks the bundle holds no native module for another architecture.",
+              "type": "string",
+              "enum": ["x64", "arm64"]
+            },
             "configure": { "$ref": "#/definitions/path" },
             "units": {
               "type": "array",

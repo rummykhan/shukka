@@ -1,4 +1,5 @@
-// The shukka CLI (design C7): `bootstrap --account`, `bootstrap <project>`, `diff`, `deploy`, `deploy-ci <project>`.
+// The shukka CLI (design C7): `bootstrap --account`, `bootstrap <project>`, `diff`, `deploy`, `deploy-ci <project>`,
+// and `init <project>` (shu-cio.1).
 // Run with `npx github:rummykhan/shukka#v1 <command>`; bin/shukka loads this file.
 //
 // Exit codes: 0 done; 1 refused or failed (one `shukka: ...` line says why); 2 usage error;
@@ -45,7 +46,8 @@ export const COMMANDS = [
     name: 'bootstrap',
     usage: 'shukka bootstrap --account [--oidc-provider-arn <arn>] [--projects <a,b>] [--profile <name>] --region <region> [--dry-run]\n'
       + 'shukka bootstrap <project> [--config <path>] [--hosted-zone-id <id>] [--mail-domain <domain>]... [--repo <owner/name>]\n'
-      + '    [--emergency-principal <arn>]... [--allow-private-types] [--bound-existing-roles] [--profile <name>] [--region <region>] [--dry-run]',
+      + '    [--emergency-principal <arn>]... [--allow-private-types] [--bound-existing-roles] [--tag-existing-ec2]\n'
+      + '    [--profile <name>] [--region <region>] [--dry-run]',
     summary: [
       'Once per AWS account, with admin credentials: --account deploys the Shukka-Account stack (cdk deploy), which owns',
       "the account's GitHub OIDC provider, or imports an existing one with --oidc-provider-arn, and lists the account's",
@@ -68,6 +70,11 @@ export const COMMANDS = [
       'are in a stack tagged Project=<project> or shukka:project=<project> do not refuse: right after Shukka-Boundary-<project>',
       'is deployed, each gets the boundary (aws iam put-role-permissions-boundary, printed), the roles are checked again, and',
       'the bootstrap goes on. Without the flag, the refusal names it when every such role is in the project\'s own stacks.',
+      '',
+      'With --tag-existing-ec2 (a project moving onto shukka), the EC2 instances, launch templates, security groups, volumes',
+      'and Elastic IPs of stacks tagged Project=<project> or shukka:project=<project> are tagged Project=<project> (aws ec2',
+      'create-tags, printed per stack) right after Shukka-Boundary-<project> is deployed: the fence changes and deletes only',
+      'Project-tagged EC2 resources, so one made before the tag would be left behind when a fenced deploy replaces it.',
     ].join('\n'),
     flags: [
       { name: 'account', help: 'bootstrap the account (Shukka-Account) instead of a project' },
@@ -80,6 +87,7 @@ export const COMMANDS = [
       { name: 'emergency-principal', value: '<arn>', repeat: true, help: 'role or user ARN (pattern) that may deploy from a laptop (default: whoever runs this)' },
       { name: 'allow-private-types', help: 'go ahead although the account has private CloudFormation extensions (each is listed with its execution role)' },
       { name: 'bound-existing-roles', help: 'for a project moving onto shukka: after deploying Shukka-Boundary-<project>, put its boundary on the roles named like the project that have none and are in a stack tagged Project=<project> or shukka:project=<project> (aws iam put-role-permissions-boundary, each printed), re-check, then go on; any other such role still refuses' },
+      { name: 'tag-existing-ec2', help: 'for a project moving onto shukka: tag the EC2 instances, launch templates, security groups, volumes and Elastic IPs of stacks tagged Project=<project> or shukka:project=<project> Project=<project> (aws ec2 create-tags, each printed), so a fenced deploy can replace or delete them; nothing outside those stacks is tagged' },
       PROFILE,
       REGION,
       DRY_RUN,
@@ -158,6 +166,25 @@ export const COMMANDS = [
       DRY_RUN,
     ],
   },
+  {
+    name: 'init',
+    usage: 'shukka init <project> [--apps <a,b>] [--account <id>] [--region <region>] [--ref <vX.Y.Z>] [--force]',
+    summary: [
+      'In your repository root, writes shukka.json and the caller workflow .github/workflows/ci.yml, pinned to this',
+      "shukka's release tag (or --ref), and prints the CDK wiring for your app (shukkaSynthesizer, shukkaCiSynthesizer,",
+      'ShukkaAccess, tagProject, applyBoundary). It reads the apps from package.json workspaces (or --apps), their',
+      "checks and build from each app's package.json scripts, and infra.dir from the shallowest cdk.json; every value it",
+      'could not read holds TODO (a TODO command fails until you replace it), and it lists them all. shukka.json is',
+      'checked against the schema before it is written. Never overwrites a file without --force; calls no AWS or GitHub.',
+    ].join('\n'),
+    flags: [
+      { name: 'apps', value: '<a,b>', help: 'app names (default: the package.json workspaces)' },
+      { name: 'account', value: '<id>', help: 'AWS account id (default: a TODO)' },
+      { name: 'region', value: '<region>', help: 'AWS region (default: AWS_REGION, else us-east-1 and a TODO)' },
+      { name: 'ref', value: '<vX.Y.Z>', help: "release tag to pin (default: v<this shukka's version>; vX.Y.Z-rc.N for a candidate)" },
+      { name: 'force', help: 'overwrite shukka.json and .github/workflows/ci.yml when they exist' },
+    ],
+  },
 ];
 
 /**
@@ -193,6 +220,7 @@ export function helpText() {
     '  diff                  cdk diff of origin/main with the guard\'s verdict',
     '  deploy                emergency deploy of origin/main from this machine',
     '  deploy-ci <project>   deploy the CI stack <Project>-Ci with your admin credentials, from a checked assembly',
+    '  init <project>        write shukka.json and the caller workflow; print the CDK wiring',
     '  help                  this text (also --help, and <command> --help)',
     '',
   ];
@@ -317,11 +345,23 @@ export async function main(argv, deps = {}) {
     const makeAws = (r) => (deps.aws ?? ((t, i) => realAws({ ...t, io: i })))({ ...(profile ? { profile } : {}), region: r }, io);
     const configPath = str(flags, 'config') ?? 'shukka.json';
 
+    if (spec.name === 'init') {
+      if (positional.length > 1) throw new CliError(`init: unexpected argument ${JSON.stringify(positional[1])}`, 2);
+      const { initCommand } = await import('./init.mjs');
+      return initCommand({
+        cwd, out, env, project: positional[0], force: flags.force === true,
+        ...(str(flags, 'apps') !== undefined ? { apps: str(flags, 'apps') } : {}),
+        ...(str(flags, 'account') !== undefined ? { account: str(flags, 'account') } : {}),
+        ...(region !== undefined ? { region } : {}),
+        ...(str(flags, 'ref') !== undefined ? { ref: str(flags, 'ref') } : {}),
+      });
+    }
+
     if (spec.name === 'bootstrap') {
       const { bootstrapAccount, bootstrapProject } = await import('./bootstrap.mjs');
       if (flags.account === true) {
         if (positional.length > 0) throw new CliError('bootstrap: give --account or a project name, not both', 2);
-        const projectOnly = ['config', 'hosted-zone-id', 'mail-domain', 'repo', 'emergency-principal', 'allow-private-types', 'bound-existing-roles'].filter((f) => f in flags);
+        const projectOnly = ['config', 'hosted-zone-id', 'mail-domain', 'repo', 'emergency-principal', 'allow-private-types', 'bound-existing-roles', 'tag-existing-ec2'].filter((f) => f in flags);
         if (projectOnly.length > 0) throw new CliError(`bootstrap --account: --${projectOnly[0]} is for a project bootstrap`, 2);
         const r = region ?? env.AWS_REGION ?? env.AWS_DEFAULT_REGION;
         if (!r) throw new CliError('bootstrap --account: give --region', 2);
@@ -353,6 +393,7 @@ export async function main(argv, deps = {}) {
         ...(list(flags, 'emergency-principal') ? { emergencyPrincipals: list(flags, 'emergency-principal') } : {}),
         allowPrivateTypes: flags['allow-private-types'] === true,
         boundExistingRoles: flags['bound-existing-roles'] === true,
+        tagExistingEc2: flags['tag-existing-ec2'] === true,
       });
       return 0;
     }

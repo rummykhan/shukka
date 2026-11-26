@@ -15,7 +15,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { checkProjectName, loadConfig } from '../config.mjs';
-import { CliError, NPM_SAFE, awsFiles, cdkBin, cdkPlace, mustRun, refuseSymlink, tempDir } from './exec.mjs';
+import { CliError, adminCdkEnv, adminCredentials, cdkBin, cdkPlace, mustRun, refuseSymlink, tempDir } from './exec.mjs';
 export const ACCOUNT_STACK = 'Shukka-Account';
 /** Tag on the stacks `shukka bootstrap` deploys, naming the project; how shukka knows a bootstrap is its own. */
 export const PROJECT_TAG = 'shukka:project';
@@ -39,7 +39,7 @@ function profileArgs(target) {
 
 /**
  * The `cdk deploy` of one stack from a synthesized cloud assembly, with shukka's own pinned cdk (`node <bin>`, never
- * npx), from an empty temp directory with an empty HOME: no .npmrc or cdk.json (whose plugins would run with admin
+ * npx), from an empty temp directory with an empty HOME and the admin's keys only (adminCdkEnv): no .npmrc or cdk.json (whose plugins would run with admin
  * credentials) is read from the directory the admin runs this from, or from the admin's home.
  * @param {Io} io
  * @param {string} assembly
@@ -49,11 +49,12 @@ function profileArgs(target) {
 function cdkDeploy(io, assembly, stack, target) {
   const place = cdkPlace();
   mustRun(io, `cdk deploy ${stack}`, process.execPath, [
-    cdkBin(), 'deploy', stack, '--app', assembly, '--require-approval', 'never', '--no-color', ...profileArgs(target),
+    cdkBin(), 'deploy', stack, '--app', assembly, '--require-approval', 'never', '--no-color',
   ], {
     cwd: place.cwd,
-    // HOME moved to an empty directory (no ~/.cdk.json plugins); the admin's AWS files pinned by real path first.
-    env: { ...awsFiles(), ...NPM_SAFE, HOME: place.home, AWS_REGION: target.region, AWS_DEFAULT_REGION: target.region },
+    // HOME moved to an empty directory (no ~/.cdk.json plugins), where an SSO profile cannot resolve: cdk gets the
+    // profile's keys, resolved here first, and no --profile.
+    fullEnv: adminCdkEnv(adminCredentials(io, target.profile), target.region, place.home),
   });
 }
 
@@ -383,12 +384,77 @@ async function boundRoles(io, aws, { project, toBound, boundaryArn, target }) {
 const RECHECKS = 4;
 const RECHECK_MS = 2000;
 
+/** Physical ids of the EC2 resources the fence changes only when tagged Project=<project>: instance, launch template, security group, volume, Elastic IP (allocation id). */
+const EC2_ID_RE = /^(?:i|lt|sg|vol|eipalloc)-[0-9a-f]{8,17}$/;
+/** An AWS::EC2::EIP's physical id: its public IPv4 address. */
+const IPV4_RE = /^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/;
+
+/**
+ * --tag-existing-ec2: the EC2 resources of the project's own stacks (tagged Project=<project> or
+ * shukka:project=<project>, in this region) that the fence changes only when they carry Project=<project>. Resources
+ * created before the project tagged its stacks lack the tag, so a fenced deploy could not replace or delete them and
+ * CloudFormation's cleanup would leave them behind. An Elastic IP's public address is looked up (read only) to its
+ * allocation id. Nothing outside those stacks is ever named.
+ * @param {Io} io
+ * @param {Aws} aws
+ * @param {string} project
+ * @param {Target & { region: string }} target
+ * @returns {Promise<{ id: string, stack: string }[]>}
+ */
+async function ownedEc2Resources(io, aws, project, target) {
+  /** @type {{ id: string, stack: string }[]} */
+  const found = [];
+  /** @type {Map<string, string>} */
+  const ips = new Map();
+  for (const [id, stack] of await ownedPhysicalIds(aws, project)) {
+    if (EC2_ID_RE.test(id)) found.push({ id, stack });
+    else if (IPV4_RE.test(id)) ips.set(id, stack);
+  }
+  if (ips.size > 0) {
+    const r = io.run('aws', [
+      'ec2', 'describe-addresses', '--public-ips', ...ips.keys(), '--query', 'Addresses[].[PublicIp,AllocationId]', '--output', 'text',
+      '--region', target.region, ...profileArgs(target),
+    ], { mutates: false, capture: 'stdout' });
+    if (r.status !== 0) throw new CliError(`cannot look up the Elastic IP(s) ${[...ips.keys()].join(', ')} of ${project}'s stacks (aws ec2 describe-addresses failed)`);
+    /** @type {Map<string, string>} */
+    const allocations = new Map();
+    for (const line of r.stdout.split('\n')) {
+      const [ip, allocation] = line.trim().split(/\s+/);
+      if (ip && allocation && /^eipalloc-[0-9a-f]+$/.test(allocation)) allocations.set(ip, allocation);
+    }
+    for (const [ip, stack] of ips) {
+      const allocation = allocations.get(ip);
+      if (allocation) found.push({ id: allocation, stack });
+      else io.warn(`Elastic IP ${ip} (stack ${stack}) has no allocation id in this region; not tagged`);
+    }
+  }
+  return found;
+}
+
+/**
+ * Tag each of the project's own EC2 resources Project=<project> (one `aws ec2 create-tags` per stack, printed).
+ * @param {Io} io
+ * @param {{ project: string, resources: { id: string, stack: string }[], target: Target & { region: string } }} inputs
+ */
+function tagEc2(io, { project, resources, target }) {
+  io.say(`1/4 tagging ${resources.length} existing EC2 resource(s) of ${project}'s stacks Project=${project}`);
+  /** @type {Map<string, string[]>} */
+  const byStack = new Map();
+  for (const r of resources) byStack.set(r.stack, [...(byStack.get(r.stack) ?? []), r.id]);
+  for (const [stack, ids] of byStack) {
+    io.say(`stack ${stack}: ${ids.join(', ')}`);
+    mustRun(io, `create-tags on the EC2 resources of ${stack}`, 'aws', [
+      'ec2', 'create-tags', '--resources', ...ids, '--tags', `Key=Project,Value=${project}`, '--region', target.region, ...profileArgs(target),
+    ]);
+  }
+}
+
 /**
  * `shukka bootstrap <project>`.
  * @param {{
  *   io: Io, aws: Aws, target: Target, project: string, configPath: string, cwd: string,
  *   hostedZoneIds?: string[], mailDomains?: string[], repo?: string, emergencyPrincipals?: string[],
- *   allowPrivateTypes?: boolean, boundExistingRoles?: boolean,
+ *   allowPrivateTypes?: boolean, boundExistingRoles?: boolean, tagExistingEc2?: boolean,
  * }} options
  */
 export async function bootstrapProject(options) {
@@ -544,12 +610,20 @@ export async function bootstrapProject(options) {
     if (!REPO_RE.test(repo)) throw new CliError(`--repo ${repo} is not owner/name`);
   }
 
+  // A project moving onto shukka: EC2 resources of its own stacks made before the Project tag (the fence changes and
+  // deletes only Project-tagged ones), looked up now so a failed lookup stops the bootstrap before anything changes.
+  const toTag = options.tagExistingEc2 ? await ownedEc2Resources(io, aws, project, target) : [];
+
   // 1. The fence.
   const boundaryStack = lib.boundaryStackName(project);
   io.say(`1/4 ${boundaryStack}: boundary ${lib.boundaryPolicyName(project)} and execution policies ${lib.executionPolicyNames(project).join(', ')}; ${fenceLine}`);
   const assembly = await synthBoundary(io, { project, qualifier, account: caller.account, region, hostedZoneId, mailDomains });
   cdkDeploy(io, assembly, boundaryStack, target);
   if (toBound.length > 0) await boundRoles(io, aws, { project, toBound, boundaryArn: `arn:${caller.arn.split(':')[1]}:iam::${caller.account}:policy/${lib.boundaryPolicyName(project)}`, target });
+  if (options.tagExistingEc2) {
+    if (toTag.length > 0) tagEc2(io, { project, resources: toTag, target });
+    else io.say(`1/4 no EC2 resources in ${project}'s stacks to tag`);
+  }
 
   // 2. The project's bootstrap.
   io.say(`2/4 ${toolkitName}: qualifier ${qualifier}, execution role with ${lib.executionPolicyNames(project).join(', ')}; emergency principals ${emergency.join(', ')}`);

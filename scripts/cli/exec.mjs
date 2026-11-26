@@ -8,7 +8,7 @@ import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { closeSync, lstatSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
-import { homedir, tmpdir } from 'node:os';
+import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -177,14 +177,21 @@ export function projectEnv(extra = {}, from = process.env) {
   for (const [k, v] of Object.entries(from)) {
     if (v !== undefined && !/^AWS_/i.test(k)) env[k] = v;
   }
+  Object.assign(env, noAwsFiles());
+  for (const [k, v] of Object.entries(extra)) if (v !== undefined) env[k] = v;
+  return env;
+}
+
+/**
+ * The AWS config and credentials files pointed at empty files in a shukka temp directory, and the instance metadata
+ * service off: a child given these finds no profile and no credentials but what its environment holds.
+ * @returns {{ AWS_CONFIG_FILE: string, AWS_SHARED_CREDENTIALS_FILE: string, AWS_EC2_METADATA_DISABLED: string }}
+ */
+export function noAwsFiles() {
   const dir = tempDir('noaws');
   writeFileSync(join(dir, 'config'), '');
   writeFileSync(join(dir, 'credentials'), '');
-  env.AWS_CONFIG_FILE = join(dir, 'config');
-  env.AWS_SHARED_CREDENTIALS_FILE = join(dir, 'credentials');
-  env.AWS_EC2_METADATA_DISABLED = 'true';
-  for (const [k, v] of Object.entries(extra)) if (v !== undefined) env[k] = v;
-  return env;
+  return { AWS_CONFIG_FILE: join(dir, 'config'), AWS_SHARED_CREDENTIALS_FILE: join(dir, 'credentials'), AWS_EC2_METADATA_DISABLED: 'true' };
 }
 
 /** node:22 (Debian bookworm) by its multi-platform index digest: the base of the project image (image/Dockerfile). */
@@ -200,21 +207,38 @@ export const PROJECT_DOCKERFILE = fileURLToPath(new URL('./image/Dockerfile', im
  */
 export const PROJECT_PLATFORM = 'linux/amd64';
 
-/** The local tag of the project image: shukka-project:<first 16 hex of the Dockerfile's SHA-256>. */
-export function projectImage() {
-  return `shukka-project:${createHash('sha256').update(readFileSync(PROJECT_DOCKERFILE)).digest('hex').slice(0, 16)}`;
+/**
+ * The platform an app's build and bundle run for: its servers' architecture (shukka.json apps[].server.arch), so the
+ * native modules npm installs (sharp's @img/sharp-linux-<arch>, ...) load there. Everything else runs for
+ * PROJECT_PLATFORM.
+ * @param {'x64' | 'arm64'} arch
+ * @returns {string}
+ */
+export function platformFor(arch) {
+  return arch === 'arm64' ? 'linux/arm64' : PROJECT_PLATFORM;
+}
+
+/**
+ * The local tag of the project image: shukka-project:<first 16 hex of the Dockerfile's SHA-256>, with -arm64 after
+ * it for the linux/arm64 image (a local tag holds one platform's image).
+ * @param {string} [platform]
+ */
+export function projectImage(platform = PROJECT_PLATFORM) {
+  const hash = createHash('sha256').update(readFileSync(PROJECT_DOCKERFILE)).digest('hex').slice(0, 16);
+  return `shukka-project:${hash}${platform === PROJECT_PLATFORM ? '' : `-${platform.split('/').pop()}`}`;
 }
 
 /**
  * Build the project image unless this Docker already has it (`docker image inspect`, read-only); returns its tag.
  * The build context is an empty directory: the Dockerfile copies nothing in.
  * @param {Io} io
+ * @param {string} [platform] PROJECT_PLATFORM unless an app's build needs another (platformFor)
  * @returns {string}
  */
-export function ensureProjectImage(io) {
-  const tag = projectImage();
+export function ensureProjectImage(io, platform = PROJECT_PLATFORM) {
+  const tag = projectImage(platform);
   if (io.run('docker', ['image', 'inspect', '--format', '{{.Id}}', tag], { mutates: false, capture: 'merged' }).status === 0) return tag;
-  mustRun(io, `docker build of ${tag}`, 'docker', ['build', '--platform', PROJECT_PLATFORM, '--tag', tag, '--file', PROJECT_DOCKERFILE, tempDir('image')]);
+  mustRun(io, `docker build of ${tag}`, 'docker', ['build', '--platform', platform, '--tag', tag, '--file', PROJECT_DOCKERFILE, tempDir('image')]);
   return tag;
 }
 
@@ -259,7 +283,8 @@ let containers = 0;
  * or with `network` the network of that container (a check's services, reached on localhost). The container sees no
  * variable of this process: only HOME, CI=true and `env`, which is written to an --env-file in a shukka temp
  * directory (values stay off the command line).
- * @param {{ image: string, tree: string, cwd: string, env: Record<string, string>, cmd: string, args: string[], label?: string, network?: string }} spec
+ * `platform` (default PROJECT_PLATFORM) must be the one `image` was built for (ensureProjectImage).
+ * @param {{ image: string, tree: string, cwd: string, env: Record<string, string>, cmd: string, args: string[], label?: string, network?: string, platform?: string }} spec
  * @returns {string[]}
  */
 export function containerArgs(spec) {
@@ -279,7 +304,7 @@ export function containerArgs(spec) {
   const gid = process.getgid?.() ?? 1000;
   containers += 1;
   return [
-    'run', '--rm', '--platform', PROJECT_PLATFORM,
+    'run', '--rm', '--platform', spec.platform ?? PROJECT_PLATFORM,
     '--name', `shukka-${spec.label ?? 'step'}-${process.pid}-${containers}`,
     '--user', `${uid}:${gid}`,
     '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
@@ -358,16 +383,67 @@ export function cdkPlace() {
 }
 
 /**
- * The AWS config and credentials files of this process, by real path, so a child whose HOME is moved still finds
- * the caller's profile.
- * @param {Record<string, string | undefined>} [env]
- * @returns {{ AWS_CONFIG_FILE: string, AWS_SHARED_CREDENTIALS_FILE: string }}
+ * The admin's credentials as short-lived keys, resolved in this process (its own environment and real HOME) with
+ * `aws configure export-credentials`: an SSO profile (its token cache is under ~/.aws/sso), a credential_process,
+ * an assumed role or static keys alike. The admin's cdk runs with an empty HOME (cdkPlace), where an SSO profile
+ * cannot resolve, so it is given these keys and nothing else (adminCdkEnv). The keys are captured, never printed.
+ * Not run in a dry run, where no admin cdk runs: the command is printed and no keys are returned.
+ * @param {Io} io
+ * @param {string} [profile] none: the AWS CLI's default chain (AWS_PROFILE, keys in the environment, ...)
+ * @returns {Record<string, string>} AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and, for temporary keys, AWS_SESSION_TOKEN
  */
-export function awsFiles(env = process.env) {
+export function adminCredentials(io, profile) {
+  const args = ['configure', 'export-credentials', ...(profile ? ['--profile', profile] : []), '--format', 'process'];
+  if (io.dryRun) {
+    io.out(`+ ${commandLine('aws', args)}; cdk gets only those keys   [dry run: not run]\n`);
+    return {};
+  }
+  const who = profile ? `profile ${profile}` : 'your default AWS credentials';
+  const r = io.run('aws', args, { mutates: false, capture: 'stdout' });
+  if (r.status !== 0) {
+    throw new CliError(`cannot get credentials for ${who} (aws configure export-credentials failed; it needs AWS CLI 2.9 or later); `
+      + `for an SSO profile, sign in first: aws sso login${profile ? ` --profile ${profile}` : ''}`);
+  }
+  /** @type {any} */
+  let c;
+  try {
+    c = JSON.parse(r.stdout);
+  } catch {
+    c = null; // the parse error would quote the output, which holds the keys
+  }
+  const ok = (/** @type {unknown} */ v) => typeof v === 'string' && v !== '';
+  if (!c || !ok(c.AccessKeyId) || !ok(c.SecretAccessKey)) throw new CliError(`aws configure export-credentials gave no keys for ${who}`);
   return {
-    AWS_CONFIG_FILE: env.AWS_CONFIG_FILE ?? join(homedir(), '.aws', 'config'),
-    AWS_SHARED_CREDENTIALS_FILE: env.AWS_SHARED_CREDENTIALS_FILE ?? join(homedir(), '.aws', 'credentials'),
+    AWS_ACCESS_KEY_ID: c.AccessKeyId,
+    AWS_SECRET_ACCESS_KEY: c.SecretAccessKey,
+    ...(ok(c.SessionToken) ? { AWS_SESSION_TOKEN: c.SessionToken } : {}),
   };
+}
+
+/** Variables of this process the admin's cdk keeps: how to find node and temp files, the CA bundle and proxies. */
+const ADMIN_ENV_KEEP = [
+  'PATH', 'TMPDIR', 'LANG', 'AWS_CA_BUNDLE', 'HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'NO_PROXY', 'no_proxy',
+];
+
+/**
+ * The whole environment of the admin's cdk: only the variables in ADMIN_ENV_KEEP from this process (nothing like
+ * NODE_OPTIONS or CDK_* that could change what cdk loads or does, and no AWS_PROFILE or keys of its own), the keys
+ * from adminCredentials, empty AWS config and credentials files (no profile to resolve), the region, npm made safe,
+ * and the empty HOME. cdk is then run without --profile.
+ * @param {Record<string, string>} credentials from adminCredentials
+ * @param {string} region
+ * @param {string} home
+ * @param {Record<string, string | undefined>} [from]
+ * @returns {Record<string, string>}
+ */
+export function adminCdkEnv(credentials, region, home, from = process.env) {
+  /** @type {Record<string, string>} */
+  const env = {};
+  for (const k of ADMIN_ENV_KEEP) {
+    const v = from[k];
+    if (v !== undefined) env[k] = v;
+  }
+  return { ...env, ...noAwsFiles(), ...credentials, ...NPM_SAFE, HOME: home, AWS_REGION: region, AWS_DEFAULT_REGION: region };
 }
 
 /**

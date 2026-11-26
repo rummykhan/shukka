@@ -166,7 +166,7 @@ function unwrapDocker(args: string[]) {
  * `docker run` of a project step (not a detached service) is recorded (and answered) as the command run inside the container, with the
  * container's workdir as `cwd`, its whole environment as `fullEnv` and the real docker argv as `docker`.
  */
-function recordingSpawn(respond: (call: Call) => { status: number; stdout: string } = () => ({ status: 0, stdout: '' })) {
+function recordingSpawn(respond: (call: Call) => { status: number; stdout: string } = answerExport) {
   const calls: Call[] = [];
   const spawn = (cmd: string, args: string[], options: any) => {
     if (cmd === 'docker' && args[0] === 'run' && !args.includes('--detach')) {
@@ -180,6 +180,11 @@ function recordingSpawn(respond: (call: Call) => { status: number; stdout: strin
     return respond({ cmd, args, options });
   };
   return { calls, spawn };
+}
+
+/** The default answer: `aws configure export-credentials` prints the admin's keys (shu-2mg), anything else succeeds silently. */
+function answerExport({ cmd, args }: Call) {
+  return cmd === 'aws' && args[0] === 'configure' && args[1] === 'export-credentials' ? { status: 0, stdout: EXPORTED } : { status: 0, stdout: '' };
 }
 
 /** The real spawn, except docker: `docker info` and `docker image inspect` answer (Docker and the image are there), anything else fails the test. */
@@ -265,7 +270,9 @@ test('shu-5ix: bootstrap --account dry run prints the cdk deploy of Shukka-Accou
   const lines = printed(r.out);
   const deploy = lines.find((l) => l.includes(' deploy Shukka-Account'));
   assert.ok(deploy, r.out);
-  assert.match(deploy, new RegExp(`^\\+ ${reEscape(CDK)} deploy Shukka-Account --app \\S+ --require-approval never --no-color --profile stelking\\s+\\[dry run: not run\\]$`));
+  assert.match(deploy, new RegExp(`^\\+ ${reEscape(CDK)} deploy Shukka-Account --app \\S+ --require-approval never --no-color\\s+\\[dry run: not run\\]$`));
+  // shu-2mg: cdk gets the profile's exported keys, not --profile (an SSO profile cannot resolve under its empty HOME).
+  assert.ok(lines.includes('+ aws configure export-credentials --profile stelking --format process; cdk gets only those keys   [dry run: not run]'), r.out);
   assert.deepEqual(MUTATING(calls), [], 'nothing but lookups ran');
   const template = templateOf(argAfter(deploy, '--app'), 'Shukka-Account');
   const types = Object.values(template.Resources).map((x: any) => x.Type);
@@ -331,7 +338,7 @@ test('shu-5ix: bootstrap <project> dry run deploys the boundary stack, then the 
 
   // 1. The fence: boundary and the three execution policies, with the config's hosted zone and mail domain.
   const boundaryLine = lines[boundary]!;
-  assert.match(boundaryLine, /--profile stelking/);
+  assert.ok(!boundaryLine.includes('--profile'), 'cdk gets the exported keys, not the profile (shu-2mg)');
   const fence = templateOf(argAfter(boundaryLine, '--app'), 'Shukka-Boundary-shukkatest');
   const names = Object.values(fence.Resources).filter((x: any) => x.Type === 'AWS::IAM::ManagedPolicy').map((x: any) => x.Properties.ManagedPolicyName).sort();
   assert.deepEqual(names, ['shukkatest-shukka-boundary', 'shukkatest-shukka-execution', 'shukkatest-shukka-execution-iam', 'shukkatest-shukka-execution-infra']);
@@ -374,6 +381,7 @@ test('shu-5ix: bootstrap <project> real run hands each buildEnv value to gh on s
     [['variable', 'set', 'CONTACT_EMAIL', '--repo', 'owner/consumer'], 'hello@example.com'],
   ]);
   assert.deepEqual(calls.filter((c) => c.cmd !== 'git' && c.cmd !== 'gh').map((c) => `${c.cmd} ${c.args.slice(0, 3).join(' ')}`), [
+    'aws configure export-credentials --profile',
     `${process.execPath} ${cdkBin()} deploy Shukka-Boundary-shukkatest`,
     'aws cloudformation deploy --stack-name',
   ]);
@@ -542,6 +550,7 @@ test('shu-5ix: deploy dry run prints the workflow steps in order: checks, build,
     /^node scripts\/assembly\.mjs check \S+ --project shukkatest$/,
     new RegExp(`^node scripts/policy-guard\\.mjs \\S+ --account ${ACCOUNT} --mail-domain example\\.com$`),
     new RegExp(`^assume arn:aws:iam::${ACCOUNT}:role/cdk-shukkatest-deploy-role-${ACCOUNT}-us-east-1 as shukka-emergency; cdk gets only that session$`),
+    /^read the state of each stack to deploy; stop if one is ROLLBACK_COMPLETE, ROLLBACK_FAILED, UPDATE_ROLLBACK_FAILED, DELETE_FAILED or REVIEW_IN_PROGRESS$/, // shu-wud
     new RegExp(`^${reEscape(CDK)} diff --app \\S+ --no-color --parameters BootstrapVersion=/cdk-bootstrap/shukkatest/version$`),
     /^node scripts\/guard\.mjs < the diff$/,
     new RegExp(`^${reEscape(CDK)} deploy --app \\S+ --require-approval never --no-color --parameters BootstrapVersion=/cdk-bootstrap/shukkatest/version --all --tags=shukka:revision=${sha}$`),
@@ -567,6 +576,9 @@ function bundleInTree(bundle: string, cwd: string) {
 }
 
 /** A spawn for a real deploy run: commands succeed, cdk synth writes a manifest, cdk diff prints `diff`, the bundle script bundles `bundle`. */
+/** What `aws configure export-credentials --format process` prints: the admin profile's short-lived keys (shu-2mg). */
+const EXPORTED = JSON.stringify({ Version: 1, AccessKeyId: 'ASIAADMINSSO', SecretAccessKey: 'admin-sso-secret', SessionToken: 'admin-sso-token', Expiration: '2026-11-26T03:00:00Z' });
+
 function deploySpawn(diff: string, bundle: string, diffStatus = 0, artifacts: Record<string, unknown> = { 'shukkatest-App': { type: 'aws:cloudformation:stack', properties: { tags: { Project: 'shukkatest' } } } }, files: Record<string, unknown> = {}) {
   return recordingSpawn(({ cmd, args, options }) => {
     if (cmd === 'npx' && args.includes('synth')) {
@@ -576,6 +588,7 @@ function deploySpawn(diff: string, bundle: string, diffStatus = 0, artifacts: Re
       return { status: 0, stdout: '' };
     }
     if (cmd === process.execPath && args[1] === 'diff') return { status: diffStatus, stdout: diff };
+    if (cmd === 'aws' && args[0] === 'configure' && args[1] === 'export-credentials') return { status: 0, stdout: EXPORTED };
     if (cmd === 'bash' && args[0]?.endsWith('bundle.sh')) return bundleInTree(bundle, options.cwd);
     return { status: 0, stdout: '' };
   });
@@ -678,6 +691,18 @@ test('shu-5ix: project code runs without AWS credentials; cdk gets only the depl
     assert.ok(env.HOME.includes('shukka-cdk-home-'), `cdk gets an empty HOME: ${env.HOME}`);
   }
   assert.equal(c.s3.calls.length, 2, 'upload and release used the caller clients');
+}));
+
+test('shu-wud: deploy stops before cdk when a stack it deploys is ROLLBACK_FAILED, naming the stack, the state and what to do', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  const s = deploySpawn(CLEAN_DIFF, bundleDir(tmp));
+  const c = releaseClients();
+  const { aws } = awsWith(c, { describeStack: async (name: string) => (name === 'shukkatest-App' ? { name, outputs: {}, tags: {}, status: 'ROLLBACK_FAILED' } : null) });
+  const r = await cli(['deploy', '--skip-checks'], { cwd: dir, spawn: s.spawn, aws, checkAssembly: NO_ASSETS });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.err, /refusing to deploy:\n(shukka: )?stack shukkatest-App is in ROLLBACK_FAILED: .*Delete it by hand with admin credentials \(aws cloudformation delete-stack --stack-name shukkatest-App/);
+  assert.ok(!s.calls.some((x) => isCdk(x, 'diff') || isCdk(x, 'deploy')), 'cdk never runs');
+  assert.equal(c.s3.calls.length, 0, 'nothing uploaded');
 }));
 
 test('shu-5ix: deploy stops at the guard on a destructive diff unless --allow-replacement, and takes buildEnv from the environment', withTmp(async (tmp) => {
@@ -884,11 +909,11 @@ test("shu-5ix: a planted .npmrc and cdk.json in the directory bootstrap runs fro
   const { calls, spawn } = recordingSpawn(({ cmd, args, options }) => {
     if (cmd === process.execPath && args[0] === cdkBin()) {
       const app = args[args.indexOf('--app') + 1]!;
-      const env = { ...process.env, ...options.env, CDK_DISABLE_CLI_TELEMETRY: 'true' };
+      const env = { ...options.fullEnv, CDK_DISABLE_CLI_TELEMETRY: 'true' };
       const r = spawnSync(process.execPath, [cdkBin(), 'ls', '--app', app, '--no-notices'], { cwd: options.cwd, env, encoding: 'utf8' });
       replays.push({ cwd: options.cwd, out: r.stdout + r.stderr });
     }
-    return { status: 0, stdout: '' };
+    return answerExport({ cmd, args, options });
   });
   const r = await cli(projectArgs().filter((a) => a !== '--dry-run'), { cwd: dir, spawn, keepTemp: true });
   assert.equal(r.code, 0, r.err);
@@ -897,8 +922,8 @@ test("shu-5ix: a planted .npmrc and cdk.json in the directory bootstrap runs fro
   for (const x of cdkCalls) {
     assert.ok(x.args[0]!.startsWith(join(root, 'node_modules', 'aws-cdk')), `shukka's own cdk: ${x.args[0]}`);
     assert.notEqual(x.options.cwd, dir);
-    assert.equal(x.options.env.npm_config_script_shell, '/bin/sh');
-    assert.equal(x.options.env.npm_config_registry, 'https://registry.npmjs.org/');
+    assert.equal(x.options.fullEnv.npm_config_script_shell, '/bin/sh');
+    assert.equal(x.options.fullEnv.npm_config_registry, 'https://registry.npmjs.org/');
   }
   assert.ok(replays.length >= 1 && replays.every((p) => p.out.includes('Shukka-Boundary-shukkatest')), JSON.stringify(replays));
   assert.ok(!existsSync(marker), 'the planted plugin did not run');
@@ -906,10 +931,12 @@ test("shu-5ix: a planted .npmrc and cdk.json in the directory bootstrap runs fro
   assert.ok(!existsSync(homeMarker), 'the ~/.cdk.json plugin did not run');
   for (const x of cdkCalls) {
     assert.deepEqual(readdirSync(x.options.cwd), [], 'cdk runs in an empty directory');
-    assert.notEqual(x.options.env.HOME, fakeHome);
-    assert.deepEqual(readdirSync(x.options.env.HOME), [], 'cdk gets an empty HOME');
-    assert.equal(x.options.env.AWS_CONFIG_FILE, join(fakeHome, '.aws', 'config'), "the admin's profile still resolves");
-    assert.equal(x.options.env.AWS_SHARED_CREDENTIALS_FILE, join(fakeHome, '.aws', 'credentials'));
+    assert.notEqual(x.options.fullEnv.HOME, fakeHome);
+    assert.deepEqual(readdirSync(x.options.fullEnv.HOME), [], 'cdk gets an empty HOME');
+    // shu-2mg: the admin's profile is resolved by shukka first; cdk gets its keys and empty AWS files.
+    assert.equal(x.options.fullEnv.AWS_ACCESS_KEY_ID, 'ASIAADMINSSO', "the admin's keys");
+    assert.equal(readFileSync(x.options.fullEnv.AWS_CONFIG_FILE, 'utf8'), '');
+    assert.equal(readFileSync(x.options.fullEnv.AWS_SHARED_CREDENTIALS_FILE, 'utf8'), '');
   }
 
   // Controls: the same cdk run from the project directory, or with the real HOME, does load the planted plugin.
@@ -1832,15 +1859,20 @@ test('shu-ecn: deploy-ci synthesizes in Docker without credentials, checks the a
   const assemblyDir = diff.args[3]!;
   assert.ok(assemblyDir.endsWith('cdk.out'), 'the checked assembly, never the project directory');
   assert.equal(synth.args[synth.args.indexOf('--output') + 1], assemblyDir, 'the assembly the container wrote and the checks read');
-  assert.deepEqual(diff.args, [cdkBin(), 'diff', '--app', assemblyDir, '--exclusively', 'Shukkatest-Ci', '--no-color', '--profile', 'admin']);
-  assert.deepEqual(deploy.args, [cdkBin(), 'deploy', '--app', assemblyDir, 'Shukkatest-Ci', '--exclusively', '--require-approval', 'never', '--no-color', '--profile', 'admin']);
+  assert.deepEqual(diff.args, [cdkBin(), 'diff', '--app', assemblyDir, '--exclusively', 'Shukkatest-Ci', '--no-color']);
+  assert.deepEqual(deploy.args, [cdkBin(), 'deploy', '--app', assemblyDir, 'Shukkatest-Ci', '--exclusively', '--require-approval', 'never', '--no-color']);
+  const exports = calls.filter((x) => x.cmd === 'aws' && x.args[1] === 'export-credentials');
+  assert.ok(exports.length > 0 && exports.every((x) => x.args.join(' ') === 'configure export-credentials --profile admin --format process'), 'the admin profile is resolved by shukka first (shu-2mg)');
   for (const c of cdks) {
     assert.ok(!c.options.docker, 'cdk runs on the host with the admin profile');
     assert.ok(!c.options.cwd.startsWith(dir) && readdirSync(c.options.cwd).length === 0, 'cdk runs from an empty directory, not the checkout');
     assert.notEqual(c.options.fullEnv.HOME, homedir(), 'with an empty HOME');
     assert.equal(readdirSync(c.options.fullEnv.HOME).length, 0);
     assert.equal(c.options.env, undefined, 'nothing of this process\'s environment is merged in');
+    assert.equal(c.options.fullEnv.AWS_ACCESS_KEY_ID, 'ASIAADMINSSO', 'with the admin profile\'s exported keys (shu-2mg)');
+    assert.equal(c.options.fullEnv.AWS_PROFILE, undefined);
   }
+  assert.ok(!r.out.includes('admin-sso-secret') && !r.err.includes('admin-sso-secret') && !r.out.includes('admin-sso-token'), 'the keys are never printed');
   assert.match(r.out, /\[~\] AWS::IAM::Role InfraRole/);
   assert.match(r.out, /guard: nothing is deleted or replaced/);
   assert.match(r.out, new RegExp(`Shukkatest-Ci deployed at ${sha}`));
@@ -1984,11 +2016,16 @@ test('shu-ecn: deploy-ci refuses a CI stack whose assets would be published anyw
 }));
 
 test('shu-ecn: the admin\'s cdk gets a minimal environment, never NODE_OPTIONS or CDK settings of this process', async () => {
-  const { adminEnv } = await import('../scripts/cli/deploy.mjs');
-  const env = adminEnv('us-east-1', '/tmp/empty-home', { PATH: '/bin', NODE_OPTIONS: '--require /tmp/x.js', CDK_HOME: '/x', AWS_PROFILE: 'admin', AWS_ACCESS_KEY_ID: 'AKIA', HOME: '/Users/me', npm_config_userconfig: '/x' });
+  const { adminCdkEnv } = await import('../scripts/cli/exec.mjs');
+  const keys = { AWS_ACCESS_KEY_ID: 'ASIAEXPORTED', AWS_SECRET_ACCESS_KEY: 'exported-secret', AWS_SESSION_TOKEN: 'exported-token' };
+  const env = adminCdkEnv(keys, 'us-east-1', '/tmp/empty-home', { PATH: '/bin', NODE_OPTIONS: '--require /tmp/x.js', CDK_HOME: '/x', AWS_PROFILE: 'admin', AWS_ACCESS_KEY_ID: 'AKIA', HOME: '/Users/me', npm_config_userconfig: '/x' });
   assert.equal(env.PATH, '/bin');
-  assert.equal(env.AWS_PROFILE, 'admin');
-  assert.equal(env.AWS_ACCESS_KEY_ID, 'AKIA');
+  // shu-2mg: the exported keys replace the profile and any keys of this process; the AWS files are empty.
+  assert.equal(env.AWS_PROFILE, undefined);
+  assert.equal(env.AWS_ACCESS_KEY_ID, 'ASIAEXPORTED');
+  assert.equal(env.AWS_SESSION_TOKEN, 'exported-token');
+  assert.equal(readFileSync(env.AWS_CONFIG_FILE!, 'utf8'), '');
+  assert.equal(readFileSync(env.AWS_SHARED_CREDENTIALS_FILE!, 'utf8'), '');
   assert.equal(env.HOME, '/tmp/empty-home');
   assert.equal(env.AWS_REGION, 'us-east-1');
   for (const k of ['NODE_OPTIONS', 'CDK_HOME', 'npm_config_userconfig']) assert.equal(env[k], undefined, k);
@@ -2093,6 +2130,91 @@ test('shu-ik0: bootstrap --account refuses --bound-existing-roles, and --help do
   assert.match(helpText(), /--bound-existing-roles/);
 });
 
+// ---------- shu-dnd: a project moving onto shukka, whose own stacks hold EC2 resources made before the Project tag ----------
+
+/** An account whose stack Shukkatest-prod-Instance (Project=shukkatest) holds EC2 resources, Shukkatest-dns (shukka:project) an EIP, and a foreign stack others. */
+function ec2Account() {
+  return fakeAws({
+    stacksWithTags: async () => [
+      { name: 'Shukkatest-prod-Instance', tags: { Project: 'shukkatest' } },
+      { name: 'Shukkatest-dns', tags: { 'shukka:project': 'shukkatest' } },
+      { name: 'Orbitary-prod', tags: { Project: 'orbitary' } },
+      { name: 'Untagged', tags: {} },
+    ],
+    stackPhysicalIds: async (name: string) => ({
+      'Shukkatest-prod-Instance': ['i-0abc12345678def01', 'lt-0c441db83956d6c6b', 'sg-0123456789abcdef0', 'vol-0fedcba9876543210', 'Shukkatest-prod-Instance-Role1ABCC5F0'],
+      'Shukkatest-dns': ['203.0.113.7', 'Z0123456789ABCDEFGHIJ'],
+      'Orbitary-prod': ['i-0999999999999999a', 'lt-0999999999999999b', '198.51.100.9'],
+      Untagged: ['sg-0888888888888888c'],
+    } as Record<string, string[]>)[name] ?? [],
+  });
+}
+
+/** A spawn that answers `aws ec2 describe-addresses` with the EIP's allocation id. */
+function ec2Spawn() {
+  return recordingSpawn((c) => (c.cmd === 'aws' && c.args[1] === 'describe-addresses'
+    ? { status: 0, stdout: '203.0.113.7\teipalloc-0a1b2c3d4e5f60718\n' }
+    : answerExport(c)));
+}
+
+const FOREIGN = ['i-0999999999999999a', 'lt-0999999999999999b', '198.51.100.9', 'sg-0888888888888888c'];
+
+test('shu-dnd: --tag-existing-ec2 --dry-run prints create-tags for the EC2 resources of the project\'s own stacks only, and changes nothing', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  const { calls, spawn } = ec2Spawn();
+  const r = await cli(projectArgs(['--tag-existing-ec2']), { cwd: dir, spawn, aws: ec2Account().aws });
+  assert.equal(r.code, 0, r.out + r.err);
+  const lines = printed(r.out);
+  const tags = lines.filter((l) => l.includes('ec2 create-tags'));
+  assert.deepEqual(tags, [
+    '+ aws ec2 create-tags --resources i-0abc12345678def01 lt-0c441db83956d6c6b sg-0123456789abcdef0 vol-0fedcba9876543210 --tags Key=Project,Value=shukkatest --region us-east-1 --profile stelking   [dry run: not run]',
+    '+ aws ec2 create-tags --resources eipalloc-0a1b2c3d4e5f60718 --tags Key=Project,Value=shukkatest --region us-east-1 --profile stelking   [dry run: not run]',
+  ]);
+  for (const id of FOREIGN) assert.ok(!r.out.includes(id), `${id} is in no stack of shukkatest and is never named`);
+  // The EIP lookup is read only and runs in a dry run; it names only the project's own address.
+  const lookup = calls.filter((c) => c.cmd === 'aws' && c.args[1] === 'describe-addresses');
+  assert.equal(lookup.length, 1);
+  assert.deepEqual(lookup[0]!.args.slice(0, 4), ['ec2', 'describe-addresses', '--public-ips', '203.0.113.7']);
+  assert.ok(r.out.includes('stack Shukkatest-prod-Instance: i-0abc12345678def01, lt-0c441db83956d6c6b'), r.out);
+  assert.deepEqual(MUTATING(calls).filter((c) => !(c.cmd === 'aws' && c.args[1] === 'describe-addresses')), [], 'a dry run changes nothing');
+}));
+
+test('shu-dnd: --tag-existing-ec2 tags after the boundary stack and before the project bootstrap', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  const { calls, spawn } = ec2Spawn();
+  const r = await cli(projectArgs(['--tag-existing-ec2']).filter((a) => a !== '--dry-run'), { cwd: dir, spawn, aws: ec2Account().aws });
+  assert.equal(r.code, 0, r.out + r.err);
+  const lines = printed(r.out);
+  const boundary = lines.findIndex((l) => l.includes('deploy Shukka-Boundary-shukkatest'));
+  const tag = lines.findIndex((l) => l.includes('ec2 create-tags'));
+  const toolkit = lines.findIndex((l) => l.startsWith('+ aws cloudformation deploy'));
+  assert.ok(boundary !== -1 && tag > boundary && toolkit > tag, r.out);
+  const runs = calls.filter((c) => c.cmd === 'aws' && c.args[1] === 'create-tags');
+  assert.equal(runs.length, 2, 'one create-tags per owned stack, run for real');
+  for (const c of runs) for (const id of FOREIGN) assert.ok(!c.args.includes(id), `${id} not tagged`);
+}));
+
+test('shu-dnd: a failed Elastic IP lookup stops the bootstrap before anything changes; without the flag nothing is looked up or tagged', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  const failing = recordingSpawn((c) => (c.cmd === 'aws' && c.args[1] === 'describe-addresses' ? { status: 255, stdout: '' } : answerExport(c)));
+  const r = await cli(projectArgs(['--tag-existing-ec2']).filter((a) => a !== '--dry-run'), { cwd: dir, spawn: failing.spawn, aws: ec2Account().aws });
+  assert.equal(r.code, 1, r.out + r.err);
+  assert.match(r.err, /cannot look up the Elastic IP\(s\) 203\.0\.113\.7/);
+  assert.deepEqual(MUTATING(failing.calls).filter((c) => !(c.cmd === 'aws' && c.args[1] === 'describe-addresses')), [], 'nothing ran');
+
+  const plain = ec2Spawn();
+  const r2 = await cli(projectArgs(), { cwd: dir, spawn: plain.spawn, aws: ec2Account().aws });
+  assert.equal(r2.code, 0, r2.out + r2.err);
+  assert.ok(!r2.out.includes('create-tags') && !plain.calls.some((c) => c.args[1] === 'describe-addresses'), r2.out);
+}));
+
+test('shu-dnd: bootstrap --account refuses --tag-existing-ec2, and --help documents it', async () => {
+  const r = await cli(['bootstrap', '--account', '--region', 'us-east-1', '--tag-existing-ec2', '--dry-run']);
+  assert.equal(r.code, 2);
+  assert.match(r.err, /--tag-existing-ec2 is for a project bootstrap/);
+  assert.match(helpText(), /--tag-existing-ec2/);
+});
+
 // shu-r5f: shukka diff and deploy point every stack's BootstrapVersion at the project's bootstrap (the qualifier from
 // shukka.json), so a stack first deployed through CDK's default bootstrap moves to the project's.
 test('shu-r5f: shukka diff and deploy pass --parameters BootstrapVersion=/cdk-bootstrap/<qualifier>/version to cdk diff and cdk deploy', withTmp(async (tmp) => {
@@ -2130,4 +2252,180 @@ test('shu-r5f: a qualifier that is not ^[a-z0-9]{1,10}$ is refused before any cd
     assert.match(r.err, /qualifier/);
     assert.ok(!s.calls.some((y) => isCdk(y, 'diff') || isCdk(y, 'deploy')), `${bad}: cdk never ran`);
   }
+}));
+
+// ---------- shu-2mg: admin profiles that need the real HOME (AWS SSO, credential_process) ----------
+
+/**
+ * A stand-in for the AWS CLI's `aws configure export-credentials`, resolving profiles the way the real one does as far
+ * as these tests need: from $AWS_CONFIG_FILE (default $HOME/.aws/config); an SSO profile (sso_session) only when a
+ * token sits in $HOME/.aws/sso/cache, which is where the AWS CLI and SDKs look whatever AWS_CONFIG_FILE says; a
+ * profile with static keys as those keys.
+ */
+const STUB_AWS = `#!/usr/bin/env bash
+set -eu
+[ "$1 $2" = "configure export-credentials" ] || { echo "stub aws: unexpected $*" >&2; exit 2; }
+shift 2
+profile="\${AWS_PROFILE:-default}"
+while [ $# -gt 0 ]; do case "$1" in --profile) profile="$2"; shift 2;; *) shift;; esac; done
+config="\${AWS_CONFIG_FILE:-$HOME/.aws/config}"
+section=$(awk -v p="[profile $profile]" '$0==p{on=1;next} /^\\[/{on=0} on' "$config" 2>/dev/null || true)
+[ -n "$section" ] || { echo "The config profile ($profile) could not be found" >&2; exit 255; }
+if printf '%s\\n' "$section" | grep -q '^sso_session'; then
+  grep -qs accessToken "$HOME"/.aws/sso/cache/*.json || { echo "Error loading SSO Token: Token for $profile does not exist" >&2; exit 255; }
+  echo '{"Version": 1, "AccessKeyId": "ASIASSOSTUB", "SecretAccessKey": "sso-stub-secret", "SessionToken": "sso-stub-token", "Expiration": "2026-11-26T03:00:00+00:00"}'
+else
+  id=$(printf '%s\\n' "$section" | sed -n 's/^aws_access_key_id *= *//p')
+  secret=$(printf '%s\\n' "$section" | sed -n 's/^aws_secret_access_key *= *//p')
+  echo "{\\"Version\\": 1, \\"AccessKeyId\\": \\"$id\\", \\"SecretAccessKey\\": \\"$secret\\"}"
+fi
+`;
+
+/** A home directory with an SSO profile `sso-admin` and its cached token, a static-key profile `static-admin`, and the stub aws. */
+function ssoHome(tmp: string, withToken = true) {
+  const home = join(tmp, 'home');
+  write(join(home, '.aws', 'config'), [
+    '[sso-session corp]', 'sso_start_url = https://example.awsapps.com/start', 'sso_region = us-east-1', '',
+    '[profile sso-admin]', 'sso_session = corp', `sso_account_id = ${ACCOUNT}`, 'sso_role_name = AdministratorAccess', '',
+    '[profile static-admin]', 'aws_access_key_id = AKIASTATICSTUB', 'aws_secret_access_key = static-stub-secret', '',
+  ].join('\n'));
+  if (withToken) write(join(home, '.aws', 'sso', 'cache', 'abc123.json'), JSON.stringify({ startUrl: 'https://example.awsapps.com/start', accessToken: 'sso-access-token', expiresAt: '2026-11-26T10:00:00Z' }));
+  const stub = join(tmp, 'bin', 'aws');
+  write(stub, STUB_AWS);
+  execFileSync('chmod', ['+x', stub]);
+  return { home, stub, vars: { HOME: home, AWS_CONFIG_FILE: join(home, '.aws', 'config') } };
+}
+
+/** A recording spawn whose `aws configure export-credentials` runs the stub for real, with the environment the CLI gives it. */
+function exportSpawn(stub: string, respond?: (call: Call) => { status: number; stdout: string }) {
+  return recordingSpawn((call) => {
+    if (call.cmd === 'aws' && call.args[1] === 'export-credentials') return realSpawn(stub, call.args, call.options);
+    return respond ? respond(call) : { status: 0, stdout: '' };
+  });
+}
+
+test('shu-2mg: bootstrap with an SSO profile reaches the cdk step with the profile\'s keys, resolved with the real HOME (stubbed SSO cache)', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  const { home, stub, vars } = ssoHome(tmp);
+  for (const argv of [
+    ['bootstrap', '--account', '--profile', 'sso-admin', '--region', 'us-east-1'],
+    ['bootstrap', 'shukkatest', '--config', 'shukka.json', '--repo', 'owner/consumer', '--profile', 'sso-admin', '--region', 'us-east-1'],
+  ]) {
+    const { calls, spawn } = exportSpawn(stub);
+    const r = await withEnv(vars, () => cli(argv, { spawn, cwd: dir }));
+    assert.equal(r.code, 0, `${argv[1]}: ${r.out}${r.err}`);
+    const exp = calls.find((x) => x.cmd === 'aws' && x.args[1] === 'export-credentials')!;
+    assert.deepEqual(exp.args, ['configure', 'export-credentials', '--profile', 'sso-admin', '--format', 'process']);
+    assert.equal(exp.options.fullEnv, undefined, 'the export runs in this process\'s environment, where the SSO cache is');
+    const cdks = calls.filter((x) => x.cmd === process.execPath && x.args[1] === 'deploy');
+    assert.ok(cdks.length > 0, `${argv[1]} reaches the cdk step: ${r.out}`);
+    for (const c of cdks) {
+      const env = c.options.fullEnv;
+      assert.ok(env, 'cdk gets a whole environment, nothing inherited');
+      assert.equal(env.AWS_ACCESS_KEY_ID, 'ASIASSOSTUB');
+      assert.equal(env.AWS_SECRET_ACCESS_KEY, 'sso-stub-secret');
+      assert.equal(env.AWS_SESSION_TOKEN, 'sso-stub-token');
+      assert.equal(env.AWS_REGION, 'us-east-1');
+      assert.equal(env.AWS_PROFILE, undefined);
+      assert.ok(!c.args.includes('--profile'), 'cdk is not given the profile it could not resolve');
+      assert.notEqual(env.HOME, home);
+      assert.equal(readdirSync(env.HOME).length, 0, 'cdk still runs with an empty HOME');
+      assert.equal(readFileSync(env.AWS_CONFIG_FILE, 'utf8'), '', 'and no AWS config of the admin\'s');
+      assert.equal(readdirSync(c.options.cwd).length, 0, 'from an empty directory');
+      // The bug this fixes: the same profile, looked up from cdk's empty HOME, has no SSO token.
+      const fromCdkHome = spawnSync(stub, ['configure', 'export-credentials', '--profile', 'sso-admin'], { env: { PATH: process.env.PATH, HOME: env.HOME, AWS_CONFIG_FILE: vars.AWS_CONFIG_FILE }, encoding: 'utf8' });
+      assert.notEqual(fromCdkHome.status, 0, 'under cdk\'s HOME the SSO profile does not resolve');
+    }
+    for (const secret of ['sso-stub-secret', 'sso-stub-token', 'sso-access-token']) assert.ok(!r.out.includes(secret) && !r.err.includes(secret), `${secret} is never printed`);
+  }
+}));
+
+test('shu-2mg: deploy-ci with an SSO profile gives shukka\'s cdk the profile\'s exported keys and no --profile', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  const { stub, vars } = ssoHome(tmp);
+  const base = deploySpawn(CI_DIFF, bundleDir(tmp), 0, CI_ARTIFACTS(), CI_FILES());
+  const { calls, spawn } = exportSpawn(stub, (call) => base.spawn(call.cmd, call.args, call.options));
+  const r = await withEnv(vars, () => cli(['deploy-ci', 'shukkatest', '--profile', 'sso-admin', '--yes'], { cwd: dir, spawn, aws: fakeAws().aws, checkAssembly: NO_ASSETS }));
+  assert.equal(r.code, 0, r.out + r.err);
+  const cdks = calls.filter((x) => x.cmd === process.execPath);
+  assert.deepEqual(cdks.map((x) => x.args[1]), ['diff', 'deploy']);
+  for (const c of cdks) {
+    assert.equal(c.options.fullEnv.AWS_ACCESS_KEY_ID, 'ASIASSOSTUB');
+    assert.equal(c.options.fullEnv.AWS_SESSION_TOKEN, 'sso-stub-token');
+    assert.equal(c.options.fullEnv.AWS_PROFILE, undefined);
+    assert.ok(!c.args.includes('--profile'));
+    assert.equal(readdirSync(c.options.fullEnv.HOME).length, 0);
+  }
+  assert.ok(!r.out.includes('sso-stub-secret') && !r.err.includes('sso-stub-token'));
+}));
+
+test('shu-2mg: a static-key profile still works: cdk gets its keys, without a session token', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  const { stub, vars } = ssoHome(tmp);
+  const { calls, spawn } = exportSpawn(stub);
+  const r = await withEnv(vars, () => cli(['bootstrap', '--account', '--profile', 'static-admin', '--region', 'us-east-1'], { spawn, cwd: dir }));
+  assert.equal(r.code, 0, r.out + r.err);
+  const cdk = calls.find((x) => x.cmd === process.execPath && x.args[1] === 'deploy')!;
+  assert.equal(cdk.options.fullEnv.AWS_ACCESS_KEY_ID, 'AKIASTATICSTUB');
+  assert.equal(cdk.options.fullEnv.AWS_SECRET_ACCESS_KEY, 'static-stub-secret');
+  assert.equal(cdk.options.fullEnv.AWS_SESSION_TOKEN, undefined);
+  assert.ok(!r.out.includes('static-stub-secret'));
+}));
+
+test('shu-2mg: an SSO profile that is not signed in stops before cdk, says to run aws sso login, and prints no keys', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  const { stub, vars } = ssoHome(tmp, false);
+  const { calls, spawn } = exportSpawn(stub);
+  const r = await withEnv(vars, () => cli(['bootstrap', '--account', '--profile', 'sso-admin', '--region', 'us-east-1'], { spawn, cwd: dir }));
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.err, /cannot get credentials for profile sso-admin .*aws sso login --profile sso-admin/);
+  assert.ok(!calls.some((x) => x.cmd === process.execPath), 'cdk never runs');
+
+  // Output that is not the keys JSON is refused without being quoted (it could hold keys).
+  const garbled = recordingSpawn((call) => (call.cmd === 'aws' && call.args[1] === 'export-credentials' ? { status: 0, stdout: 'AWS_SECRET_ACCESS_KEY=leaked-secret' } : { status: 0, stdout: '' }));
+  const g = await cli(['bootstrap', '--account', '--profile', 'sso-admin', '--region', 'us-east-1'], { spawn: garbled.spawn, cwd: dir });
+  assert.equal(g.code, 1);
+  assert.match(g.err, /gave no keys for profile sso-admin/);
+  assert.ok(!g.err.includes('leaked-secret') && !g.out.includes('leaked-secret'));
+}));
+
+test('shu-njm: deploy builds and bundles an arm64 app in a linux/arm64 container, keeps the other project steps on linux/amd64, and refuses an x64 native module', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp, (c) => { c.apps[0].server.arch = 'arm64'; });
+  const elf = (machine: number) => {
+    const b = Buffer.alloc(64);
+    b.write('\x7fELF', 0, 'latin1');
+    b[4] = 2; b[5] = 1; b[6] = 1;
+    b.writeUInt16LE(3, 16);
+    b.writeUInt16LE(machine, 18);
+    return b;
+  };
+  const bundle = bundleDir(tmp);
+  mkdirSync(join(bundle, 'node_modules', '@img', 'sharp-linux-arm64', 'lib'), { recursive: true });
+  writeFileSync(join(bundle, 'node_modules', '@img', 'sharp-linux-arm64', 'lib', 'sharp-linux-arm64.node'), elf(183));
+  let s = deploySpawn(CLEAN_DIFF, bundle);
+  const r = await cli(['deploy', '--profile', 'stelking'], { cwd: dir, spawn: s.spawn, aws: awsWith(releaseClients()).aws, checkAssembly: NO_ASSETS });
+  assert.equal(r.code, 0, r.out + r.err);
+  const steps = s.calls.filter((x) => stepOf(x) !== undefined);
+  assert.deepEqual(steps.map(stepOf), PROJECT_STEPS);
+  const armSteps = new Set(['npm ci', 'npm run build', 'bundle.sh']);
+  for (const x of steps) {
+    const argv: string[] = x.options.docker;
+    const arm = armSteps.has(stepOf(x)!);
+    assert.equal(argv[argv.indexOf('--platform') + 1], arm ? 'linux/arm64' : 'linux/amd64', stepOf(x));
+    assert.equal(unwrapDocker(argv).image, arm ? projectImage('linux/arm64') : projectImage(), stepOf(x));
+  }
+  // Each platform's image is looked up (and built when missing) once.
+  assert.deepEqual(s.calls.filter((x) => x.cmd === 'docker' && x.args[0] === 'image').map((x) => x.args.at(-1)), [projectImage(), projectImage('linux/arm64')]);
+
+  // The same app whose bundle carries sharp for x64 is refused before anything is synthesized or deployed.
+  const wrong = join(tmp, 'wrong');
+  cpSync(bundleDir(join(tmp, 'w')), wrong, { recursive: true });
+  mkdirSync(join(wrong, 'node_modules', '@img', 'sharp-linux-x64', 'lib'), { recursive: true });
+  writeFileSync(join(wrong, 'node_modules', '@img', 'sharp-linux-x64', 'lib', 'sharp-linux-x64.node'), elf(62));
+  s = deploySpawn(CLEAN_DIFF, wrong);
+  const refused = await cli(['deploy', '--profile', 'stelking'], { cwd: dir, spawn: s.spawn, aws: awsWith(releaseClients()).aws, checkAssembly: NO_ASSETS });
+  assert.equal(refused.code, 1, refused.out + refused.err);
+  assert.match(refused.err, /build web: the bundle holds native modules for another architecture than the servers' \(arm64\)/);
+  assert.match(refused.err, /"node_modules\/@img\/sharp-linux-x64\/lib\/sharp-linux-x64\.node": built for x64, the servers are arm64/);
+  assert.ok(!s.calls.some((x) => stepOf(x) === 'cdk synth' || isCdk(x, 'deploy')), 'nothing synthesized or deployed');
 }));

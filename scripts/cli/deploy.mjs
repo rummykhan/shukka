@@ -6,7 +6,7 @@
 //
 // `deploy` takes the steps the workflows take, in the same order:
 //   checks (pipeline.yml "check", skippable with --skip-checks) -> build and bundle (pipeline.yml "build") ->
-//   synth, assembly and policy checks, cdk diff, guard, cdk deploy with the shukka:revision tag (infra.yml "deploy") ->
+//   synth, assembly and policy checks, stuck-stack check, cdk diff, guard, cdk deploy with the shukka:revision tag (infra.yml "deploy") ->
 //   upload and release each app (ec2.yml "release": scripts/upload.mjs, scripts/release.mjs) -> smoke.
 // Credentials, as in CI: the project's own code (checks, build, bundle, npm ci, synth, smoke) runs in a throwaway
 // Docker container with only the fresh worktree mounted and nothing of the caller's environment or home
@@ -25,15 +25,17 @@ import { randomBytes } from 'node:crypto';
 import { copyFileSync, cpSync, existsSync, lstatSync, mkdtempSync, readFileSync, realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { bootstrapVersionArgs, ciStackName, ciStackPlan, deployCommands } from '../assembly.mjs';
+import { bootstrapVersionArgs, ciStackName, ciStackPlan, deployCommands, stackNames } from '../assembly.mjs';
 import { loadConfig } from '../config.mjs';
 import { adminNotice, guard, report } from '../guard.mjs';
 import { githubRepoFromUrl, policyGuard, report as policyReport } from '../policy-guard.mjs';
 import { release } from '../release.mjs';
+import { stuckStacks } from '../stack-state.mjs';
 import { checkBundle, upload } from '../upload.mjs';
+import { checkNativeArch } from '../native-arch.mjs';
 import {
-  CliError, HOST_CODE_WARNING, NPM_SAFE, awsFiles, cdkBin, cdkPlace, containerArgs, dockerAvailable, ensureProjectImage, mustRun, projectEnv, refuseSymlink,
-  startServices, tempDir,
+  CliError, HOST_CODE_WARNING, NPM_SAFE, PROJECT_PLATFORM, adminCdkEnv, adminCredentials, cdkBin, cdkPlace, containerArgs, dockerAvailable, ensureProjectImage, mustRun,
+  platformFor, projectEnv, refuseSymlink, startServices, tempDir,
 } from './exec.mjs';
 
 const SHUKKA_DIR = fileURLToPath(new URL('../../', import.meta.url));
@@ -47,7 +49,7 @@ export const SESSION_NAME = 'shukka-emergency';
  * @typedef {import('../config.mjs').Config} Config
  * @typedef {{ profile?: string, region?: string }} Target
  * @typedef {{ root: string, sha: string, tree: string, config: Config, aws: Aws }} Prepared
- * @typedef {{ cwd: string, env?: Record<string, string>, capture?: false | 'stdout', network?: string }} StepOptions network: a container whose network the step joins (container mode only)
+ * @typedef {{ cwd: string, env?: Record<string, string>, capture?: false | 'stdout', network?: string, platform?: string }} StepOptions network: a container whose network the step joins (container mode only); platform: the container's (exec.mjs platformFor), PROJECT_PLATFORM when absent
  * @typedef {import('./exec.mjs').RunResult} RunResult
  * @typedef {{
  *   inContainer: boolean,
@@ -175,9 +177,17 @@ export function projectSteps(io, tree, config, trust) {
     const image = ensureProjectImage(io);
     io.say(`the project's code (npm ci, cdk synth, checks, build, bundle, smoke) runs in throwaway containers of ${image}: `
       + `only ${tree} is mounted, no home directory, no AWS or GitHub credentials`);
+    /** @type {Map<string, string>} the project image for each other platform an app's build asks for, built on first use */
+    const images = new Map();
+    const imageFor = (/** @type {string | undefined} */ platform) => {
+      if (!platform || platform === PROJECT_PLATFORM) return image;
+      if (!images.has(platform)) images.set(platform, ensureProjectImage(io, platform));
+      return /** @type {string} */ (images.get(platform));
+    };
     exec = (cmd, args, options) => io.run('docker', containerArgs({
-      image, tree, cwd: options.cwd, env: { ...base, ...options.env }, cmd, args, label: config.project,
+      image: imageFor(options.platform), tree, cwd: options.cwd, env: { ...base, ...options.env }, cmd, args, label: config.project,
       ...(options.network ? { network: options.network } : {}),
+      ...(options.platform ? { platform: options.platform } : {}),
     }), options.capture ? { capture: options.capture } : {});
     services = (check, names) => startServices(io, check, names, `${config.project}-${randomBytes(4).toString('hex')}`);
   } else {
@@ -419,6 +429,46 @@ function deployStacks(io, config, session, assembly, sha) {
 }
 
 /**
+ * Stop before cdk when a stack the deploy would touch (every stack in the assembly but the CI stack) is in a state no
+ * update can leave (scripts/stack-state.mjs: ROLLBACK_COMPLETE, ROLLBACK_FAILED, UPDATE_ROLLBACK_FAILED,
+ * DELETE_FAILED, REVIEW_IN_PROGRESS), naming the stack, its state and what an admin does, as infra.yml does. cdk would
+ * otherwise try to delete it and fail on the deploy role's DeleteStack deny. A stack that cannot be read is a warning.
+ * @param {Io} io
+ * @param {Aws} aws
+ * @param {Config} config
+ * @param {string} assembly
+ */
+export async function checkStacksDeployable(io, aws, config, assembly) {
+  if (io.dryRun) {
+    io.out('+ read the state of each stack to deploy; stop if one is ROLLBACK_COMPLETE, ROLLBACK_FAILED, UPDATE_ROLLBACK_FAILED, DELETE_FAILED or REVIEW_IN_PROGRESS   [dry run: not run]\n');
+    return;
+  }
+  const ci = ciStackName(config.project);
+  /** @type {string[]} */
+  let names = [];
+  if (existsSync(join(assembly, 'manifest.json'))) {
+    try {
+      names = stackNames(assembly).filter((n) => n !== ci);
+    } catch (error) {
+      throw new CliError(/** @type {Error} */ (error).message);
+    }
+  }
+  /** @type {import('../stack-state.mjs').StackState[]} */
+  const states = [];
+  for (const name of names) {
+    try {
+      const s = await aws.describeStack(name);
+      states.push({ name, status: s?.status ?? null });
+    } catch (error) {
+      io.warn(`could not read the state of stack ${name}: ${String(/** @type {Error} */ (error).message ?? error).split('\n')[0]}`);
+    }
+  }
+  const stuck = stuckStacks(states);
+  if (stuck.length > 0) throw new CliError(`refusing to deploy:\n${stuck.map((s) => s.message).join('\n')}`);
+  io.say(`stacks checked: none is stuck (${names.length})`);
+}
+
+/**
  * Run each check's commands in its directory, as pipeline.yml's check job does, as project code.
  * @param {Io} io
  * @param {ProjectSteps} steps
@@ -472,9 +522,11 @@ async function build(io, steps, aws, tree, config, app, env) {
     values[name] = p.value;
   }
   const cwd = join(tree, app.build.dir);
+  // The build and bundle run for the servers' architecture, as pipeline.yml's build job runs on an arm64 runner for them.
+  const platform = platformFor(app.server.arch);
   app.build.run.forEach((command, i) => {
     io.say(`build ${app.name}, command ${i + 1} of ${app.build.run.length}`);
-    steps.run(`build ${app.name} (command ${i + 1})`, 'bash', ['-eo', 'pipefail', '-c', command], { cwd, env: values });
+    steps.run(`build ${app.name} (command ${i + 1})`, 'bash', ['-eo', 'pipefail', '-c', command], { cwd, env: values, platform });
   });
   let script = resolve(cwd, app.build.bundle);
   if (!existsSync(script) && app.build.bundle === 'scripts/bundle.sh') script = join(SHUKKA_DIR, 'scripts', 'bundle.sh');
@@ -485,11 +537,17 @@ async function build(io, steps, aws, tree, config, app, env) {
     copyFileSync(script, copy);
     script = copy;
   }
-  const r = steps.run(`build ${app.name}: the bundle script`, 'bash', [script], { cwd, env: values, capture: 'stdout' });
+  const r = steps.run(`build ${app.name}: the bundle script`, 'bash', [script], { cwd, env: values, capture: 'stdout', platform });
   if (io.dryRun) return `<directory printed by ${app.build.bundle}>`;
   const dir = r.stdout.split('\n').map((l) => l.trim()).filter(Boolean).pop();
   if (!dir) throw new CliError(`build ${app.name}: the bundle script did not print a directory`);
-  return snapshotBundle(checkBundlePath(tree, resolve(cwd, dir), app.name), app.name);
+  const copy = snapshotBundle(checkBundlePath(tree, resolve(cwd, dir), app.name), app.name);
+  // As pipeline.yml does: refuse native modules the servers cannot load (scripts/native-arch.mjs).
+  const native = checkNativeArch(copy, app.server.arch);
+  if (native.problems.length > 0) {
+    throw new CliError(`build ${app.name}: the bundle holds native modules for another architecture than the servers' (${app.server.arch}):\n${native.problems.join('\n')}`);
+  }
+  return copy;
 }
 
 /**
@@ -640,6 +698,7 @@ export async function deployCommand(options) {
     await checkAssemblySafe(io, assembly, config.project, options.checkAssembly);
     checkPoliciesSafe(io, root, assembly, config, options.allowReplacement ?? false);
     const session = await fencedSession(io, aws, config);
+    await checkStacksDeployable(io, aws, config, assembly);
     const { result, diffStatus } = diffAndGuard(io, config, session, assembly, options.allowReplacement ?? false);
     if (result.code !== 0) {
       throw new CliError(result.verdict === 'incomplete'
@@ -683,34 +742,9 @@ export async function deployCommand(options) {
   }
 }
 
-/** Variables of this process the admin's cdk keeps: how to find node and temp files, the AWS credentials and proxies. */
-const ADMIN_ENV_KEEP = [
-  'PATH', 'TMPDIR', 'LANG', 'AWS_PROFILE', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN', 'AWS_CA_BUNDLE',
-  'HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'NO_PROXY', 'no_proxy',
-];
-
 /**
- * The whole environment of the admin's cdk: only the variables in ADMIN_ENV_KEEP from this process (nothing like
- * NODE_OPTIONS or CDK_* that could change what cdk loads or does), the admin's AWS files by real path, the config's
- * region, npm made safe, and an empty HOME.
- * @param {string} region
- * @param {string} home
- * @param {Record<string, string | undefined>} [from]
- * @returns {Record<string, string>}
- */
-export function adminEnv(region, home, from = process.env) {
-  /** @type {Record<string, string>} */
-  const env = {};
-  for (const k of ADMIN_ENV_KEEP) {
-    const v = from[k];
-    if (v !== undefined) env[k] = v;
-  }
-  return { ...env, ...awsFiles(from), ...NPM_SAFE, HOME: home, AWS_REGION: region, AWS_DEFAULT_REGION: region };
-}
-
-/**
- * shukka's pinned cdk with the caller's own (admin) credentials: their AWS files and --profile, from an empty temp
- * directory with an empty HOME and a minimal environment (adminEnv), on an assembly passed with --app. No project
+ * shukka's pinned cdk with the caller's own (admin) credentials: their profile's keys, resolved first (adminCredentials:
+ * an SSO profile too), from an empty temp directory with an empty HOME and a minimal environment (adminCdkEnv), on an assembly passed with --app. No project
  * code runs here: no cdk.json (so no `app` command and no plugins), no .npmrc, no npm; only the synthesized and
  * checked cdk.out.
  * @param {Io} io
@@ -721,9 +755,9 @@ export function adminEnv(region, home, from = process.env) {
  */
 function adminCdk(io, config, target, args, options = {}) {
   const place = cdkPlace();
-  return io.run(process.execPath, [cdkBin(), ...args, ...(target.profile ? ['--profile', target.profile] : [])], {
+  return io.run(process.execPath, [cdkBin(), ...args], {
     cwd: place.cwd,
-    fullEnv: adminEnv(config.aws.region, place.home),
+    fullEnv: adminCdkEnv(adminCredentials(io, target.profile), config.aws.region, place.home),
     ...options,
   });
 }
