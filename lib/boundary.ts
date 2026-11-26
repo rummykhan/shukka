@@ -208,9 +208,15 @@ export function fenceDocuments(inputs: FenceInputs): FenceDocuments {
       ],
     },
     { Sid: 'Parameters', Effect: 'Allow', Action: 'ssm:*', Resource: [`arn:aws:ssm:${region}:${account}:parameter/${P}`, `arn:aws:ssm:${region}:${account}:parameter/${P}/*`] },
+    // shu-jhi: CloudFormation's AWS::Route53::HostedZone handler reads with GetHostedZone, ListTagsForResource and
+    // ListQueryLoggingConfigs, and updates the comment with UpdateHostedZoneComment. No create, delete, VPC or
+    // query-logging-config writes.
     {
       Sid: 'DNS', Effect: 'Allow',
-      Action: ['route53:ChangeResourceRecordSets', 'route53:GetHostedZone', 'route53:ListResourceRecordSets', 'route53:ChangeTagsForResource', 'route53:ListTagsForResource'],
+      Action: [
+        'route53:ChangeResourceRecordSets', 'route53:GetHostedZone', 'route53:ListResourceRecordSets', 'route53:ChangeTagsForResource',
+        'route53:ListTagsForResource', 'route53:ListQueryLoggingConfigs', 'route53:UpdateHostedZoneComment',
+      ],
       Resource: `arn:aws:route53:::hostedzone/${zone}`,
     },
     { Sid: 'DNSChanges', Effect: 'Allow', Action: ['route53:GetChange'], Resource: 'arn:aws:route53:::change/*' },

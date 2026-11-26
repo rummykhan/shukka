@@ -72,6 +72,15 @@ const cases = [
   ['exec', 'implicitDeny', 'ec2:TerminateInstances', `arn:aws:ec2:${R}:${A}:instance/i-0orbitary`, O],
   ['exec', 'implicitDeny', 'ec2:RunInstances', `arn:aws:ec2:${R}:${A}:instance/*`, { 'aws:RequestTag/Project': 'orbitary' }],
   ['exec', 'implicitDeny', 'route53:ChangeResourceRecordSets', 'arn:aws:route53:::hostedzone/ZOTHERZONE'],
+  // shu-jhi: CloudFormation's hosted-zone handler reads query logging configs and updates the comment, on the
+  // project's zone only; creating, deleting or re-associating a zone stays refused.
+  ['exec', 'allowed', 'route53:ListQueryLoggingConfigs', 'arn:aws:route53:::hostedzone/Z0123456789EXAMPLE'],
+  ['exec', 'allowed', 'route53:UpdateHostedZoneComment', 'arn:aws:route53:::hostedzone/Z0123456789EXAMPLE'],
+  ['exec', 'implicitDeny', 'route53:ListQueryLoggingConfigs', 'arn:aws:route53:::hostedzone/ZOTHERZONE'],
+  ['exec', 'implicitDeny', 'route53:UpdateHostedZoneComment', 'arn:aws:route53:::hostedzone/ZOTHERZONE'],
+  ['exec', 'implicitDeny', 'route53:DeleteHostedZone', 'arn:aws:route53:::hostedzone/Z0123456789EXAMPLE'],
+  ['exec', 'implicitDeny', 'route53:AssociateVPCWithHostedZone', 'arn:aws:route53:::hostedzone/Z0123456789EXAMPLE'],
+  ['exec', 'implicitDeny', 'route53:CreateQueryLoggingConfig', 'arn:aws:route53:::hostedzone/Z0123456789EXAMPLE'],
   ['exec', 'implicitDeny', 'iam:CreateOpenIDConnectProvider', `arn:aws:iam::${A}:oidc-provider/token.actions.githubusercontent.com`],
   ['exec', 'implicitDeny', 'iam:AttachRolePolicy', `arn:aws:iam::${A}:role/trendigle-x`],
   // shu-9bj.6: the pipeline's own roles cannot be re-trusted or given more power through a deploy; other project
