@@ -2093,6 +2093,91 @@ test('shu-ik0: bootstrap --account refuses --bound-existing-roles, and --help do
   assert.match(helpText(), /--bound-existing-roles/);
 });
 
+// ---------- shu-dnd: a project moving onto shukka, whose own stacks hold EC2 resources made before the Project tag ----------
+
+/** An account whose stack Shukkatest-prod-Instance (Project=shukkatest) holds EC2 resources, Shukkatest-dns (shukka:project) an EIP, and a foreign stack others. */
+function ec2Account() {
+  return fakeAws({
+    stacksWithTags: async () => [
+      { name: 'Shukkatest-prod-Instance', tags: { Project: 'shukkatest' } },
+      { name: 'Shukkatest-dns', tags: { 'shukka:project': 'shukkatest' } },
+      { name: 'Orbitary-prod', tags: { Project: 'orbitary' } },
+      { name: 'Untagged', tags: {} },
+    ],
+    stackPhysicalIds: async (name: string) => ({
+      'Shukkatest-prod-Instance': ['i-0abc12345678def01', 'lt-0c441db83956d6c6b', 'sg-0123456789abcdef0', 'vol-0fedcba9876543210', 'Shukkatest-prod-Instance-Role1ABCC5F0'],
+      'Shukkatest-dns': ['203.0.113.7', 'Z0123456789ABCDEFGHIJ'],
+      'Orbitary-prod': ['i-0999999999999999a', 'lt-0999999999999999b', '198.51.100.9'],
+      Untagged: ['sg-0888888888888888c'],
+    } as Record<string, string[]>)[name] ?? [],
+  });
+}
+
+/** A spawn that answers `aws ec2 describe-addresses` with the EIP's allocation id. */
+function ec2Spawn() {
+  return recordingSpawn((c) => (c.cmd === 'aws' && c.args[1] === 'describe-addresses'
+    ? { status: 0, stdout: '203.0.113.7\teipalloc-0a1b2c3d4e5f60718\n' }
+    : { status: 0, stdout: '' }));
+}
+
+const FOREIGN = ['i-0999999999999999a', 'lt-0999999999999999b', '198.51.100.9', 'sg-0888888888888888c'];
+
+test('shu-dnd: --tag-existing-ec2 --dry-run prints create-tags for the EC2 resources of the project\'s own stacks only, and changes nothing', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  const { calls, spawn } = ec2Spawn();
+  const r = await cli(projectArgs(['--tag-existing-ec2']), { cwd: dir, spawn, aws: ec2Account().aws });
+  assert.equal(r.code, 0, r.out + r.err);
+  const lines = printed(r.out);
+  const tags = lines.filter((l) => l.includes('ec2 create-tags'));
+  assert.deepEqual(tags, [
+    '+ aws ec2 create-tags --resources i-0abc12345678def01 lt-0c441db83956d6c6b sg-0123456789abcdef0 vol-0fedcba9876543210 --tags Key=Project,Value=shukkatest --region us-east-1 --profile stelking   [dry run: not run]',
+    '+ aws ec2 create-tags --resources eipalloc-0a1b2c3d4e5f60718 --tags Key=Project,Value=shukkatest --region us-east-1 --profile stelking   [dry run: not run]',
+  ]);
+  for (const id of FOREIGN) assert.ok(!r.out.includes(id), `${id} is in no stack of shukkatest and is never named`);
+  // The EIP lookup is read only and runs in a dry run; it names only the project's own address.
+  const lookup = calls.filter((c) => c.cmd === 'aws' && c.args[1] === 'describe-addresses');
+  assert.equal(lookup.length, 1);
+  assert.deepEqual(lookup[0]!.args.slice(0, 4), ['ec2', 'describe-addresses', '--public-ips', '203.0.113.7']);
+  assert.ok(r.out.includes('stack Shukkatest-prod-Instance: i-0abc12345678def01, lt-0c441db83956d6c6b'), r.out);
+  assert.deepEqual(MUTATING(calls).filter((c) => !(c.cmd === 'aws' && c.args[1] === 'describe-addresses')), [], 'a dry run changes nothing');
+}));
+
+test('shu-dnd: --tag-existing-ec2 tags after the boundary stack and before the project bootstrap', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  const { calls, spawn } = ec2Spawn();
+  const r = await cli(projectArgs(['--tag-existing-ec2']).filter((a) => a !== '--dry-run'), { cwd: dir, spawn, aws: ec2Account().aws });
+  assert.equal(r.code, 0, r.out + r.err);
+  const lines = printed(r.out);
+  const boundary = lines.findIndex((l) => l.includes('deploy Shukka-Boundary-shukkatest'));
+  const tag = lines.findIndex((l) => l.includes('ec2 create-tags'));
+  const toolkit = lines.findIndex((l) => l.startsWith('+ aws cloudformation deploy'));
+  assert.ok(boundary !== -1 && tag > boundary && toolkit > tag, r.out);
+  const runs = calls.filter((c) => c.cmd === 'aws' && c.args[1] === 'create-tags');
+  assert.equal(runs.length, 2, 'one create-tags per owned stack, run for real');
+  for (const c of runs) for (const id of FOREIGN) assert.ok(!c.args.includes(id), `${id} not tagged`);
+}));
+
+test('shu-dnd: a failed Elastic IP lookup stops the bootstrap before anything changes; without the flag nothing is looked up or tagged', withTmp(async (tmp) => {
+  const { dir } = consumer(tmp);
+  const failing = recordingSpawn((c) => (c.cmd === 'aws' && c.args[1] === 'describe-addresses' ? { status: 255, stdout: '' } : { status: 0, stdout: '' }));
+  const r = await cli(projectArgs(['--tag-existing-ec2']).filter((a) => a !== '--dry-run'), { cwd: dir, spawn: failing.spawn, aws: ec2Account().aws });
+  assert.equal(r.code, 1, r.out + r.err);
+  assert.match(r.err, /cannot look up the Elastic IP\(s\) 203\.0\.113\.7/);
+  assert.deepEqual(MUTATING(failing.calls).filter((c) => !(c.cmd === 'aws' && c.args[1] === 'describe-addresses')), [], 'nothing ran');
+
+  const plain = ec2Spawn();
+  const r2 = await cli(projectArgs(), { cwd: dir, spawn: plain.spawn, aws: ec2Account().aws });
+  assert.equal(r2.code, 0, r2.out + r2.err);
+  assert.ok(!r2.out.includes('create-tags') && !plain.calls.some((c) => c.args[1] === 'describe-addresses'), r2.out);
+}));
+
+test('shu-dnd: bootstrap --account refuses --tag-existing-ec2, and --help documents it', async () => {
+  const r = await cli(['bootstrap', '--account', '--region', 'us-east-1', '--tag-existing-ec2', '--dry-run']);
+  assert.equal(r.code, 2);
+  assert.match(r.err, /--tag-existing-ec2 is for a project bootstrap/);
+  assert.match(helpText(), /--tag-existing-ec2/);
+});
+
 // shu-r5f: shukka diff and deploy point every stack's BootstrapVersion at the project's bootstrap (the qualifier from
 // shukka.json), so a stack first deployed through CDK's default bootstrap moves to the project's.
 test('shu-r5f: shukka diff and deploy pass --parameters BootstrapVersion=/cdk-bootstrap/<qualifier>/version to cdk diff and cdk deploy', withTmp(async (tmp) => {
