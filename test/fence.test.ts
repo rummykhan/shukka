@@ -92,6 +92,7 @@ const SPIKE_EXCEPTIONS: Record<'executionA' | 'executionB' | 'boundary', { chang
       'EC2ProjectTagIsFixed', // the Project tag cannot be set to another project or removed
       'EC2DescribeOwnInstancesOnly', // no DescribeInstanceAttribute (user data) on other projects' instances
       'EC2NoSpotRequests', // spot request descriptions carry user data and cannot be fenced
+      'EC2RunInstancesNewInterfaces', // new network interfaces only tagged with the project (shu-0uf)
       'EC2RunInstancesInterfaces', // existing network interfaces only the project's
       'NoChangeToCiRoles', // shu-9bj.6: the pipeline's own roles cannot be re-trusted or given more power by a deploy
     ],
@@ -262,10 +263,15 @@ test('shu-i1b: instances launch only from allowed AMI owners, own security group
   assert.deepEqual(own.Condition, { StringEquals: { 'aws:ResourceTag/Project': 'shukkatest' } });
   const eni = stmt(b, 'EC2RunInstancesInterfaces');
   assert.deepEqual(eni.Resource, 'arn:aws:ec2:eu-west-1:123456789012:network-interface/*');
-  assert.deepEqual(eni.Condition, { StringEqualsIfExists: { 'aws:ResourceTag/Project': 'shukkatest' } });
+  assert.deepEqual(eni.Condition, { StringEquals: { 'aws:ResourceTag/Project': 'shukkatest' } });
+  // shu-0uf: a new interface only with the project's tag on the request; no IfExists anywhere on interfaces.
+  const newEni = stmt(b, 'EC2RunInstancesNewInterfaces');
+  assert.deepEqual(newEni.Resource, 'arn:aws:ec2:eu-west-1:123456789012:network-interface/*');
+  assert.deepEqual(newEni.Condition, { StringEquals: { 'aws:RequestTag/Project': 'shukkatest' } });
+  assert.ok(!JSON.stringify(b.Statement).includes('IfExists'), 'shu-0uf: no IfExists condition in the fence');
   // No other statement lets RunInstances or CreateVolume reach images, security groups, launch templates, network
   // interfaces or snapshots.
-  const fenced = new Set(['EC2UseOwnTagged', 'EC2RunInstancesImages', 'EC2RunInstancesInterfaces']);
+  const fenced = new Set(['EC2UseOwnTagged', 'EC2RunInstancesImages', 'EC2RunInstancesInterfaces', 'EC2RunInstancesNewInterfaces']);
   for (const st of b.Statement.filter((s) => s.Effect === 'Allow' && !fenced.has(s.Sid))) {
     if (!list(st.Action).some((a) => a === 'ec2:RunInstances' || a === 'ec2:CreateVolume')) continue;
     for (const r of list(st.Resource)) {
