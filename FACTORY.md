@@ -34,7 +34,7 @@ Known gaps in the gate: anything that needs a real GitHub token or AWS (trust ru
 - Commits: one plain-English sentence; no bead id. Commit identity is the GitHub noreply address (repo-local config), as in koujou. Factory builders commit on their own task branch; this overrides the "do not commit unless asked" text beads wrote into AGENTS.md and CLAUDE.md.
 - Push: the epic branch when shipping; acceptance may also push release-candidate tags (`v1.0.0-rc.N`) from the epic branch so the test consumer can call them. Task branches are never pushed. Never push `main` directly.
 - Integration: pull request to `main`, opened by the factory.
-- Merge: factory, after the owner approves each time; method: merge.
+- Merge: factory, as soon as the pull request is mergeable (checks green, no conflict), wherever the merge deploys: the owner approves the work once, at the plan gate (2026-11-27); method: merge. The factory then watches the deploy and the change-is-live check and reports.
 - Required human review: the owner.
 
 ## Deploy policy
