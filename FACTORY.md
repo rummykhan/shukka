@@ -91,6 +91,9 @@ Never use: Orbitary's resources (look, never touch), Trendigle's production data
 | Spikes | `<work order>/spikes/` |
 | Decision log | the Decisions table in each design |
 | Pitfalls / lessons | `## Lessons` below |
+- 2026-11-27 (v1.0.0): release tags must be lightweight (`git tag vX.Y.Z`, never `-a`): GitHub will not start a caller pinned to an annotated tag, because nested `./` workflow calls resolve at the tag object. The OIDC spike ran from a branch and never exercised this path.
+- 2026-11-27 (shu-cio): a spike or acceptance run must take the exact path a consumer takes (a caller pinned to a released tag, a real existing stack), and adoption by an existing project gets a rehearsal on its real stacks: the greenfield consumer passed while Trendigle and Orbitary each found defects only their real shape had.
+- 2026-11-27 (shu-cio): only resources that failed during a rollback can be skipped by `continue-update-rollback`; when the boundary itself cannot be deleted, skip that role's logical id. Untagged pre-migration resources (ENIs, volumes) need `bootstrap --tag-existing-ec2` before the first fenced deploy.
 
 ## Beads
 
