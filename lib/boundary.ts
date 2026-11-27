@@ -153,7 +153,7 @@ export function validateFenceInputs(
 }
 
 const INFRA_SIDS = new Set([
-  'EC2Read', 'EC2DescribeOwnInstancesOnly', 'EC2NoSpotRequests', 'EC2RunInstancesInterfaces', 'EC2LaunchTagged', 'EC2CreateTagged', 'EC2RunInstancesSupporting', 'EC2RunInstancesImages', 'EC2UseOwnTagged',
+  'EC2Read', 'EC2DescribeOwnInstancesOnly', 'EC2NoSpotRequests', 'EC2RunInstancesNewInterfaces', 'EC2RunInstancesInterfaces', 'EC2LaunchTagged', 'EC2CreateTagged', 'EC2RunInstancesSupporting', 'EC2RunInstancesImages', 'EC2UseOwnTagged',
   'EC2TagOnCreate', 'EC2ChangeOwn', 'EC2ProjectTagIsFixed', 'EC2AssociateToOwnInstance',
 ]);
 
@@ -251,9 +251,12 @@ export function fenceDocuments(inputs: FenceInputs): FenceDocuments {
       Sid: 'EC2RunInstancesSupporting', Effect: 'Allow', Action: ['ec2:RunInstances', 'ec2:CreateSecurityGroup'],
       Resource: [ec2('subnet'), ec2('vpc'), ec2('volume'), ec2('key-pair')],
     },
-    // Spike hole: an instance could launch into another project's network interface. A new interface has no tags
-    // yet (IfExists); an existing one must be the project's.
-    { Sid: 'EC2RunInstancesInterfaces', Effect: 'Allow', Action: 'ec2:RunInstances', Resource: ec2('network-interface'), Condition: { StringEqualsIfExists: { 'aws:ResourceTag/Project': P } } },
+    // Spike hole: an instance could launch into another project's network interface, and (shu-0uf) into any
+    // existing interface with no Project tag, since IfExists let an absent tag through. A new interface must be
+    // tagged with the project in the same request (tagProject puts network-interface in the launch template's tag
+    // specifications); an existing one must already be the project's.
+    { Sid: 'EC2RunInstancesNewInterfaces', Effect: 'Allow', Action: 'ec2:RunInstances', Resource: ec2('network-interface'), Condition: { StringEquals: { 'aws:RequestTag/Project': P } } },
+    { Sid: 'EC2RunInstancesInterfaces', Effect: 'Allow', Action: 'ec2:RunInstances', Resource: ec2('network-interface'), Condition: ownTag },
     // Spike hole: image/* was open to any owner's AMI.
     { Sid: 'EC2RunInstancesImages', Effect: 'Allow', Action: 'ec2:RunInstances', Resource: `arn:aws:ec2:${region}::image/*`, Condition: { StringEquals: { 'ec2:Owner': [...amiOwners] } } },
     // Spike hole: security-group/* and launch-template/* for RunInstances were open to every project's; snapshots

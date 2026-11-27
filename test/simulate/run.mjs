@@ -187,7 +187,11 @@ const extra = [
   ['exec', 'implicitDeny', 'ec2:RunInstances', `arn:aws:ec2:${R}:${A}:launch-template/lt-0orbitary`, O],
   ['exec', 'allowed', 'ec2:RunInstances', `arn:aws:ec2:${R}:${A}:launch-template/lt-0trendigle`, T],
   ['exec', 'implicitDeny', 'ec2:RunInstances', `arn:aws:ec2:${R}:${A}:network-interface/eni-0orbitary`, O],
-  ['exec', 'allowed', 'ec2:RunInstances', `arn:aws:ec2:${R}:${A}:network-interface/*`],
+  ['exec', 'allowed', 'ec2:RunInstances', `arn:aws:ec2:${R}:${A}:network-interface/*`, { 'aws:RequestTag/Project': 'trendigle' }],
+  ['exec', 'allowed', 'ec2:RunInstances', `arn:aws:ec2:${R}:${A}:network-interface/eni-0trendigle`, T],
+  // shu-0uf: an existing interface with no Project tag, or a new one not tagged in the request, is refused.
+  ['exec', 'implicitDeny', 'ec2:RunInstances', `arn:aws:ec2:${R}:${A}:network-interface/eni-0untagged`],
+  ['exec', 'implicitDeny', 'ec2:RunInstances', `arn:aws:ec2:${R}:${A}:network-interface/*`, { 'aws:RequestTag/Project': 'orbitary' }],
   // 10b. shu-9bj.18: the tagged creates need Project on the request. CloudFormation sends none for a launch template
   // unless its TagSpecifications hold it (tagProject); without it the create is refused, as in the rc.5 deploy.
   ['exec', 'implicitDeny', 'ec2:CreateLaunchTemplate', `arn:aws:ec2:${R}:${A}:launch-template/*`],
